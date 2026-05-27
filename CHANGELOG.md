@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.0.1 — 2026-05-27
+
+First tagged release. The connector has been live-tested against a
+self-hosted Loomio 3.0.24 instance (openssl-communities.org) and the
+production Cloud Run deployment is serving real traffic. Expect rough
+edges — only one upstream Loomio instance exercised so far; some b2
+endpoints have known upstream bugs (see NOTES-ON-LOOMIO-API.md).
 
 Initial scaffolding. Targets Loomio's b2 API (the canonical surface).
 See DESIGN.md / NOTES-ON-LOOMIO-API.md for the b1-vs-b2 rationale.
