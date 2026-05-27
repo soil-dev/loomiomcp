@@ -35,7 +35,7 @@ import { LoomioApiError, LoomioAuthError, loomioGet } from "../loomio/client.js"
 // by id so each group appears once in the result.
 //
 // The probe runs with bounded concurrency and a "stop after N
-// consecutive 404s" early-exit, since most Loomio instances have
+// consecutive misses" early-exit, since most Loomio instances have
 // dense ID ranges in the low hundreds.
 
 interface RawGroup {
@@ -58,34 +58,58 @@ interface PollsResponse {
   groups?: RawGroup[];
 }
 
-export const listGroupsSchema = z.object({
-  start_id: z
-    .number()
-    .int()
-    .min(1)
-    .optional()
-    .describe("First group_id to probe (inclusive). Defaults to 1."),
-  end_id: z
-    .number()
-    .int()
-    .min(1)
-    .max(10000)
-    .optional()
-    .describe(
-      "Last group_id to probe (inclusive). Defaults to 200, which covers most Loomio instances; bump for larger ones.",
-    ),
-  stop_after_consecutive_misses: z
-    .number()
-    .int()
-    .min(1)
-    .max(1000)
-    .optional()
-    .describe(
-      "Early-exit heuristic: stop probing after this many consecutive 404s. Saves wall time on sparse ID ranges. Defaults to 50.",
-    ),
-});
-
+const DEFAULT_START_ID = 1;
+const DEFAULT_END_ID = 200;
+const MAX_END_ID = 10000;
+const MAX_PROBE_SPAN = 500;
 const CONCURRENCY = 5;
+
+export const listGroupsSchema = z
+  .object({
+    start_id: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("First group_id to probe (inclusive). Defaults to 1."),
+    end_id: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_END_ID)
+      .optional()
+      .describe(
+        "Last group_id to probe (inclusive). Defaults to 200. A single call may scan at most 500 ids; use multiple calls for wider ranges.",
+      ),
+    stop_after_consecutive_misses: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_PROBE_SPAN)
+      .optional()
+      .describe(
+        "Early-exit heuristic: stop probing after this many consecutive 404/403 misses. Saves wall time on sparse id ranges. Defaults to 50.",
+      ),
+  })
+  .superRefine((input, ctx) => {
+    const start = input.start_id ?? DEFAULT_START_ID;
+    const end = input.end_id ?? DEFAULT_END_ID;
+    if (end < start) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["end_id"],
+        message: "end_id must be greater than or equal to start_id.",
+      });
+      return;
+    }
+    if (end - start + 1 > MAX_PROBE_SPAN) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["end_id"],
+        message: `A single list_groups call may scan at most ${MAX_PROBE_SPAN} ids.`,
+      });
+    }
+  });
 
 interface ProbeResult {
   id: number;
@@ -105,7 +129,7 @@ async function probeOne(id: number): Promise<ProbeResult> {
     if (err instanceof LoomioApiError && err.status === 404) return { id, groups: [] };
     // 403 → bot isn't a member of this group (and isn't is_admin).
     // Treat as soft miss so we keep walking the range.
-    if (err instanceof LoomioAuthError) return { id, groups: [] };
+    if (err instanceof LoomioAuthError && err.status === 403) return { id, groups: [] };
     throw err;
   }
 }
@@ -135,9 +159,10 @@ function slim(g: RawGroup): SlimGroup {
 }
 
 export async function listGroups(input: z.infer<typeof listGroupsSchema>) {
-  const start = input.start_id ?? 1;
-  const end = input.end_id ?? 200;
-  const maxMisses = input.stop_after_consecutive_misses ?? 50;
+  const parsed = listGroupsSchema.parse(input);
+  const start = parsed.start_id ?? DEFAULT_START_ID;
+  const end = parsed.end_id ?? DEFAULT_END_ID;
+  const maxMisses = parsed.stop_after_consecutive_misses ?? 50;
 
   const seenIds = new Set<number>();
   const found: SlimGroup[] = [];
@@ -158,7 +183,7 @@ export async function listGroups(input: z.infer<typeof listGroupsSchema>) {
     for (const r of results) {
       lastScanned = r.id;
       if (r.groups.length > 0) {
-        // b2/discussions returns the queried group + its parent. Dedupe
+        // b2/polls returns the queried group + its parent. Dedupe
         // by id; the parent may also be hit later in the probe range
         // (which is harmless — same group, just confirmed twice).
         for (const g of r.groups) {

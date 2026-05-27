@@ -8,7 +8,7 @@ setupLoomioTest();
 describe("listGroups", () => {
   it("collects groups from 200 responses, skips 404s, dedupes by id", async () => {
     // Probe ids 1..5 with concurrency=5 → one batch of 5 calls.
-    // b2/discussions returns the queried group AND its parent in `groups`.
+    // b2/polls returns the queried group AND its parent in `groups`.
     mockFetch(200, { groups: [{ id: 1, key: "a", handle: "alpha", name: "Alpha" }] });
     mockFetch(404, { error: 404 });
     mockFetch(200, {
@@ -106,9 +106,28 @@ describe("listGroups", () => {
     expect(result.groups.map((g) => g.id)).toEqual([1, 3]);
   });
 
-  it("schema clamps end_id to 10000", async () => {
+  it("schema caps each probe span to 500 ids", async () => {
     const { listGroupsSchema } = await import("../src/tools/groups.js");
-    expect(listGroupsSchema.safeParse({ end_id: 10001 }).success).toBe(false);
-    expect(listGroupsSchema.safeParse({ end_id: 10000 }).success).toBe(true);
+    expect(listGroupsSchema.safeParse({ start_id: 1, end_id: 500 }).success).toBe(true);
+    expect(listGroupsSchema.safeParse({ start_id: 1, end_id: 501 }).success).toBe(false);
+    expect(listGroupsSchema.safeParse({ start_id: 9501, end_id: 10000 }).success).toBe(true);
+    expect(listGroupsSchema.safeParse({ start_id: 9500, end_id: 10000 }).success).toBe(false);
+  });
+
+  it("rejects an inverted probe range", async () => {
+    const { listGroupsSchema } = await import("../src/tools/groups.js");
+    expect(listGroupsSchema.safeParse({ start_id: 10, end_id: 9 }).success).toBe(false);
+  });
+
+  it("rejects end_id above the absolute ceiling", async () => {
+    const { listGroupsSchema } = await import("../src/tools/groups.js");
+    expect(listGroupsSchema.safeParse({ start_id: 10000, end_id: 10001 }).success).toBe(false);
+  });
+
+  it("propagates 401 auth failures instead of returning an empty list", async () => {
+    mockFetch(401, { error: "bad api key" });
+
+    const { listGroups } = await import("../src/tools/groups.js");
+    await expect(listGroups({ start_id: 1, end_id: 1 })).rejects.toThrow(/401/);
   });
 });

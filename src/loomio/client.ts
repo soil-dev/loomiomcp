@@ -58,7 +58,10 @@ export class LoomioReadOnlyError extends Error {
 }
 
 export class LoomioAuthError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    public readonly status?: number,
+  ) {
     super(message);
     this.name = "LoomioAuthError";
   }
@@ -195,6 +198,7 @@ async function throwForStatus(res: Response): Promise<void> {
     throw new LoomioAuthError(
       `Loomio API returned ${res.status}: ${detail}. ` +
         "Check that LOOMIO_API_KEY is valid and has access to the requested resource.",
+      res.status,
     );
   }
   if (!res.ok) {

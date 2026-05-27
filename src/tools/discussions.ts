@@ -110,12 +110,12 @@ async function resolveDiscussionPrivate(groupId: number): Promise<boolean> {
     const opts = resp.groups?.[0]?.discussion_privacy_options;
     return opts !== "public_only";
   } catch (err) {
-    // 401/403 → LoomioAuthError; other non-2xx → LoomioApiError. A
-    // 403 specifically means the group is hidden from us, and
+    // A 403 specifically means the group is hidden from us, and
     // Loomio's GroupPrivacy validator forces every hidden group to
     // `private_only`, so `true` is the only valid fallback.
-    if (err instanceof LoomioAuthError) return true;
-    if (err instanceof LoomioApiError && err.status === 403) return true;
+    if ((err instanceof LoomioAuthError || err instanceof LoomioApiError) && err.status === 403) {
+      return true;
+    }
     throw err;
   }
 }

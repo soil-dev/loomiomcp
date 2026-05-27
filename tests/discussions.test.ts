@@ -45,6 +45,12 @@ describe("getDiscussion", () => {
     );
     expect(getDiscussionSchema.safeParse({ id_or_key: "abc/def" }).success).toBe(false);
   });
+
+  it("rejects dot-only string keys before building a URL", async () => {
+    const { getDiscussion } = await import("../src/tools/discussions.js");
+    await expect(getDiscussion({ id_or_key: ".." })).rejects.toThrow(/id_or_key/);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
 });
 
 describe("createDiscussion", () => {
@@ -92,6 +98,13 @@ describe("createDiscussion", () => {
 
     const body = JSON.parse((vi.mocked(fetch).mock.calls[1]![1] as RequestInit).body as string);
     expect(body.private).toBe(true);
+  });
+
+  it("propagates 401 from the private auto-resolve fetch", async () => {
+    mockFetch(401, { error: "bad api key" });
+    const { createDiscussion } = await import("../src/tools/discussions.js");
+    await expect(createDiscussion({ title: "T", group_id: 7 })).rejects.toThrow(/401/);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(1);
   });
 
   it("respects explicit private=true (no group fetch)", async () => {

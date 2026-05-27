@@ -32,6 +32,12 @@ describe("getPoll", () => {
     expect(getPollSchema.safeParse({ id_or_key: "../memberships?group_id=7" }).success).toBe(false);
     expect(getPollSchema.safeParse({ id_or_key: "abc/def" }).success).toBe(false);
   });
+
+  it("rejects dot-only string keys before building a URL", async () => {
+    const { getPoll } = await import("../src/tools/polls.js");
+    await expect(getPoll({ id_or_key: ".." })).rejects.toThrow(/id_or_key/);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
 });
 
 describe("createPoll", () => {

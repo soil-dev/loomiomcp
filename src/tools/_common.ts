@@ -16,7 +16,11 @@ export const idOrKey = z.union([loomioKey, positiveId]);
 export type IdOrKey = z.infer<typeof idOrKey>;
 
 export function encodePathSegment(value: IdOrKey): string {
-  return encodeURIComponent(String(value));
+  const raw = String(value);
+  if (raw === "" || raw === "." || raw === "..") {
+    throw new Error("id_or_key must be a non-empty Loomio id or short key.");
+  }
+  return encodeURIComponent(raw);
 }
 
 /** Documented `poll_type` values, per https://www.loomio.com/help/api2 */
