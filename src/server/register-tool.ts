@@ -14,6 +14,10 @@ import { getRequestContext, logEvent } from "../log.js";
  */
 const READ_PREFIXES = ["search_", "filter_", "get_", "list_", "show_", "run_"];
 
+function isReadOnlyByName(name: string): boolean {
+  return READ_PREFIXES.some((p) => name.startsWith(p));
+}
+
 function isDestructive(name: string): boolean {
   // `manage_memberships` can remove members when remove_absent=true.
   // `deactivate_user` disables a user account instance-wide (b3 admin).
@@ -21,14 +25,41 @@ function isDestructive(name: string): boolean {
   return name.startsWith("delete_") || name === "manage_memberships" || name === "deactivate_user";
 }
 
-export function inferAnnotations(name: string): ToolAnnotations | undefined {
-  if (READ_PREFIXES.some((p) => name.startsWith(p))) {
-    return { readOnlyHint: true };
-  }
-  if (isDestructive(name)) {
-    return { destructiveHint: true };
-  }
-  return undefined;
+/**
+ * Compute the full ToolAnnotations record for a tool by name.
+ *
+ * Loud explicitness matters here: per MCP spec
+ * (https://modelcontextprotocol.io/specification/2025-03-26/server/tools),
+ * `destructiveHint` defaults to TRUE when unset, and `readOnlyHint`
+ * defaults to FALSE. So a tool that only advertises
+ * `{readOnlyHint: true}` is read by spec-compliant clients as
+ * "read-only, but may also be destructive" — contradictory, and
+ * conservative clients (Claude.ai included) treat the absent
+ * `destructiveHint: false` as "ask the user before each call".
+ *
+ * Returning all four flags on every tool removes that ambiguity and
+ * lets MCP clients (Claude.ai's Custom Connector flow specifically)
+ * auto-approve reads without per-call prompts. Values:
+ *
+ *   readOnlyHint   — true for `get_…` / `list_…` / etc. by naming
+ *                     convention
+ *   destructiveHint — true only for tools that may delete/overwrite
+ *                     (manage_memberships with remove_absent;
+ *                     deactivate_user; any future `delete_…`)
+ *   idempotentHint  — reads are idempotent (no side effects). Writes
+ *                     vary; we conservatively report false for them
+ *                     (`create_…` always creates a new row).
+ *   openWorldHint   — true for every tool here; this connector exists
+ *                     to call out to the Loomio API.
+ */
+export function inferAnnotations(name: string): ToolAnnotations {
+  const readOnly = isReadOnlyByName(name);
+  return {
+    readOnlyHint: readOnly,
+    destructiveHint: isDestructive(name),
+    idempotentHint: readOnly,
+    openWorldHint: true,
+  };
 }
 
 function argFieldNames(input: unknown): string[] {
@@ -77,10 +108,9 @@ export function registerTool<Schema extends z.ZodObject<ZodRawShape>>(
     callback: (input: z.infer<Schema>) => Promise<CallToolResult>,
   ) => void;
 
-  const annotations = inferAnnotations(name);
   registerWithSchema(
     name,
-    { description, inputSchema: schema, ...(annotations ? { annotations } : {}) },
+    { description, inputSchema: schema, annotations: inferAnnotations(name) },
     async (input) => {
       const startedAt = Date.now();
       const argFields = argFieldNames(input);
