@@ -63,6 +63,20 @@ Set `LOOMIO_MCP_READONLY=1` to register only the read tools
 skipped at server-init time. This is the mode the Cloud Run deployment
 runs in.
 
+## Docs map
+
+| File | When to read |
+|---|---|
+| [INSTALL.md](INSTALL.md) | "I want to use this locally with Claude Desktop / Code today" |
+| [DEPLOY.md](DEPLOY.md) | "I want to run this as a remote HTTP/OAuth endpoint" |
+| [HOWTO.md](HOWTO.md) | "I want example prompts and use cases" |
+| [DESIGN.md](DESIGN.md) | "I want to understand the load-bearing choices" |
+| [NOTES-ON-LOOMIO-API.md](NOTES-ON-LOOMIO-API.md) | "I'm hitting a weird Loomio behaviour, or want the line-by-line endpoint reference" |
+| [SECURITY.md](SECURITY.md) | "I'm doing a security review or rotating secrets" |
+| [OPTIMIZATIONS.md](OPTIMIZATIONS.md) | "I want observability / usage analytics queries" |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | "I want to add a tool or send a PR" |
+| [CHANGELOG.md](CHANGELOG.md) | "What changed?" |
+
 ## License
 
 Apache-2.0

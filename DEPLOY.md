@@ -14,9 +14,9 @@ stdio server. The host launches the process; the API key stays on your
 machine.
 
 To run in read-only mode: also set `LOOMIO_MCP_READONLY=1`. Only the
-read tools (`get_discussion`, `list_discussions`, `get_poll`,
-`list_polls`, `list_memberships`) are registered; write tools are not
-even visible to the MCP host.
+read tools are registered; write tools are not even visible to the MCP
+host. See [README.md](README.md) for the full tool catalog and which
+tools are reads vs writes.
 
 ## Cloud Run (HTTP)
 
@@ -28,6 +28,7 @@ Required env in any HTTP deployment:
 | Variable | What it is |
 |---|---|
 | `LOOMIO_API_KEY` | Loomio API key. Shared by every authenticated MCP caller hitting this deployment. |
+| `LOOMIO_API_BASE_URL` | Loomio API root. Defaults to `https://www.loomio.com/api`. Set to e.g. `https://openssl-communities.org/api` for a self-hosted instance. Override is gated to `https://` or loopback `http://` so the api_key (which travels as a query parameter) can't leak to a plaintext host. |
 | `PUBLIC_BASE_URL` | Public origin of the service, e.g. `https://loomiomcp-xyz.run.app`. Used to build OAuth metadata. |
 | `MCP_OAUTH_SIGNING_KEY` | HMAC key for OAuth tokens (≥16 chars, stable across instances). |
 
@@ -71,3 +72,19 @@ Set the new `LOOMIO_API_KEY` and redeploy / restart. Outstanding OAuth
 tokens stay valid (they prove caller identity to the connector, not to
 Loomio). To invalidate every outstanding OAuth token at once, rotate
 `MCP_OAUTH_SIGNING_KEY` — every issued token becomes unverifiable.
+
+## Reference deployment
+
+A working production Cloud Run deployment with secrets handling via
+GCP KMS + Secret Manager lives at
+[openssl/infra GCP/loomiomcp](https://github.com/openssl/infra/tree/main/GCP/loomiomcp/).
+Pulumi project, three bootstrap scripts (API key, signing key, OAuth
+client), and a smoke test that walks the OAuth dance.
+
+## Image build
+
+The container image used by that reference deployment is built by
+[openssl/images loomiomcp/build.sh](https://github.com/openssl/images/tree/main/loomiomcp/build.sh).
+A `Dockerfile` ships in this repo for direct `docker build`; the
+`build.sh` wrapper standardises tagging + push for the openssl
+container registry.

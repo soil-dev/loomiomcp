@@ -56,6 +56,41 @@ the URL query and the body fields flat. The membership controller
 reads params directly, so flat works there too. See
 NOTES-ON-LOOMIO-API.md for line-by-line justification.
 
+## Probe-based group enumeration
+
+`list_groups` exists because Loomio has no api-key-authed endpoint
+that returns the caller's group list:
+
+- v1's `profile/groups` requires a Devise session (and the
+  Turnstile-walled login path; see "Surface area" above).
+- The v1 `explore` endpoint returns only publicly-listed groups —
+  closed, secret, and hidden groups are filtered out regardless of
+  the caller's privileges.
+- b2 has no `groups` resource at all.
+
+So we probe: issue one request per candidate `group_id` and read the
+embedded group metadata from the response. Three candidate endpoints
+took serious consideration:
+
+1. **`b2/memberships?group_id=N`** — rejected. Requires the caller
+   to be a group ADMIN; the connector's bot user typically isn't,
+   so every probe would 403.
+2. **`b2/discussions?group_id=N&limit=1`** — only requires
+   membership, but the serializer OMITS the `groups` array entirely
+   when the queried group has no discussions. Empty groups silently
+   disappear from the enumeration even though we have access.
+3. **`b2/polls?group_id=N&limit=1&status=all`** — only requires
+   membership, and the serializer ALWAYS embeds the queried group's
+   metadata in the `groups` array (because it also returns
+   poll-creation events whose resolution requires the group object).
+   Works for empty groups too. **Chosen.**
+
+The 500-id per-call cap is the load-protection lever (one HTTP call
+per probed id; default scans of 1..200 cost ~50–200 outbound calls).
+For wider sweeps callers issue multiple invocations with
+non-overlapping `start_id` / `end_id` ranges. See
+NOTES-ON-LOOMIO-API.md → "Gotcha 4" for the empirical detail.
+
 ## API-key injection
 
 Both Loomio public APIs (b2 and b3) take their auth secret as a query
@@ -88,6 +123,20 @@ tool description, schema field description, and `destructiveHint: true`
 annotation in `src/server/register-tool.ts` all flag it; the default of
 `remove_absent: false` keeps the additive case ergonomic.
 `deactivate_user` also carries the destructive hint. See SECURITY.md.
+
+## Tool annotations
+
+`inferAnnotations` in `src/server/register-tool.ts` returns the full
+four-flag MCP `ToolAnnotations` set for every tool —
+`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`.
+Per MCP spec, `destructiveHint` defaults to `true` when unset, and
+`readOnlyHint` defaults to `false`. A tool that only advertises
+`{readOnlyHint: true}` is read by spec-compliant clients as
+"read-only, but may also be destructive" — contradictory — and
+conservative clients (Claude.ai's auto-approval flow included) fall
+back to per-call prompting. Emitting all four flags explicitly removes
+the ambiguity and lets the connector's reads auto-approve in
+Claude.ai.
 
 ## What we deliberately don't have
 

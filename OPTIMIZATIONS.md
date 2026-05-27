@@ -249,6 +249,11 @@ for line in sys.stdin:
 If `get_discussion x10+` shows up often, the case for a `get_discussions`
 batch tool is empirical, not hypothetical.
 
+Note that `list_groups` legitimately fans out 50–200 outbound calls
+per invocation by design; that's not an N+1, it's the documented
+workaround for Loomio's missing groups index endpoint. See
+NOTES-ON-LOOMIO-API.md → "Gotcha 4".
+
 ### Read vs write traffic mix
 
 ```sh
@@ -314,7 +319,8 @@ is operator-side, not a code change — left to the deployment.
 If Loomio starts rate-limiting (none observed so far), add a
 `retriedAfter429: true` field on `loomio.request` so the queries
 above can quantify retry traffic. Not needed until 429s show up in
-the logs.
+the logs. See NOTES-ON-LOOMIO-API.md → "Things we don't know yet"
+for the current state of rate-limit-header knowledge.
 
 ### c. Batch fan-out helper
 

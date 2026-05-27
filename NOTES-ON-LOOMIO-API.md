@@ -55,6 +55,7 @@ path so a single client serves both namespaces.
 | GET | `/b2/memberships?group_id=…&limit=…&offset=…` | `list_memberships` |
 | POST | `/b2/memberships` | `manage_memberships` |
 | POST | `/b2/comments?discussion_id=…` | `create_comment` |
+| GET (probe) | `/b2/polls?group_id=N&limit=1&status=all` | `list_groups` (one call per probed id; see "Gotcha 4") |
 
 ### b3 (server-instance b3_api_key; opt-in via LOOMIO_B3_API_KEY)
 
@@ -141,6 +142,7 @@ Loomio returns various shapes; `src/loomio/client.ts`'s
 | `get_poll` (id or key) | ✓ | |
 | `list_polls` | ✓ | |
 | `list_memberships` | ✓ | |
+| `list_groups` | ✓ | Probe-based; see "Gotcha 4" |
 | `create_discussion` | ✓ | Connector auto-resolves `private` from group's `discussion_privacy_options` (see below) |
 | `create_comment` | ✓ | Connector uses form-encoded body (see below) |
 | `manage_memberships` | ✓ | Additive path verified; `remove_absent: true` not exercised |
@@ -211,6 +213,44 @@ Reported as a Loomio bug TODO. Until fixed, `create_poll` will fail
 422 on most groups configured `public_discussions_only`. The tool
 is kept registered (and the schema is correct per /help/api2) so it
 starts working as soon as upstream is patched.
+
+## Gotcha 4: enumerating groups is by probe, not by query
+
+Loomio has no api-key-authed "list the caller's groups" endpoint. v1's
+`profile/groups` requires a Devise session; the v1 `explore` endpoint
+returns only publicly-listed groups (it filters out closed / secret /
+hidden ones regardless of the caller's privileges); b2 has no `groups`
+resource. So `list_groups` works around this by probing a `group_id`
+range against an endpoint that DOES require only membership, and
+collecting the embedded group metadata from the response.
+
+The probe-endpoint candidates and why **b2/polls** wins:
+
+- **`b2/memberships?group_id=N`** — rejected. Requires the caller to
+  be a group ADMIN. A non-admin api-key user gets 403 on every probe.
+- **`b2/discussions?group_id=N&limit=1`** — only requires membership,
+  BUT the serializer omits the `groups` array entirely when the
+  queried group has zero discussions. Empty groups silently disappear
+  from the result even though we have access.
+- **`b2/polls?group_id=N&limit=1&status=all`** — only requires
+  membership. The serializer ALWAYS embeds the queried group's
+  metadata in the `groups` array (it also serializes
+  poll-creation events, whose resolution needs the group object), so
+  empty groups show up too.
+
+Each probe distinguishes:
+
+- 200 → group exists, bot can read its polls (= is a member, or
+  `is_admin: true`); the response carries the group object.
+- 404 → no group with that id (skip).
+- 403 → group exists but bot isn't a member; treated as soft miss.
+
+`b2/polls` also returns the queried group's PARENT group in the same
+`groups` array (so users can navigate up). The connector dedupes by
+id. Schema-capped at 500 ids per invocation as the load-protection
+lever; the default 1..200 scan typically costs 50–200 outbound calls
+in 2–5 seconds and an `is_admin` user sees every group on the
+instance in one sweep.
 
 ## Things we don't know yet
 

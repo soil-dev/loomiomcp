@@ -25,10 +25,12 @@ URLs land in proxy access logs. Consequences:
   forwarded to the MCP client and never appear in the
   `tool.call` / `loomio.request` events emitted by `src/log.ts`
   (paths are run through `redactPath()` which drops the query string).
-- `LOOMIO_API_BASE_URL` overrides are gated: only `https://` is
-  accepted, plus `http://` on loopback. A typo'd `http://` override to
-  a public host would put the key in plaintext in every intermediate
-  log.
+- `LOOMIO_API_BASE_URL` overrides are validated at request time in
+  `baseUrl()` (`src/loomio/client.ts`): the override MUST be either
+  `https://`, or `http://` pointed at loopback (`localhost`,
+  `127.0.0.1`, `[::1]`). A typo'd `http://` override to a public host
+  would put the api_key in plaintext in every intermediate access
+  log; the validation refuses to start the request in that case.
 
 ## Read-only mode
 
@@ -77,6 +79,17 @@ Never set `LOOMIO_B3_API_KEY` on a Cloud Run deployment that's
 accessible to multiple users. The b3 secret authenticates the
 *server* as a Loomio instance operator, not the calling user — any
 client that can reach the MCP server can deactivate any user.
+
+## `list_groups` outbound fan-out
+
+`list_groups` issues one outbound HTTP call per probed id (up to 500
+per invocation, capped at the schema layer). A malicious caller with
+a valid OAuth token could spam this — the connector caps single-call
+cost but doesn't rate-limit invocations. For high-trust deployments
+this is fine; for multi-tenant deployments, consider Cloud Run-level
+rate limiting or removing the tool. The probe targets the upstream
+Loomio API, so the blast radius is on Loomio's side, not the
+connector's.
 
 ## OAuth
 
