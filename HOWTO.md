@@ -29,20 +29,20 @@ If you want a standalone poll, omit `discussion_id`.
 
 > List the current members of the group.
 
-`list_memberships()` returns everyone visible to the API-key user.
+`list_memberships({group_id: 17})` returns everyone visible to the API-key user.
 
 ## Add a new member
 
 > Invite alice@example.com.
 
-`manage_memberships({emails: ["alice@example.com"]})`. Additive only —
+`manage_memberships({group_id: 17, emails: ["alice@example.com"]})`. Additive only —
 nobody is removed.
 
 ## Reconcile to a roster (DANGEROUS)
 
 > Set the group membership to exactly these 12 emails.
 
-This requires `manage_memberships({emails: [...], remove_absent: true})`.
-Read `list_memberships()` first and confirm the diff with a human. The
+This requires `manage_memberships({group_id: 17, emails: [...], remove_absent: true})`.
+Read `list_memberships({group_id: 17})` first and confirm the diff with a human. The
 connector marks this tool with `destructiveHint: true` so clients can
 prompt. See SECURITY.md.

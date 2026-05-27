@@ -26,6 +26,25 @@ describe("getDiscussion", () => {
     const [url] = vi.mocked(fetch).mock.calls[0]!;
     expect(url).toContain("/b2/discussions/abcDEF12");
   });
+
+  it("encodes string keys as a single path segment", async () => {
+    mockFetch(200, {});
+    const { getDiscussion } = await import("../src/tools/discussions.js");
+    await getDiscussion({ id_or_key: "../memberships?group_id=7" });
+
+    const [url] = vi.mocked(fetch).mock.calls[0]!;
+    expect(url).toContain("/b2/discussions/..%2Fmemberships%3Fgroup_id%3D7?");
+    expect(url).not.toContain("/b2/memberships");
+  });
+
+  it("rejects path-like string keys at schema layer", async () => {
+    const { getDiscussionSchema } = await import("../src/tools/discussions.js");
+    expect(getDiscussionSchema.safeParse({ id_or_key: "abcDEF12" }).success).toBe(true);
+    expect(getDiscussionSchema.safeParse({ id_or_key: "../memberships?group_id=7" }).success).toBe(
+      false,
+    );
+    expect(getDiscussionSchema.safeParse({ id_or_key: "abc/def" }).success).toBe(false);
+  });
 });
 
 describe("createDiscussion", () => {

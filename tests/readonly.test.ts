@@ -48,6 +48,12 @@ describe("read-only client guard", () => {
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
+  it("blocks create_discussion before the private auto-resolve fetch", async () => {
+    const { createDiscussion } = await import("../src/tools/discussions.js");
+    await expect(createDiscussion({ title: "T", group_id: 1 })).rejects.toThrow(/read-only mode/);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
   it("blocks create_poll without making any HTTP call", async () => {
     const { createPoll } = await import("../src/tools/polls.js");
     await expect(createPoll({ title: "T", poll_type: "proposal", group_id: 1 })).rejects.toThrow(

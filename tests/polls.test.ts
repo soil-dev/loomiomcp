@@ -15,6 +15,23 @@ describe("getPoll", () => {
     expect(url).toContain("/b2/polls/5");
     expect(url).toContain("api_key=test-key");
   });
+
+  it("encodes string keys as a single path segment", async () => {
+    mockFetch(200, {});
+    const { getPoll } = await import("../src/tools/polls.js");
+    await getPoll({ id_or_key: "../memberships?group_id=7" });
+
+    const [url] = vi.mocked(fetch).mock.calls[0]!;
+    expect(url).toContain("/b2/polls/..%2Fmemberships%3Fgroup_id%3D7?");
+    expect(url).not.toContain("/b2/memberships");
+  });
+
+  it("rejects path-like string keys at schema layer", async () => {
+    const { getPollSchema } = await import("../src/tools/polls.js");
+    expect(getPollSchema.safeParse({ id_or_key: "abcDEF12" }).success).toBe(true);
+    expect(getPollSchema.safeParse({ id_or_key: "../memberships?group_id=7" }).success).toBe(false);
+    expect(getPollSchema.safeParse({ id_or_key: "abc/def" }).success).toBe(false);
+  });
 });
 
 describe("createPoll", () => {
@@ -33,22 +50,42 @@ describe("createPoll", () => {
 
   it("rejects unknown poll_type at schema layer", async () => {
     const { createPollSchema } = await import("../src/tools/polls.js");
-    expect(createPollSchema.safeParse({ title: "x", poll_type: "made_up" }).success).toBe(false);
+    expect(
+      createPollSchema.safeParse({ title: "x", poll_type: "made_up", group_id: 1 }).success,
+    ).toBe(false);
   });
 
   it("accepts every documented poll_type", async () => {
     const { createPollSchema } = await import("../src/tools/polls.js");
-    for (const t of [
-      "proposal",
-      "poll",
-      "count",
-      "score",
-      "ranked_choice",
-      "meeting",
-      "dot_vote",
-    ]) {
-      expect(createPollSchema.safeParse({ title: "x", poll_type: t }).success).toBe(true);
+    expect(
+      createPollSchema.safeParse({ title: "x", poll_type: "proposal", group_id: 1 }).success,
+    ).toBe(true);
+
+    for (const t of ["poll", "count", "score", "ranked_choice", "meeting", "dot_vote"]) {
+      expect(
+        createPollSchema.safeParse({ title: "x", poll_type: t, group_id: 1, options: ["A"] })
+          .success,
+      ).toBe(true);
     }
+  });
+
+  it("requires either group_id or discussion_id", async () => {
+    const { createPollSchema } = await import("../src/tools/polls.js");
+    expect(createPollSchema.safeParse({ title: "x", poll_type: "proposal" }).success).toBe(false);
+    expect(
+      createPollSchema.safeParse({ title: "x", poll_type: "proposal", discussion_id: 1 }).success,
+    ).toBe(true);
+  });
+
+  it("requires options for every non-proposal poll_type", async () => {
+    const { createPollSchema } = await import("../src/tools/polls.js");
+    expect(createPollSchema.safeParse({ title: "x", poll_type: "poll", group_id: 1 }).success).toBe(
+      false,
+    );
+    expect(
+      createPollSchema.safeParse({ title: "x", poll_type: "poll", group_id: 1, options: ["A"] })
+        .success,
+    ).toBe(true);
   });
 });
 

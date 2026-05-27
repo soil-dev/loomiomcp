@@ -1,6 +1,13 @@
 import { z } from "zod";
-import { LoomioApiError, LoomioAuthError, loomioGet, loomioPost } from "../loomio/client.js";
-import { idOrKey, positiveId } from "./_common.js";
+import {
+  isReadOnly,
+  LoomioApiError,
+  LoomioAuthError,
+  LoomioReadOnlyError,
+  loomioGet,
+  loomioPost,
+} from "../loomio/client.js";
+import { encodePathSegment, idOrKey, positiveId } from "./_common.js";
 
 // ── get_discussion ──────────────────────────────────────────────────────────
 
@@ -11,7 +18,7 @@ export const getDiscussionSchema = z.object({
 });
 
 export async function getDiscussion(input: z.infer<typeof getDiscussionSchema>) {
-  return loomioGet<unknown>(`/b2/discussions/${input.id_or_key}`);
+  return loomioGet<unknown>(`/b2/discussions/${encodePathSegment(input.id_or_key)}`);
 }
 
 // ── list_discussions ────────────────────────────────────────────────────────
@@ -114,6 +121,7 @@ async function resolveDiscussionPrivate(groupId: number): Promise<boolean> {
 }
 
 export async function createDiscussion(input: z.infer<typeof createDiscussionSchema>) {
+  if (isReadOnly()) throw new LoomioReadOnlyError("POST");
   const priv =
     input.private !== undefined ? input.private : await resolveDiscussionPrivate(input.group_id);
   return loomioPost<unknown>("/b2/discussions", { ...input, private: priv });
