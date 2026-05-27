@@ -24,6 +24,11 @@ export function setupLoomioTest(env: Record<string, string> = {}): void {
     for (const [k, v] of Object.entries(env)) process.env[k] = v;
   });
   afterEach(() => {
+    // `clearAllMocks` clears call history but NOT queued
+    // `mockResolvedValueOnce` values; `mockReset` does both. Without
+    // a reset, a test that queues more responses than it consumes
+    // (e.g. an early-exit test) leaks mocks into the next test.
+    vi.mocked(fetch).mockReset();
     vi.clearAllMocks();
     delete process.env["LOOMIO_API_KEY"];
     for (const k of Object.keys(env)) delete process.env[k];

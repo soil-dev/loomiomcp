@@ -25,6 +25,7 @@ import {
   manageMembershipsSchema,
   manageMemberships,
 } from "./tools/memberships.js";
+import { listGroupsSchema, listGroups } from "./tools/groups.js";
 import { createCommentSchema, createComment } from "./tools/comments.js";
 import {
   deactivateUserSchema,
@@ -118,6 +119,16 @@ export function createLoomioMcpServer(): McpServer {
     "List members of a Loomio group with their email addresses, roles, and join state. Required: `group_id`. Caller MUST be a group admin (non-admins get HTTP 403; the response is server-side scoped to include `include_email: true`). Optional `limit` 1-200 (default 50) and `offset` for pagination. Use to answer 'who's in group X', 'find a member by email', or — critically — BEFORE calling manage_memberships with remove_absent=true, since the diff between current and intended members is what makes that destructive call safe.",
     listMembershipsSchema,
     listMemberships,
+  );
+
+  registerTool(
+    server,
+    "list_groups",
+    "List groups the connector's api-key user can see, by probing a group_id range. Loomio's API has no native 'list groups' endpoint that honours api-key auth (v1's profile/groups needs a session; the v1 explore endpoint returns only public groups). This tool works around that by issuing one `b2/memberships?group_id=N&limit=1` per id and collecting the group objects from the 200 responses — 404s skipped, 403s treated as soft misses. Bot users with `is_admin: true` see every group on the instance; otherwise it returns only groups the bot is a member or admin of. " +
+      "Optional knobs: `start_id` (default 1), `end_id` (default 200; bump for larger instances), `stop_after_consecutive_misses` (default 50; early-exit on sparse id ranges). " +
+      "Caveat: this is the right tool to answer 'what groups can you see' and similar discovery questions, but it costs O(end_id - start_id) outbound calls — typically ~50–200 HTTP requests in 2–5 seconds. The returned group objects are slimmed to `{id, key, handle, name, parent_id, discussion_privacy_options, is_visible_to_public, memberships_count}`; to drill in, use `list_memberships`, `list_discussions`, `list_polls` with the relevant id.",
+    listGroupsSchema,
+    listGroups,
   );
 
   if (!readOnly) {

@@ -17,6 +17,10 @@ Tools (b2, per-user `?api_key=`):
 - `create_poll(title, poll_type, …)` — start a new poll
 - `list_memberships(group_id, limit?, offset?)` — list a group's members with email
   addresses (caller must be a group admin)
+- `list_groups({start_id?, end_id?, stop_after_consecutive_misses?})` — enumerate
+  visible groups by probing `b2/memberships` across an id range. Loomio has no
+  api-key-authed list-groups endpoint; this is the workaround. ~50–200 outbound
+  calls per invocation
 - `manage_memberships({group_id, emails, remove_absent})` — add and (with
   `remove_absent: true`) **remove** members. See SECURITY.md before using
   `remove_absent`.
