@@ -1,0 +1,21 @@
+node_modules/
+dist/
+
+# Secrets / per-host config — never commit any flavour of .env.
+.env
+.env.*
+
+*.tsbuildinfo
+.claude/
+
+# Local-only live integration tests. The script needs real Loomio
+# credentials and instance-specific group IDs, so each operator keeps
+# their own copy out of source control. See HOWTO.md for the template
+# behaviour and required env vars.
+scripts/live-test*.mjs
+scripts/live-test*.local.*
+
+# Any *.local.* override is for the local machine only.
+*.local.mjs
+*.local.ts
+*.local.json

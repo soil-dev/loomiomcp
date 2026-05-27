@@ -1,0 +1,65 @@
+{
+  "name": "loomiomcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for Loomio. Lets Claude (Desktop, Code, or web Projects via Custom Connector) read and create Loomio discussions, polls, and group memberships in plain English.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "loomio",
+    "claude",
+    "claude-desktop",
+    "anthropic",
+    "ai-tools",
+    "agent"
+  ],
+  "license": "Apache-2.0",
+  "author": "Anton Arapov",
+  "homepage": "https://github.com/soil-dev/loomiomcp#readme",
+  "bugs": {
+    "url": "https://github.com/soil-dev/loomiomcp/issues"
+  },
+  "type": "module",
+  "bin": {
+    "loomiomcp": "dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build:icon": "node scripts/build-icon.mjs",
+    "build": "npm run build:icon && tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint src tests scripts",
+    "format": "biome format --write src tests scripts",
+    "format:check": "biome format src tests scripts",
+    "check": "biome check src tests scripts",
+    "prepare": "npm run build:icon && tsup"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/soil-dev/loomiomcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "undici": "^8.3.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.15",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.1",
+    "tsup": "^8.3.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
