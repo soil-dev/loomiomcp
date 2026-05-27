@@ -9,15 +9,30 @@ import { LoomioApiError, LoomioAuthError, loomioGet } from "../loomio/client.js"
 // only publicly-listed groups (skipping hidden / closed / secret ones,
 // regardless of the caller's privileges).
 //
-// Workaround: probe `b2/memberships?group_id=N` over an id range. With
-// the bot user marked `is_admin: true`, the responses cleanly
-// distinguish:
+// Workaround: probe `b2/polls?group_id=N&limit=1&status=all` over an
+// id range. We use the polls endpoint specifically because:
+//   - b2/memberships requires the caller to be a group ADMIN.
+//     Non-admin bots get 403 across the board.
+//   - b2/discussions only requires MEMBERSHIP but its serializer
+//     OMITS the `groups` array entirely when the queried group has
+//     no discussions — so empty groups silently disappear from the
+//     enumeration even though the bot has access.
+//   - b2/polls also only requires MEMBERSHIP but its serializer
+//     ALWAYS includes the group metadata in the `groups` array,
+//     because it also returns historical poll-created events whose
+//     resolution requires the group object. Works for empty groups.
+//   - For `is_admin: true` users, every endpoint bypasses the
+//     per-group check anyway.
 //
-//   200 → group exists, bot can see it; the response carries the group
-//         object we want
+// Responses cleanly distinguish:
+//   200 → group exists, bot can read its polls (= is a member, or
+//         `is_admin`); the response carries the group object
 //   404 → no group with that id (skip)
-//   403 → group exists but bot can't see it (shouldn't happen with
-//         is_admin; treat as miss)
+//   403 → group exists but bot isn't a member (skip)
+//
+// b2/polls's response shape: the `groups` array carries the queried
+// group AND its parent group (so users can navigate up). We dedupe
+// by id so each group appears once in the result.
 //
 // The probe runs with bounded concurrency and a "stop after N
 // consecutive 404s" early-exit, since most Loomio instances have
@@ -39,7 +54,7 @@ interface RawGroup {
   archived_at?: string | null;
 }
 
-interface MembershipsResponse {
+interface PollsResponse {
   groups?: RawGroup[];
 }
 
@@ -74,22 +89,23 @@ const CONCURRENCY = 5;
 
 interface ProbeResult {
   id: number;
-  group: RawGroup | null;
+  groups: RawGroup[];
 }
 
 async function probeOne(id: number): Promise<ProbeResult> {
   try {
-    const resp = await loomioGet<MembershipsResponse>("/b2/memberships", {
+    const resp = await loomioGet<PollsResponse>("/b2/polls", {
       group_id: id,
       limit: 1,
+      status: "all",
     });
-    return { id, group: resp.groups?.[0] ?? null };
+    return { id, groups: resp.groups ?? [] };
   } catch (err) {
     // 404 (RecordNotFound) is the expected "no such group" signal.
-    if (err instanceof LoomioApiError && err.status === 404) return { id, group: null };
-    // 403 → bot can't see it (shouldn't happen with is_admin, but
-    // treat as a soft miss so we keep walking the range).
-    if (err instanceof LoomioAuthError) return { id, group: null };
+    if (err instanceof LoomioApiError && err.status === 404) return { id, groups: [] };
+    // 403 → bot isn't a member of this group (and isn't is_admin).
+    // Treat as soft miss so we keep walking the range.
+    if (err instanceof LoomioAuthError) return { id, groups: [] };
     throw err;
   }
 }
@@ -123,6 +139,7 @@ export async function listGroups(input: z.infer<typeof listGroupsSchema>) {
   const end = input.end_id ?? 200;
   const maxMisses = input.stop_after_consecutive_misses ?? 50;
 
+  const seenIds = new Set<number>();
   const found: SlimGroup[] = [];
   let consecutiveMisses = 0;
   let earlyExit = false;
@@ -140,8 +157,16 @@ export async function listGroups(input: z.infer<typeof listGroupsSchema>) {
 
     for (const r of results) {
       lastScanned = r.id;
-      if (r.group) {
-        found.push(slim(r.group));
+      if (r.groups.length > 0) {
+        // b2/discussions returns the queried group + its parent. Dedupe
+        // by id; the parent may also be hit later in the probe range
+        // (which is harmless — same group, just confirmed twice).
+        for (const g of r.groups) {
+          if (!seenIds.has(g.id)) {
+            seenIds.add(g.id);
+            found.push(slim(g));
+          }
+        }
         consecutiveMisses = 0;
       } else {
         consecutiveMisses++;
