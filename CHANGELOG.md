@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.0.3 — 2026-05-28
+
+Tool-selection tuning. No new tools, no API changes — just rewrites
+of the descriptions Claude reads when deciding which tool to call.
+
+Motivation: in two real consumer chats analysed by the maintainer,
+Claude reached for `list_polls` + `list_memberships` and reconstructed
+participation client-side instead of calling `get_user_activity`,
+even though the latter answers the question directly. The
+reconstruction is more expensive AND ambiguous (you can't tell
+"didn't vote" from "abstained" by reading a poll record alone). This
+release rewires the descriptions so the right tool wins.
+
+Description changes (counts unchanged: 8 reads + 4 writes + 2 b3 admin):
+
+- `get_user_activity` — major rewrite. Explicit framing as the
+  primary entry point for any user-centric question — single OR
+  multi-user. Adds the pattern "for an N-delegate comparison, **call
+  this tool N times**" with example phrasings: "compare delegate
+  turnout across the BAC and TAC", "rank members of group N by
+  participation", "build participation cards for each delegate".
+  Reframes the cost as amortised (the same `list_discussions` fetch
+  serves every per-user call in the same conversation) and explains
+  the canonical-stream advantage over a `list_polls`-based
+  reconstruction.
+
+- `list_polls` — adds a cross-ref at the end: for per-user
+  participation questions, prefer `get_user_activity`. Calls out the
+  abstain-vs-didn't-vote ambiguity that `list_polls` cannot resolve.
+
+- `list_memberships` — adds an explicit "do NOT use this to construct
+  a participation analysis" warning, redirecting to `get_user_activity`
+  per member.
+
+- `list_events` — adds a "do NOT loop this over every discussion
+  yourself" warning, redirecting to `get_user_activity` for any
+  cross-discussion user-centric question.
+
+The data-driven follow-up — whether to add a `get_group_summary`
+composite — is deferred until verbose logs from production show
+whether description tuning alone closes the gap.
+
 ## 0.0.2 — 2026-05-28
 
 Two new read tools surfacing Loomio's event stream — the connector

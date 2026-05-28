@@ -101,7 +101,8 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "list_polls",
-    "List polls in a Loomio group, ordered by creation date (newest first). Required: `group_id`. Optional `status` filter — 'active' (default), 'closed', 'all' (every kept poll); `limit` 1-200 (default 50); `offset` for pagination. Caller must be a group member. Use to answer 'what's up for vote in group X', 'show me past poll results', or before create_poll to check what's already proposed.",
+    "List polls in a Loomio group, ordered by creation date (newest first). Required: `group_id`. Optional `status` filter — 'active' (default), 'closed', 'all' (every kept poll); `limit` 1-200 (default 50); `offset` for pagination. Caller must be a group member. Use to answer 'what's up for vote in group X', 'show me past poll results', or before create_poll to check what's already proposed. " +
+      "FOR PER-USER PARTICIPATION QUESTIONS — 'who voted', 'how often did X vote', 'compare delegates' turnout' — prefer `get_user_activity`. It returns participation directly (via the underlying events stream) and avoids the ambiguity between 'didn't vote' and 'abstained' that you can't tell apart from a `list_polls` response alone.",
     listPollsSchema,
     listPolls,
   );
@@ -122,7 +123,8 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "list_memberships",
-    "List members of a Loomio group with their email addresses, roles, and join state. Required: `group_id`. Caller MUST be a group admin (non-admins get HTTP 403; the response is server-side scoped to include `include_email: true`). Optional `limit` 1-200 (default 50) and `offset` for pagination. Use to answer 'who's in group X', 'find a member by email', or — critically — BEFORE calling manage_memberships with remove_absent=true, since the diff between current and intended members is what makes that destructive call safe.",
+    "List members of a Loomio group with their email addresses, roles, and join state. Required: `group_id`. Caller MUST be a group admin (non-admins get HTTP 403; the response is server-side scoped to include `include_email: true`). Optional `limit` 1-200 (default 50) and `offset` for pagination. Use to answer 'who's in group X', 'find a member by email', or — critically — BEFORE calling manage_memberships with remove_absent=true, since the diff between current and intended members is what makes that destructive call safe. " +
+      "Do NOT use this tool to construct a participation analysis (e.g. 'how active is each member', 'who voted in our polls') by combining its output with `list_polls`. That reconstruction is more expensive in round-trips AND ambiguous about abstain-vs-didn't-vote. Use `get_user_activity` per member instead — it answers participation directly from the event stream.",
     listMembershipsSchema,
     listMemberships,
   );
@@ -143,7 +145,8 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "list_events",
-    "Fetch the full event stream for one discussion — every new_comment, poll_created, stance_created, outcome_created, reaction, discussion_moved, etc. — with actor_id, kind, parent_id, created_at, and pointers to the underlying eventable record. Required: `discussion_id`. Optional `limit` (1-200, default 50), `offset` (Loomio's `from` param), and `kinds` (client-side filter to specific event kinds). The response also embeds related `comments`, `users`, and `polls` arrays for in-place resolution. Use this to answer 'show me the reply tree for thread X', 'who participated in discussion Y', or as the building block for cross-discussion aggregations. Loomio's v1/events endpoint requires a discussion_id; there's no instance-wide or per-user index — for user-centric questions, use `get_user_activity`.",
+    "Fetch the full event stream for ONE discussion — every new_comment, poll_created, stance_created, outcome_created, reaction, discussion_moved, etc. — with actor_id, kind, parent_id, created_at, and pointers to the underlying eventable record. Required: `discussion_id`. Optional `limit` (1-200, default 50), `offset` (Loomio's `from` param), and `kinds` (client-side filter to specific event kinds). The response also embeds related `comments`, `users`, and `polls` arrays for in-place resolution. Use this to answer 'show me the reply tree for thread X', 'who participated in discussion Y', or as the building block for cross-discussion aggregations. " +
+      "Loomio's v1/events endpoint REQUIRES a discussion_id; there is no instance-wide, per-group, or per-user index. For user-centric questions across many discussions ('how active is X', 'compare delegates'), use `get_user_activity` — do NOT loop `list_events` over every discussion yourself. `get_user_activity` does that fan-out server-side with concurrency control.",
     listEventsSchema,
     listEvents,
   );
@@ -152,7 +155,10 @@ export function createLoomioMcpServer(): McpServer {
     server,
     "get_user_activity",
     "Aggregate one user's activity across a set of groups. Server-side: fans out across every discussion in the specified groups, fetches its event stream, filters to events authored by the target user, and returns counts (by kind, by group, by month), plus first/last activity timestamps and a sample of recent events. Required: `user_id`, `group_ids` (1-50; pass the result of `list_groups` for instance-wide). Optional `since` / `until` (ISO-8601) bound the time window. " +
-      "Cost: one outbound HTTP call per discussion in scope (plus one `list_discussions` per group). Wide scans of an active instance commonly hit 100-300 calls in 5-30 seconds. Concurrency-capped at 6. Use this for 'tell me about user X', 'how active has user Y been in Q1', or before promoting/awarding someone. For one discussion at a time, use `list_events`.",
+      "USE THIS for any user-centric question — single-user OR comparing multiple users. Examples that all map to this tool: 'tell me about user X', 'how active has Y been in Q1', 'compare delegate turnout across the BAC and TAC', 'rank members of group N by participation', 'who's our most engaged contributor since June', 'build participation cards for each delegate'. For an N-delegate comparison, **call this tool N times** (once per user) — that's the intended pattern and is materially cheaper than reconstructing the same data from `list_polls` + `list_memberships`. " +
+      "Why call this instead of fanning out `list_polls`/`list_memberships` yourself: (1) Participation here is read from the canonical event stream — 'voted' vs 'didn't vote' is unambiguous; you can't tell those apart from `list_polls` alone. (2) Round-trip count is the same or lower in aggregate, because each user's activity scan reuses the same `list_discussions` fetches in your conversation context. (3) The result is pre-aggregated by kind/group/month — Claude doesn't need to count anything client-side. " +
+      "Cost: one outbound HTTP call per discussion in scope (plus one `list_discussions` per group). A single user-activity call on a ~200-discussion instance is ~200 calls in 5-10 seconds, concurrency-capped at 6. That sounds large but is the correct denominator for comparison: building the same answer from `list_polls` requires the same discussion-scan + a separate `list_memberships` per group + client-side cross-referencing. " +
+      "For one discussion at a time, use `list_events`. For 'what groups can the user see', use `list_groups` first to scope the call.",
     getUserActivitySchema,
     getUserActivity,
   );
