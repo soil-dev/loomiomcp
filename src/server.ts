@@ -26,6 +26,12 @@ import {
   manageMemberships,
 } from "./tools/memberships.js";
 import { listGroupsSchema, listGroups } from "./tools/groups.js";
+import {
+  listEventsSchema,
+  listEvents,
+  getUserActivitySchema,
+  getUserActivity,
+} from "./tools/events.js";
 import { createCommentSchema, createComment } from "./tools/comments.js";
 import {
   deactivateUserSchema,
@@ -130,6 +136,25 @@ export function createLoomioMcpServer(): McpServer {
       "Caveat: this is the right tool to answer 'what groups can you see' and similar discovery questions, but it costs O(end_id - start_id) outbound calls — typically ~50–200 HTTP requests in 2–5 seconds. The returned group objects are slimmed to `{id, key, handle, name, parent_id, discussion_privacy_options, is_visible_to_public, memberships_count}`; to drill in, use `list_memberships`, `list_discussions`, `list_polls` with the relevant id.",
     listGroupsSchema,
     listGroups,
+  );
+
+  // ── Events ────────────────────────────────────────────────────────────────
+
+  registerTool(
+    server,
+    "list_events",
+    "Fetch the full event stream for one discussion — every new_comment, poll_created, stance_created, outcome_created, reaction, discussion_moved, etc. — with actor_id, kind, parent_id, created_at, and pointers to the underlying eventable record. Required: `discussion_id`. Optional `limit` (1-200, default 50), `offset` (Loomio's `from` param), and `kinds` (client-side filter to specific event kinds). The response also embeds related `comments`, `users`, and `polls` arrays for in-place resolution. Use this to answer 'show me the reply tree for thread X', 'who participated in discussion Y', or as the building block for cross-discussion aggregations. Loomio's v1/events endpoint requires a discussion_id; there's no instance-wide or per-user index — for user-centric questions, use `get_user_activity`.",
+    listEventsSchema,
+    listEvents,
+  );
+
+  registerTool(
+    server,
+    "get_user_activity",
+    "Aggregate one user's activity across a set of groups. Server-side: fans out across every discussion in the specified groups, fetches its event stream, filters to events authored by the target user, and returns counts (by kind, by group, by month), plus first/last activity timestamps and a sample of recent events. Required: `user_id`, `group_ids` (1-50; pass the result of `list_groups` for instance-wide). Optional `since` / `until` (ISO-8601) bound the time window. " +
+      "Cost: one outbound HTTP call per discussion in scope (plus one `list_discussions` per group). Wide scans of an active instance commonly hit 100-300 calls in 5-30 seconds. Concurrency-capped at 6. Use this for 'tell me about user X', 'how active has user Y been in Q1', or before promoting/awarding someone. For one discussion at a time, use `list_events`.",
+    getUserActivitySchema,
+    getUserActivity,
   );
 
   if (!readOnly) {
