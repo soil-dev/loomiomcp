@@ -34,20 +34,26 @@ Required env in any HTTP deployment:
 
 OAuth mode (pick one):
 
-- **Static client (recommended for public deployments).** Set both
-  `MCP_OAUTH_CLIENT_ID` and `MCP_OAUTH_CLIENT_SECRET`. DCR is disabled;
-  the client_secret is the real auth boundary. Optionally set
-  `MCP_OAUTH_REDIRECT_URIS` (comma-separated); defaults to Anthropic's
-  known callback URIs.
-- **Insecure auto-approve (local / private networks only).** Set
-  `MCP_OAUTH_INSECURE_AUTO_APPROVE=1`. Anyone who can reach the URL
-  gets in. The server refuses to start in this mode unless
-  `PUBLIC_BASE_URL` points at loopback, OR you set
-  `MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes`.
+- **Static client.** Set both `MCP_OAUTH_CLIENT_ID` and
+  `MCP_OAUTH_CLIENT_SECRET`. DCR is disabled; the client_secret is the
+  real auth boundary. Optionally set `MCP_OAUTH_REDIRECT_URIS`
+  (comma-separated); defaults to Anthropic's known callback URIs. Use
+  this when the upstream identity (`LOOMIO_API_KEY`) sees data you
+  wouldn't want a random connected user to see — i.e. when the
+  connector is gating access to a confidential read.
+- **Open DCR (anyone who can reach the URL can register a client).**
+  Set `MCP_OAUTH_INSECURE_AUTO_APPROVE=1`. The server refuses to start
+  in this mode on a non-loopback `PUBLIC_BASE_URL` unless you also set
+  `MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes`. Use this when the upstream
+  identity is intentionally public — e.g. a read-only bot scoped to
+  open community discussions. The `openssl-communities.org` reference
+  deployment is configured this way (see [Reference deployment](#reference-deployment)).
 
-Recommended for any public deployment: `LOOMIO_MCP_READONLY=1`. Writes
-(especially `manage_memberships`) using a shared API key across many
-unrelated callers are hard to audit.
+For either mode, set `LOOMIO_MCP_READONLY=1` on any public deployment.
+Writes (especially `manage_memberships`) using a shared API key across
+many unrelated callers are hard to audit. The reference deployment
+combines open-DCR + readonly to make "available to anyone, can't write
+anything" explicit.
 
 Other env:
 
@@ -56,6 +62,9 @@ Other env:
 | `PORT` | `8080` | Listen port (Cloud Run injects). |
 | `MCP_HTTP_JSON_LIMIT` | `1mb` | Request body cap. |
 | `MCP_HTTP_TRUST_PROXY` | `1` | `app.set("trust proxy", …)`. `1` is correct for Cloud Run. |
+| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Per-IP request cap inside the window. Tighten on open-DCR deployments — `get_user_activity` fans out ~200 upstream calls per invocation, so a cap of 300/min puts a worst-case 60k upstream calls/min ceiling on any single source IP. |
+| `MCP_HTTP_RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window. |
+| `MCP_HTTP_RATE_LIMIT_DISABLED` | unset | Set to `1` to disable rate limiting entirely (only useful for local dev). |
 | `LOOMIO_MCP_LOG_VERBOSE` | unset | When `1`, emits structured JSON events to stderr (Cloud Run auto-parses). See OPTIMIZATIONS.md. |
 | `LOOMIO_B3_API_KEY` | unset | Server-instance admin secret. When set, registers `deactivate_user` / `reactivate_user`. **Do not set on a multi-user deployment** — see SECURITY.md. |
 
