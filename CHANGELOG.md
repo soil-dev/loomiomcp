@@ -67,10 +67,10 @@ Other:
   403 fence). Readonly deployments advertise 8 tools, local stdio 12,
   with b3 14.
 
-Deployment (tracked in openssl/infra, not this repo): the reference
-Cloud Run service gained a 60s request timeout, instance/concurrency
-caps matched to the fan-out workload, and a `verbose_logging` Pulumi
-toggle.
+Deployment (tracked in the separate infrastructure repo, not here): the
+reference Cloud Run service gained a 60s request timeout, instance/
+concurrency caps matched to the fan-out workload, and a config toggle
+for verbose logging.
 
 ## 0.0.3 — 2026-05-28
 
@@ -89,10 +89,10 @@ Description changes (counts unchanged: 8 reads + 4 writes + 2 b3 admin):
 
 - `get_user_activity` — major rewrite. Explicit framing as the
   primary entry point for any user-centric question — single OR
-  multi-user. Adds the pattern "for an N-delegate comparison, **call
-  this tool N times**" with example phrasings: "compare delegate
-  turnout across the BAC and TAC", "rank members of group N by
-  participation", "build participation cards for each delegate".
+  multi-user. Adds the pattern "for an N-user comparison, **call
+  this tool N times**" with example phrasings: "compare participation
+  across two groups", "rank members of group N by participation",
+  "build a participation card for each member".
   Reframes the cost as amortised (the same `list_discussions` fetch
   serves every per-user call in the same conversation) and explains
   the canonical-stream advantage over a `list_polls`-based
@@ -152,8 +152,8 @@ Other changes:
 - Documentation rewrite for accuracy + navigability: README has a
   docs-map table; tool catalog is single-sourced there;
   CONTRIBUTING.md now documents the doc-update steps that go with
-  adding a tool. Cross-repo links bridge soil-dev/loomiomcp ↔
-  openssl/infra ↔ openssl/images.
+  adding a tool. Cross-repo links bridge the connector, the
+  infrastructure repo, and the image-build repo.
 - `encodePathSegment` rejects `""` / `"."` / `".."` defence-in-depth
   before URL-encoding.
 - `list_groups` schema caps per-call probe span at 500 ids and
@@ -165,8 +165,8 @@ Other changes:
 ## 0.0.1 — 2026-05-27
 
 First tagged release. The connector has been live-tested against a
-self-hosted Loomio 3.0.24 instance (openssl-communities.org) and the
-production Cloud Run deployment is serving real traffic. Expect rough
+self-hosted Loomio 3.0.24 instance and the production Cloud Run
+deployment is serving real traffic. Expect rough
 edges — only one upstream Loomio instance exercised so far; some b2
 endpoints have known upstream bugs (see NOTES-ON-LOOMIO-API.md).
 

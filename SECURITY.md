@@ -7,19 +7,18 @@ exposes a small tool surface that calls Loomio's b2 API on behalf of
 authenticated MCP clients, plus optional b3 admin endpoints (gated by
 a separate, server-instance secret) when explicitly enabled.
 
-## HTTP / multi-user posture (the public deployment)
+## HTTP / multi-user posture (public deployments)
 
-The reference deployment (`mcp.openssl-communities.org`) runs in a
-specific shape that defines its blast radius. Understand this before
-exposing the connector publicly:
+A public, open-DCR deployment runs in a specific shape that defines its
+blast radius. Understand this before exposing the connector publicly:
 
 - **Open DCR.** Anyone who can reach the URL can register an OAuth
   client and connect (`MCP_OAUTH_INSECURE_AUTO_APPROVE=1`). The OAuth
   layer is therefore **not** an authentication boundary here — it gates
   protocol conformance, not identity.
 - **One shared upstream identity.** Every caller acts as the same
-  Loomio user — the "Communities Bot" behind `LOOMIO_API_KEY`. There is
-  no per-user upstream auth (Loomio's per-user v1 API is Turnstile-walled).
+  Loomio user — the bot account behind `LOOMIO_API_KEY`. There is no
+  per-user upstream auth (Loomio's per-user v1 API is Turnstile-walled).
 - **The bot's group memberships ARE the access boundary.** A caller
   reads exactly what the bot can read — no more. Scope the deployment by
   scoping the bot: add it only to groups whose data may be public.

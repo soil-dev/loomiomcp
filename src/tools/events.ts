@@ -160,9 +160,9 @@ export async function listEvents(input: z.infer<typeof listEventsSchema>) {
 // specified), fetch the event stream, filter to events authored by
 // the target user, and aggregate.
 //
-// Cost: ~1 HTTP call per discussion in scope. On openssl-communities,
-// that's ~200 calls for an instance-wide scan — limited by the
-// CONCURRENCY pool to bursts of 6.
+// Cost: ~1 HTTP call per discussion in scope. On a mid-sized instance
+// (a few hundred discussions) that's a few hundred calls for an
+// instance-wide scan — limited by the CONCURRENCY pool to bursts of 6.
 //
 // Amplification guard: the per-group and per-discussion page caps below
 // MULTIPLY (groups × disc-pages × event-pages), so without a global
