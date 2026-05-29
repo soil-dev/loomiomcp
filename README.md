@@ -2,10 +2,11 @@
 
 Model Context Protocol server for [Loomio](https://www.loomio.com). Lets
 Claude (Desktop, Code, or web Projects via Custom Connector) read and
-write Loomio discussions, polls, comments, and group memberships in
-plain English. Targets Loomio's **b2** API — the canonical surface
-documented at [/help/api2](https://www.loomio.com/help/api2) and the
-namespace where the controllers actually live in the open-source repo.
+write Loomio discussions, polls, comments, and group memberships — and
+analyse member activity — in plain English. Targets Loomio's **b2** API
+— the canonical surface documented at
+[/help/api2](https://www.loomio.com/help/api2) and the namespace where
+the controllers actually live in the open-source repo.
 
 Tools (b2, per-user `?api_key=`):
 
@@ -16,11 +17,21 @@ Tools (b2, per-user `?api_key=`):
 - `list_polls(group_id, status?, limit?, offset?)` — list a group's polls
 - `create_poll(title, poll_type, …)` — start a new poll
 - `list_memberships(group_id, limit?, offset?)` — list a group's members with email
-  addresses (caller must be a group admin)
+  addresses. Requires the connector's user to be a group **admin** (coordinator);
+  Loomio only returns the member list to admins. On a 403 the connector probes to
+  explain *why* — bot lacks the admin role vs. invalid key vs. not-a-member — and
+  points at `get_user_activity` / `list_events` for names/ids (email stays admin-only).
 - `list_groups({start_id?, end_id?, stop_after_consecutive_misses?})` — enumerate
   visible groups by probing `b2/polls` across an id range. Loomio has no
   api-key-authed list-groups endpoint; this is the workaround. Default scans
   are ~50–200 outbound calls; a single invocation is capped at 500 ids
+- `list_events(discussion_id, limit?, offset?, kinds?)` — the full event stream for
+  one discussion (comments, reactions, stances, outcomes, …) with `actor_id`, `kind`,
+  timestamps, and embedded `users` / `comments` / `polls`
+- `get_user_activity(user_id, group_ids, since?, until?)` — aggregate one user's
+  participation across groups (counts by kind / group / month, first/last activity).
+  The primary tool for any user-centric question; fans out server-side with a bounded
+  budget and reports completeness via `scope.complete`
 - `manage_memberships({group_id, emails, remove_absent})` — add and (with
   `remove_absent: true`) **remove** members. See SECURITY.md before using
   `remove_absent`.
@@ -58,10 +69,10 @@ Only relevant if you operate a Loomio instance.
 
 ## Read-only mode
 
-Set `LOOMIO_MCP_READONLY=1` to register only the read tools
-(`get_*` / `list_*`). All write tools (`create_*`, `manage_*`) are
-skipped at server-init time. This is the mode the Cloud Run deployment
-runs in.
+Set `LOOMIO_MCP_READONLY=1` to register only the 8 read tools
+(`get_*` / `list_*` / `get_user_activity`). All write tools
+(`create_*`, `manage_*`) are skipped at server-init time. This is the
+mode the Cloud Run deployment runs in.
 
 ## Docs map
 

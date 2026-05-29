@@ -24,12 +24,20 @@ describe("redactPath", () => {
     expect(redactPath("/b2/discussions/1,2,3")).toBe("/b2/discussions/:id");
   });
 
-  it("preserves non-numeric short keys (Loomio's string ids like 'abcDEF12')", () => {
-    expect(redactPath("/b2/polls/abcDEF12")).toBe("/b2/polls/abcDEF12");
-    expect(redactPath("/b2/discussions/abc/comments/123")).toBe("/b2/discussions/abc/comments/:id");
+  it("redacts non-numeric short keys after discussions/polls (Loomio's string ids like 'abcDEF12')", () => {
+    expect(redactPath("/b2/polls/abcDEF12")).toBe("/b2/polls/:id");
+    expect(redactPath("/b2/discussions/abcDEF12")).toBe("/b2/discussions/:id");
+    expect(redactPath("/b2/discussions/abc/comments/123")).toBe("/b2/discussions/:id/comments/:id");
   });
 
   it("leaves bare paths unchanged", () => {
     expect(redactPath("/b2/memberships")).toBe("/b2/memberships");
+  });
+
+  it("does not redact the b3 action verb after /users/ (it's not an id)", () => {
+    expect(redactPath("/b3/users/deactivate?id=42&b3_api_key=hunter2")).toBe(
+      "/b3/users/deactivate",
+    );
+    expect(redactPath("/b3/users/reactivate")).toBe("/b3/users/reactivate");
   });
 });

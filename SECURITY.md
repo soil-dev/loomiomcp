@@ -7,6 +7,43 @@ exposes a small tool surface that calls Loomio's b2 API on behalf of
 authenticated MCP clients, plus optional b3 admin endpoints (gated by
 a separate, server-instance secret) when explicitly enabled.
 
+## HTTP / multi-user posture (the public deployment)
+
+The reference deployment (`mcp.openssl-communities.org`) runs in a
+specific shape that defines its blast radius. Understand this before
+exposing the connector publicly:
+
+- **Open DCR.** Anyone who can reach the URL can register an OAuth
+  client and connect (`MCP_OAUTH_INSECURE_AUTO_APPROVE=1`). The OAuth
+  layer is therefore **not** an authentication boundary here — it gates
+  protocol conformance, not identity.
+- **One shared upstream identity.** Every caller acts as the same
+  Loomio user — the "Communities Bot" behind `LOOMIO_API_KEY`. There is
+  no per-user upstream auth (Loomio's per-user v1 API is Turnstile-walled).
+- **The bot's group memberships ARE the access boundary.** A caller
+  reads exactly what the bot can read — no more. Scope the deployment by
+  scoping the bot: add it only to groups whose data may be public.
+  Adding the bot to a new group widens what every anonymous caller sees.
+- **Writes are off.** `LOOMIO_MCP_READONLY=1` removes all write tools,
+  so the shared identity is read-only. Dropping readonly would turn open
+  DCR into anonymous public *write* — don't.
+- **Member emails stay admin-only.** The bot is deliberately a non-admin
+  member, so `list_memberships` (the only email-bearing tool) returns
+  403. On that 403 the connector probes a member-gated endpoint to
+  classify and explain the denial — bot-not-admin vs invalid-key vs
+  not-a-member — instead of a bare error (`src/loomio/access.ts`).
+  Names / usernames / ids stay reachable via `get_user_activity` /
+  `list_events`; email does not.
+- **Abuse is bounded per source IP.** The `/mcp` rate limiter keys on
+  the client IP — **not** the OAuth client_id, because under open DCR a
+  caller can mint unlimited client_ids and a client-keyed limit would be
+  trivially bypassable. `get_user_activity` additionally has a global
+  per-call fan-out budget and reports completeness via `scope.complete`.
+
+For a deployment whose upstream identity sees confidential data, use
+static-client mode instead (see DEPLOY.md) — the client_secret then
+gates who can connect.
+
 ## API key handling
 
 Two distinct secrets:
@@ -83,19 +120,25 @@ client that can reach the MCP server can deactivate any user.
 ## `list_groups` outbound fan-out
 
 `list_groups` issues one outbound HTTP call per probed id (up to 500
-per invocation, capped at the schema layer). A malicious caller with
-a valid OAuth token could spam this — the connector caps single-call
-cost but doesn't rate-limit invocations. For high-trust deployments
-this is fine; for multi-tenant deployments, consider Cloud Run-level
-rate limiting or removing the tool. The probe targets the upstream
-Loomio API, so the blast radius is on Loomio's side, not the
-connector's.
+per invocation, capped at the schema layer). `get_user_activity` fans
+out across discussions similarly, bounded by a global per-call budget
+(`MAX_SCAN_DISCUSSIONS` in `src/tools/events.ts`). A caller could still
+invoke these repeatedly — the connector caps single-call cost, and the
+`/mcp` rate limiter (keyed on source IP) bounds invocation rate. The
+probes target the upstream Loomio API, so the residual blast radius is
+on Loomio's side; size `MCP_HTTP_RATE_LIMIT_MAX` accordingly (the
+reference deployment uses 300/min/IP).
 
 ## OAuth
 
 The HTTP transport's OAuth surface (under `src/auth/`) is HMAC-signed,
 stateless. Rotate `MCP_OAUTH_SIGNING_KEY` to invalidate every
-outstanding token at once. See DEPLOY.md.
+outstanding token at once. PKCE (S256) is enforced on the token
+exchange and the auth code is single-use, client- and redirect-bound,
+with a 5-minute TTL. In open-DCR mode the OAuth dance proves protocol
+conformance, not identity (see the multi-user posture section above);
+the `/mcp` rate limiter is keyed on source IP precisely because client
+ids are caller-mintable in that mode. See DEPLOY.md.
 
 ## Reporting
 

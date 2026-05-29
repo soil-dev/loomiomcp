@@ -29,25 +29,27 @@ Required env in any HTTP deployment:
 |---|---|
 | `LOOMIO_API_KEY` | Loomio API key. Shared by every authenticated MCP caller hitting this deployment. |
 | `LOOMIO_API_BASE_URL` | Loomio API root. Defaults to `https://www.loomio.com/api`. Set to e.g. `https://openssl-communities.org/api` for a self-hosted instance. Override is gated to `https://` or loopback `http://` so the api_key (which travels as a query parameter) can't leak to a plaintext host. |
-| `PUBLIC_BASE_URL` | Public origin of the service, e.g. `https://loomiomcp-xyz.run.app`. Used to build OAuth metadata. |
+| `PUBLIC_BASE_URL` | Public origin of the service, e.g. `https://mcp.openssl-communities.org` (the reference deployment's custom domain) or the raw `https://loomiomcp-xyz.run.app`. Must match the URL clients fetch — it's the OAuth metadata issuer (RFC 8414). |
 | `MCP_OAUTH_SIGNING_KEY` | HMAC key for OAuth tokens (≥16 chars, stable across instances). |
 
 OAuth mode (pick one):
 
-- **Static client.** Set both `MCP_OAUTH_CLIENT_ID` and
-  `MCP_OAUTH_CLIENT_SECRET`. DCR is disabled; the client_secret is the
-  real auth boundary. Optionally set `MCP_OAUTH_REDIRECT_URIS`
-  (comma-separated); defaults to Anthropic's known callback URIs. Use
-  this when the upstream identity (`LOOMIO_API_KEY`) sees data you
-  wouldn't want a random connected user to see — i.e. when the
-  connector is gating access to a confidential read.
 - **Open DCR (anyone who can reach the URL can register a client).**
   Set `MCP_OAUTH_INSECURE_AUTO_APPROVE=1`. The server refuses to start
   in this mode on a non-loopback `PUBLIC_BASE_URL` unless you also set
   `MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes`. Use this when the upstream
   identity is intentionally public — e.g. a read-only bot scoped to
-  open community discussions. The `openssl-communities.org` reference
-  deployment is configured this way (see [Reference deployment](#reference-deployment)).
+  open community discussions. **This is how the `openssl-communities.org`
+  reference deployment runs** (see [Reference deployment](#reference-deployment)).
+  The per-IP rate limit (below) is the abuse bound in this mode, so keep
+  it set.
+- **Static client (lock-down alternative).** Set both
+  `MCP_OAUTH_CLIENT_ID` and `MCP_OAUTH_CLIENT_SECRET`. DCR is disabled;
+  the client_secret is the real auth boundary, so only people you hand
+  the secret to can connect. Optionally set `MCP_OAUTH_REDIRECT_URIS`
+  (comma-separated); defaults to Anthropic's known callback URIs. Use
+  this when the upstream identity (`LOOMIO_API_KEY`) sees data you
+  wouldn't want an anonymous caller to see.
 
 For either mode, set `LOOMIO_MCP_READONLY=1` on any public deployment.
 Writes (especially `manage_memberships`) using a shared API key across
@@ -62,18 +64,26 @@ Other env:
 | `PORT` | `8080` | Listen port (Cloud Run injects). |
 | `MCP_HTTP_JSON_LIMIT` | `1mb` | Request body cap. |
 | `MCP_HTTP_TRUST_PROXY` | `1` | `app.set("trust proxy", …)`. `1` is correct for Cloud Run. |
-| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Per-IP request cap inside the window. Tighten on open-DCR deployments — `get_user_activity` fans out ~200 upstream calls per invocation, so a cap of 300/min puts a worst-case 60k upstream calls/min ceiling on any single source IP. |
+| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Request cap per window, keyed on the **source IP** (not the OAuth client_id — under open DCR a caller can mint unlimited client_ids, so IP is the only sound key). Tighten on open-DCR deployments; the reference deployment uses 300. `get_user_activity` fan-out is separately bounded by a global per-call budget. |
 | `MCP_HTTP_RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window. |
 | `MCP_HTTP_RATE_LIMIT_DISABLED` | unset | Set to `1` to disable rate limiting entirely (only useful for local dev). |
 | `LOOMIO_MCP_LOG_VERBOSE` | unset | When `1`, emits structured JSON events to stderr (Cloud Run auto-parses). See OPTIMIZATIONS.md. |
 | `LOOMIO_B3_API_KEY` | unset | Server-instance admin secret. When set, registers `deactivate_user` / `reactivate_user`. **Do not set on a multi-user deployment** — see SECURITY.md. |
 
-Build and deploy:
+Build and deploy (open-DCR + read-only, matching the reference deployment):
 
 ```
 docker build -t loomiomcp .
-gcloud run deploy loomiomcp --image … --set-env-vars LOOMIO_API_KEY=…,PUBLIC_BASE_URL=…,MCP_OAUTH_SIGNING_KEY=…,MCP_OAUTH_CLIENT_ID=…,MCP_OAUTH_CLIENT_SECRET=…,LOOMIO_MCP_READONLY=1
+gcloud run deploy loomiomcp --image … --set-env-vars \
+  LOOMIO_API_KEY=…,PUBLIC_BASE_URL=https://mcp.openssl-communities.org,MCP_OAUTH_SIGNING_KEY=…,\
+  MCP_OAUTH_INSECURE_AUTO_APPROVE=1,MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes,\
+  MCP_HTTP_RATE_LIMIT_MAX=300,LOOMIO_MCP_READONLY=1,LOOMIO_MCP_LOG_VERBOSE=1
 ```
+
+For static-client mode instead, drop the three `MCP_OAUTH_INSECURE_*` /
+`_I_KNOW_*` vars and set `MCP_OAUTH_CLIENT_ID` + `MCP_OAUTH_CLIENT_SECRET`.
+The production stack is managed by Pulumi, not this raw command — see
+[Reference deployment](#reference-deployment).
 
 ## Rotating the API key
 

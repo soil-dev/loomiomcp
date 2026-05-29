@@ -233,4 +233,90 @@ describe("getUserActivity", () => {
     // 2 fetches: list_discussions(2) + events(10). No dup group fetches.
     expect(vi.mocked(fetch).mock.calls.length).toBe(2);
   });
+
+  it("rejects unparseable since/until at the schema layer", async () => {
+    const { getUserActivitySchema } = await import("../src/tools/events.js");
+    expect(
+      getUserActivitySchema.safeParse({ user_id: 2, group_ids: [1], since: "last week" }).success,
+    ).toBe(false);
+    expect(
+      getUserActivitySchema.safeParse({ user_id: 2, group_ids: [1], until: "2026-13-99" }).success,
+    ).toBe(false);
+    expect(
+      getUserActivitySchema.safeParse({ user_id: 2, group_ids: [1], since: "2026-01-31" }).success,
+    ).toBe(true);
+  });
+
+  it("reports a clean scan as complete with empty failure fields", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }] });
+    mockFetch(200, {
+      events: [
+        {
+          id: 1,
+          kind: "new_comment",
+          actor_id: 99,
+          created_at: "2025-01-01T10:00:00Z",
+          discussion_id: 10,
+          eventable_type: "Comment",
+          eventable_id: 1,
+        },
+      ],
+    });
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.scope.complete).toBe(true);
+    expect(r.scope.groups_failed).toEqual([]);
+    expect(r.scope.discussions_failed).toBe(0);
+    expect(r.scope.discussions_truncated).toBe(0);
+    expect(r.scope.discussions_capped).toBe(false);
+  });
+
+  it("records a group whose discussion list 403s and marks the scan incomplete", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }] }); // group 2 enumerates fine
+    mockFetch(403, { error: 403 }); // group 3 list_discussions denied
+    mockFetch(200, {
+      events: [
+        {
+          id: 1,
+          kind: "new_comment",
+          actor_id: 99,
+          created_at: "2025-01-01T10:00:00Z",
+          discussion_id: 10,
+          eventable_type: "Comment",
+          eventable_id: 1,
+        },
+      ],
+    });
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2, 3] });
+    expect(r.scope.groups_failed).toEqual([3]);
+    expect(r.scope.complete).toBe(false);
+    expect(r.scope.discussions_scanned).toBe(1); // only group 2's discussion
+    expect(r.counts.total).toBe(1);
+  });
+
+  it("flags a discussion as truncated when it hits the per-thread page cap", async () => {
+    // One discussion whose event stream fills every allowed page (10 × 200),
+    // so the fetch stops on the cap rather than a short page → truncated.
+    const fullPage = (start: number) => ({
+      events: Array.from({ length: 200 }, (_, i) => ({
+        id: start + i,
+        kind: "new_comment",
+        actor_id: 99,
+        created_at: "2025-01-01T10:00:00Z",
+        discussion_id: 10,
+        eventable_type: "Comment",
+        eventable_id: start + i,
+      })),
+    });
+    mockFetch(200, { discussions: [{ id: 10 }] });
+    for (let page = 0; page < 10; page++) mockFetch(200, fullPage(page * 200 + 1));
+
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.scope.discussions_truncated).toBe(1);
+    expect(r.scope.complete).toBe(false);
+    // 1 list_discussions + 10 event pages.
+    expect(vi.mocked(fetch).mock.calls.length).toBe(11);
+  });
 });

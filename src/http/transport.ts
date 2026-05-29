@@ -84,11 +84,18 @@ export function mountTransport(app: express.Express, opts: TransportOptions): vo
     limit: rateLimitMax,
     standardHeaders: "draft-7",
     legacyHeaders: false,
-    keyGenerator: (req) => {
-      const clientId = (req as { auth?: { clientId?: string } }).auth?.clientId;
-      if (clientId) return clientId;
-      return ipKeyGenerator(req.ip ?? "");
-    },
+    // Key the limiter on the SOURCE IP, never the OAuth client_id.
+    // Under open DCR (the public deployment) any caller can POST
+    // /register for unlimited fresh client_ids, so keying on client_id
+    // would let one source mint a brand-new 300/min bucket at will —
+    // silently defeating the limit. trust proxy=1 (Cloud Run's single
+    // front-end hop) makes req.ip the real client address (not
+    // X-Forwarded-For-spoofable past that hop), and ipKeyGenerator
+    // normalises IPv6 to a /56 so a /128 walk can't sidestep it. In
+    // static-client mode this is also strictly better than the old
+    // behaviour, which bucketed every caller under the one shared
+    // client_id.
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ""),
     skip: () => rateLimitDisabled,
     handler: (_req, res) => {
       res.status(429).json({

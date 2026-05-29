@@ -133,6 +133,36 @@ Loomio returns various shapes; `src/loomio/client.ts`'s
 - `{ "message": "..." }`
 - `{ "error": "..." }`
 
+## Gotcha 5: a 403 body is `{"error":403}` — useless for diagnosing *why*
+
+Verified live (2026-05-29) against the self-hosted instance: both of
+these return the byte-identical `{"error":403}` with HTTP 403:
+
+- a **valid** api_key whose user is a member but **not an admin** of
+  the group, calling an admin-gated endpoint (`b2/memberships`); and
+- a **bogus** api_key (rejected by `authenticate_api_key!` before any
+  group lookup).
+
+So the status + body alone can't tell "your key is broken" from "your
+key is fine, you just lack the admin role" from "the bot isn't in that
+group". That ambiguity is exactly what makes a raw 403 read as a
+connector/client bug when it's really a permission boundary.
+
+**The fence** (`src/loomio/access.ts`): when an admin-gated call 403s,
+probe a MEMBER-gated endpoint (`b2/polls?group_id=N`) with the same key.
+
+| memberships call | polls probe | meaning | message |
+|---|---|---|---|
+| 403 | **200** | key valid, bot is a member, lacks admin role | "needs the coordinator role (often intentional); names/ids still available via get_user_activity" |
+| 403 | 403 | key can't see the group at all | "key invalid/expired, or bot isn't a member" |
+| 403 | other | indeterminate | surfaces the probe status |
+
+The probe runs only on the 403 error path (one extra GET, rare), and
+its `loomio.request` event still shows up in the logs. `list_events` /
+`get_user_activity` read the event stream, which embeds user `id` /
+`name` / `username` (NOT `email`) for non-admins — that's the fallback
+the not-admin message points at. Email is genuinely admin-only.
+
 ## Verified live (2026-05-27 against a self-hosted Loomio 3.0.24)
 
 | Tool | Status | Notes |

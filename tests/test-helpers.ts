@@ -45,6 +45,9 @@ export function mockFetch(
     ok: status >= 200 && status < 300,
     headers: new Headers(headers),
     json: async () => body,
+    // `loomioGetStatus` (the access probe) drains the body via text();
+    // provide it so probes resolve cleanly in tests.
+    text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
     statusText: String(status),
   } as Awaited<ReturnType<typeof fetch>>);
 }

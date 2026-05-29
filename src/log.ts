@@ -115,13 +115,25 @@ export function logEvent(
  *
  * Patterns redacted:
  *   /b2/discussions/254022621        -> /b2/discussions/:id
- *   /b2/polls/abcDEF                 -> /b2/polls/abcDEF  (non-numeric keys preserved)
+ *   /b2/polls/abcDEF                 -> /b2/polls/:id  (string short-keys too)
  *   /b2/discussions/12?api_key=x     -> /b2/discussions/:id
  *   /b3/users/deactivate?id=42&b3_api_key=…   -> /b3/users/deactivate
+ *
+ * Both numeric ids AND alphanumeric short-keys are collapsed. The
+ * collection-scoped second pass only targets `discussions` / `polls`
+ * (the sole endpoints that take a string key in the PATH); it
+ * deliberately leaves the `/b3/users/deactivate` action verb intact.
  */
 export function redactPath(path: string): string {
   const noQuery = path.split("?")[0] ?? path;
-  return noQuery.replace(/\/\d+(?:,\d+)*/g, "/:id");
+  return (
+    noQuery
+      // Numeric ids (including comma-separated lists).
+      .replace(/\/\d+(?:,\d+)*/g, "/:id")
+      // Alphanumeric short-keys after the key-addressable collections.
+      // (Runs after the numeric pass, so a numeric id is already `:id`.)
+      .replace(/\/(discussions|polls)\/[^/]+/g, "/$1/:id")
+  );
 }
 
 /**

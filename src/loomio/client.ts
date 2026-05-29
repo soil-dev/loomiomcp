@@ -195,9 +195,26 @@ async function fetchWithTimeout(
 async function throwForStatus(res: Response): Promise<void> {
   if (res.status === 401 || res.status === 403) {
     const detail = await parseErrorBody(res);
+    const detailStr = String(detail ?? "").trim();
+    let pathHint = "the requested resource";
+    try {
+      pathHint = redactPath(new URL(res.url).pathname);
+    } catch {
+      // res.url unavailable / unparseable — keep the generic hint.
+    }
+    // Loomio returns a bare `{"error":403}` (no descriptive body) for
+    // BOTH an invalid key and a valid key whose user lacks the role a
+    // resource needs. So don't pin the blame on the key alone — name
+    // both causes. Tools that know a resource is role-gated (e.g.
+    // list_memberships) catch this and refine it via an access probe;
+    // see src/loomio/access.ts.
+    const detailSuffix = detailStr && detailStr !== String(res.status) ? `: ${detailStr}` : "";
     throw new LoomioAuthError(
-      `Loomio API returned ${res.status}: ${detail}. ` +
-        "Check that LOOMIO_API_KEY is valid and has access to the requested resource.",
+      `Loomio API returned ${res.status} for ${pathHint}${detailSuffix}. ` +
+        "Loomio sends the same 403 whether the connector's key is invalid/expired OR the key's user " +
+        "simply lacks the role this resource requires (some endpoints — e.g. listing a group's members " +
+        "— require the group-admin/coordinator role). Verify the key, and that the bot user has the " +
+        "needed role on the target group.",
       res.status,
     );
   }
@@ -301,6 +318,36 @@ export async function loomioGet<T>(path: string, params?: QueryParams): Promise<
   const start = await doFetch(url, { headers: baseHeaders() });
   try {
     return await consumeBody(start, () => handleResponse<T>(start.res));
+  } finally {
+    start.cleanup();
+  }
+}
+
+/**
+ * Issue a GET and return ONLY the HTTP status — never throws for an
+ * HTTP error status (unlike `loomioGet`, which raises on 4xx/5xx).
+ * Network errors and timeouts still throw.
+ *
+ * This exists for the access classifier (src/loomio/access.ts): when
+ * an admin-gated endpoint returns 403, a follow-up probe of a
+ * member-gated endpoint with the SAME key tells us whether the key is
+ * valid at all (probe 200 → valid, the 403 was about role) or being
+ * rejected outright (probe 403 → bad key / not a member). The body is
+ * drained so the socket frees and the standard `loomio.request`
+ * observability event still fires.
+ */
+export async function loomioGetStatus(path: string, params?: QueryParams): Promise<number> {
+  const url = buildUrl(B2_AUTH, path, params);
+  const start = await doFetch(url, { headers: baseHeaders() });
+  try {
+    return await consumeBody(start, async () => {
+      try {
+        await start.res.text();
+      } catch {
+        // Body already consumed / unreadable — we only need the status.
+      }
+      return start.res.status;
+    });
   } finally {
     start.cleanup();
   }

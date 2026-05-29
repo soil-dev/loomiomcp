@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.0.4 — 2026-05-29
+
+Hardening + clearer errors from a full pre-release audit. No new tools,
+no API shape changes; counts unchanged (8 reads + 4 writes + 2 b3 admin).
+
+Security:
+
+- **Rate limiter now keys on the source IP, not the OAuth client_id**
+  (`src/http/transport.ts`). Under open DCR a caller can `POST /register`
+  for unlimited fresh client_ids, so a client-id-keyed limit was
+  bypassable — each new client got its own bucket. Keying on IP restores
+  the intended "N per minute per source" bound (trust-proxy=1 makes
+  `req.ip` the real client address on Cloud Run).
+
+Clearer 403s on the membership tools (the original motivation):
+
+- Loomio answers a 403 with a bare `{"error":403}` and returns that SAME
+  body whether the key is invalid, the bot isn't a member, or the bot is
+  a member but lacks the group-admin (coordinator) role that
+  `b2/memberships` requires. Indistinguishable from the response alone,
+  so a raw 403 reads as a bug when it's usually a deliberate permission
+  boundary (the bot is kept non-admin so it can't read everyone's email).
+- New access classifier (`src/loomio/access.ts`): on a 403 from an
+  admin-gated call it probes the member-gated `b2/polls?group_id=N` with
+  the same key. Probe 200 → key valid, bot is a member, just not an admin;
+  403 → invalid key or not a member; anything else → inconclusive. One
+  extra GET, only on the rare 403 path; if the probe itself errors the
+  original 403 is preserved rather than masked.
+- `list_memberships` / `manage_memberships` now raise a tailored error
+  explaining which case applies and what to do, and point at the
+  non-admin fallback: names / usernames / ids (not email) via
+  `get_user_activity` / `list_events`. NOTES-ON-LOOMIO-API.md "Gotcha 5"
+  documents the behaviour (verified live).
+
+`get_user_activity` robustness:
+
+- **Global fan-out budget.** The per-group and per-discussion page caps
+  multiplied with no overall ceiling; `MAX_SCAN_DISCUSSIONS` now bounds
+  the expensive event-fetch stage so one public, auto-approvable call
+  can't run away on a large instance.
+- **Completeness signals.** The result's `scope` now carries `complete`,
+  `groups_failed`, `discussions_failed`, `discussions_truncated`, and
+  `discussions_capped`. Previously a group that 403'd mid-scan was
+  silently dropped and the partial total looked authoritative — bad for
+  the tool's headline participation-analysis use. Partial scans are now
+  flagged so they're reported as partial.
+- **`since` / `until` are validated.** An unparseable timestamp used to
+  slip through and silently disable the time filter (NaN comparisons are
+  always false), turning a bounded query into a full-history scan that
+  still looked bounded. Now rejected at the schema layer.
+
+Other:
+
+- `redactPath` (`src/log.ts`) also redacts alphanumeric short-keys after
+  `discussions` / `polls`, not just numeric ids — matches the documented
+  "ids are de-identified" invariant now that verbose logging is on in
+  production. (The api_key was never at risk; the query string is
+  dropped regardless.)
+- MCP server `version` synced to the package version.
+- Docs: README tool catalog now lists `list_events` / `get_user_activity`
+  (added in 0.0.2 but missed from the README list); DEPLOY.md leads with
+  the open-DCR + readonly recipe and the custom-domain `PUBLIC_BASE_URL`;
+  SECURITY.md gains an "HTTP / multi-user posture" section (open DCR,
+  shared bot key, bot-memberships-as-boundary, the IP-keyed limiter, the
+  403 fence). Readonly deployments advertise 8 tools, local stdio 12,
+  with b3 14.
+
+Deployment (tracked in openssl/infra, not this repo): the reference
+Cloud Run service gained a 60s request timeout, instance/concurrency
+caps matched to the fan-out workload, and a `verbose_logging` Pulumi
+toggle.
+
 ## 0.0.3 — 2026-05-28
 
 Tool-selection tuning. No new tools, no API changes — just rewrites
