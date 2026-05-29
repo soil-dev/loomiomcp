@@ -23,13 +23,19 @@ tools are reads vs writes.
 The HTTP entry exposes the same MCP server over OAuth 2.1 (RFC 7591)
 so Claude.ai's Custom Connector can reach it.
 
+Current OAuth handshake state (open-DCR client registrations and pending
+authorization codes) is in process memory. Access and refresh tokens are
+stateless after issuance, but registration/authorization/token exchange
+must complete on the same running instance. On Cloud Run, keep
+`--max-instances=1` unless you add a shared OAuth store.
+
 Required env in any HTTP deployment:
 
 | Variable | What it is |
 |---|---|
 | `LOOMIO_API_KEY` | Loomio API key. Shared by every authenticated MCP caller hitting this deployment. |
-| `LOOMIO_API_BASE_URL` | Loomio API root. Defaults to `https://www.loomio.com/api`. Set to e.g. `https://openssl-communities.org/api` for a self-hosted instance. Override is gated to `https://` or loopback `http://` so the api_key (which travels as a query parameter) can't leak to a plaintext host. |
-| `PUBLIC_BASE_URL` | Public origin of the service, e.g. `https://mcp.openssl-communities.org` (the reference deployment's custom domain) or the raw `https://loomiomcp-xyz.run.app`. Must match the URL clients fetch — it's the OAuth metadata issuer (RFC 8414). |
+| `LOOMIO_API_BASE_URL` | Loomio API root. Defaults to `https://www.loomio.com/api`. Set to e.g. `https://loomio.example.org/api` for a self-hosted instance. Override is gated to `https://` or loopback `http://` so the api_key (which travels as a query parameter) can't leak to a plaintext host. |
+| `PUBLIC_BASE_URL` | Public origin of the service, e.g. a custom domain `https://mcp.example.org` or the raw `https://loomiomcp-xyz.run.app`. Must match the URL clients fetch — it's the OAuth metadata issuer (RFC 8414). |
 | `MCP_OAUTH_SIGNING_KEY` | HMAC key for OAuth tokens (≥16 chars, stable across instances). |
 
 OAuth mode (pick one):
@@ -39,8 +45,8 @@ OAuth mode (pick one):
   in this mode on a non-loopback `PUBLIC_BASE_URL` unless you also set
   `MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes`. Use this when the upstream
   identity is intentionally public — e.g. a read-only bot scoped to
-  open community discussions. **This is how the `openssl-communities.org`
-  reference deployment runs** (see [Reference deployment](#reference-deployment)).
+  open community discussions. This is the recommended mode for a public,
+  read-only community connector (see [Reference deployment](#reference-deployment)).
   The per-IP rate limit (below) is the abuse bound in this mode, so keep
   it set.
 - **Static client (lock-down alternative).** Set both
@@ -75,7 +81,7 @@ Build and deploy (open-DCR + read-only, matching the reference deployment):
 ```
 docker build -t loomiomcp .
 gcloud run deploy loomiomcp --image … --set-env-vars \
-  LOOMIO_API_KEY=…,PUBLIC_BASE_URL=https://mcp.openssl-communities.org,MCP_OAUTH_SIGNING_KEY=…,\
+  LOOMIO_API_KEY=…,PUBLIC_BASE_URL=https://mcp.example.org,MCP_OAUTH_SIGNING_KEY=…,\
   MCP_OAUTH_INSECURE_AUTO_APPROVE=1,MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes,\
   MCP_HTTP_RATE_LIMIT_MAX=300,LOOMIO_MCP_READONLY=1,LOOMIO_MCP_LOG_VERBOSE=1
 ```
@@ -94,16 +100,17 @@ Loomio). To invalidate every outstanding OAuth token at once, rotate
 
 ## Reference deployment
 
-A working production Cloud Run deployment with secrets handling via
-GCP KMS + Secret Manager lives at
-[openssl/infra GCP/loomiomcp](https://github.com/openssl/infra/tree/main/GCP/loomiomcp/).
-Pulumi project, three bootstrap scripts (API key, signing key, OAuth
-client), and a smoke test that walks the OAuth dance.
+The connector is designed for Cloud Run (or any container host) behind
+its own OAuth-at-the-edge layer, with `LOOMIO_API_KEY` and
+`MCP_OAUTH_SIGNING_KEY` held in a secret manager and injected as env
+vars. A production-grade setup wires that up with an IaC tool (e.g.
+Pulumi): KMS-backed secrets, bootstrap scripts for the API key /
+signing key / OAuth client, and a smoke test that walks the full OAuth
+dance against the deployed endpoint. None of that is connector-specific
+beyond the env vars documented above.
 
 ## Image build
 
-The container image used by that reference deployment is built by
-[openssl/images loomiomcp/build.sh](https://github.com/openssl/images/tree/main/loomiomcp/build.sh).
-A `Dockerfile` ships in this repo for direct `docker build`; the
-`build.sh` wrapper standardises tagging + push for the openssl
-container registry.
+A `Dockerfile` ships in this repo for a direct `docker build`. For
+local stdio use no container is needed at all — `npx loomiomcp` runs
+the published package.

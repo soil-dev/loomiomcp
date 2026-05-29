@@ -1,15 +1,21 @@
 import { z } from "zod";
-import { loomioGet } from "../loomio/client.js";
+import { LoomioApiError, LoomioAuthError, loomioGet } from "../loomio/client.js";
 import { isoTimestamp, positiveId } from "./_common.js";
+
+const CONCURRENCY = 6;
+const EVENTS_PAGE_SIZE = 200;
+const MAX_EVENTS_PAGES = 10; // hard cap per discussion to bound a single bad thread
+const MAX_DISCUSSION_PAGES = 20; // hard cap per group when enumerating discussions
+const MAX_SCAN_DISCUSSIONS = 500; // global ceiling on discussions whose events we fetch
 
 // ── list_events ─────────────────────────────────────────────────────────────
 //
-// Thin pass-through to Loomio's v1 `events` endpoint, scoped to one
-// discussion. The v1 events controller has no api-key auth gate of
-// its own — visibility is enforced by the discussion's group
-// membership rules. The connector's bot needs membership in the
-// discussion's group (or the discussion's group must be public);
-// admin role is NOT required, unlike `list_memberships`.
+// Paginated wrapper around Loomio's v1 `events` endpoint, scoped to
+// one discussion. The v1 events controller has no api-key auth gate of
+// its own — visibility is enforced by the discussion's group membership
+// rules. The connector's bot needs membership in the discussion's group
+// (or the discussion's group must be public); admin role is NOT
+// required, unlike `list_memberships`.
 //
 // The server-side filter on v1/events is `discussion_id`. There is
 // no `actor_id` / `group_id` index; both are accepted as params but
@@ -46,6 +52,14 @@ interface EventsResponse {
   meta?: { root?: string; total?: number | null };
 }
 
+interface EventsWithScope extends EventsResponse {
+  scope: {
+    complete: boolean;
+    pages_fetched: number;
+    events_truncated: boolean;
+  };
+}
+
 export const listEventsSchema = z.object({
   discussion_id: positiveId.describe(
     "ID of the discussion whose event stream to fetch. Required — Loomio's v1/events endpoint silently returns empty without it.",
@@ -56,13 +70,17 @@ export const listEventsSchema = z.object({
     .min(1)
     .max(200)
     .optional()
-    .describe("Page size. Loomio defaults to 50; cap is 200."),
+    .describe(
+      "Page size for a single-page fetch. Omit limit/offset to let the connector paginate the full discussion stream up to its bounded cap.",
+    ),
   offset: z
     .number()
     .int()
     .min(0)
     .optional()
-    .describe("Page offset (Loomio's `from` parameter). Defaults to 0."),
+    .describe(
+      "Page offset (Loomio's `from` parameter). When supplied, list_events returns exactly that page instead of auto-paginating.",
+    ),
   kinds: z
     .array(z.string().min(1))
     .optional()
@@ -71,21 +89,66 @@ export const listEventsSchema = z.object({
     ),
 });
 
-export async function listEvents(input: z.infer<typeof listEventsSchema>) {
-  const resp = await loomioGet<EventsResponse>("/v1/events", {
-    discussion_id: input.discussion_id,
-    ...(input.limit !== undefined ? { per: input.limit } : {}),
-    ...(input.offset !== undefined ? { from: input.offset } : {}),
-  });
+function mergeEventResponse(into: EventsResponse, from: EventsResponse): void {
+  into.events = [...(into.events ?? []), ...(from.events ?? [])];
+  into.comments = [...(into.comments ?? []), ...(from.comments ?? [])];
+  into.users = [...(into.users ?? []), ...(from.users ?? [])];
+  into.polls = [...(into.polls ?? []), ...(from.polls ?? [])];
+  into.parent_events = [...(into.parent_events ?? []), ...(from.parent_events ?? [])];
+  into.meta = from.meta ?? into.meta;
+}
 
-  if (input.kinds?.length) {
-    const allowed = new Set(input.kinds);
-    return {
-      ...resp,
-      events: (resp.events ?? []).filter((e) => allowed.has(e.kind)),
-    };
+function filterKinds<T extends EventsResponse>(resp: T, kinds?: string[]): T {
+  if (!kinds?.length) return resp;
+  const allowed = new Set(kinds);
+  return {
+    ...resp,
+    events: (resp.events ?? []).filter((e) => allowed.has(e.kind)),
+  };
+}
+
+export async function listEvents(input: z.infer<typeof listEventsSchema>) {
+  if (input.limit !== undefined || input.offset !== undefined) {
+    const resp = await loomioGet<EventsResponse>("/v1/events", {
+      discussion_id: input.discussion_id,
+      ...(input.limit !== undefined ? { per: input.limit } : {}),
+      ...(input.offset !== undefined ? { from: input.offset } : {}),
+    });
+    return filterKinds(resp, input.kinds);
   }
-  return resp;
+
+  const merged: EventsResponse = {};
+  let offset = 0;
+  let pagesFetched = 0;
+  let truncated = false;
+
+  for (let page = 0; page < MAX_EVENTS_PAGES; page++) {
+    const resp = await loomioGet<EventsResponse>("/v1/events", {
+      discussion_id: input.discussion_id,
+      per: EVENTS_PAGE_SIZE,
+      from: offset,
+    });
+    pagesFetched++;
+    const evs = resp.events ?? [];
+    mergeEventResponse(merged, resp);
+    if (evs.length < EVENTS_PAGE_SIZE) break;
+    offset += EVENTS_PAGE_SIZE;
+    // Full page on the final allowed iteration means the returned "full"
+    // stream is capped; surface that rather than silently clipping it.
+    if (page === MAX_EVENTS_PAGES - 1) truncated = true;
+  }
+
+  return filterKinds(
+    {
+      ...merged,
+      scope: {
+        complete: !truncated,
+        pages_fetched: pagesFetched,
+        events_truncated: truncated,
+      },
+    } satisfies EventsWithScope,
+    input.kinds,
+  );
 }
 
 // ── get_user_activity ───────────────────────────────────────────────────────
@@ -97,9 +160,9 @@ export async function listEvents(input: z.infer<typeof listEventsSchema>) {
 // specified), fetch the event stream, filter to events authored by
 // the target user, and aggregate.
 //
-// Cost: ~1 HTTP call per discussion in scope. On openssl-communities,
-// that's ~200 calls for an instance-wide scan — limited by the
-// CONCURRENCY pool to bursts of 6.
+// Cost: ~1 HTTP call per discussion in scope. On a mid-sized instance
+// (a few hundred discussions) that's a few hundred calls for an
+// instance-wide scan — limited by the CONCURRENCY pool to bursts of 6.
 //
 // Amplification guard: the per-group and per-discussion page caps below
 // MULTIPLY (groups × disc-pages × event-pages), so without a global
@@ -110,12 +173,6 @@ export async function listEvents(input: z.infer<typeof listEventsSchema>) {
 // `truncated`, so the aggregate is never silently partial. The cap sits
 // far above this instance's ~200 discussions, so normal scans are
 // unaffected.
-
-const CONCURRENCY = 6;
-const EVENTS_PAGE_SIZE = 200;
-const MAX_EVENTS_PAGES = 10; // hard cap per discussion to bound a single bad thread
-const MAX_DISCUSSION_PAGES = 20; // hard cap per group when enumerating discussions
-const MAX_SCAN_DISCUSSIONS = 500; // global ceiling on discussions whose events we fetch
 
 const ACTIVITY_KINDS = new Set([
   "new_discussion",
@@ -128,22 +185,33 @@ const ACTIVITY_KINDS = new Set([
   "reaction",
 ]);
 
-export const getUserActivitySchema = z.object({
-  user_id: positiveId.describe("Loomio user id whose activity to summarise."),
-  group_ids: z
-    .array(positiveId)
-    .min(1)
-    .max(50)
-    .describe(
-      "Groups to scan. Required — pass the result of `list_groups` (or a subset of it) to make the cost explicit. ~1 outbound HTTP request per discussion in scope, plus one list_discussions call per group; ~100-300 calls is typical for a wide scan. Capped at 50 groups per call.",
+export const getUserActivitySchema = z
+  .object({
+    user_id: positiveId.describe("Loomio user id whose activity to summarise."),
+    group_ids: z
+      .array(positiveId)
+      .min(1)
+      .max(50)
+      .describe(
+        "Groups to scan. Required — pass the result of `list_groups` (or a subset of it) to make the cost explicit. ~1 outbound HTTP request per discussion in scope, plus one list_discussions call per group; ~100-300 calls is typical for a wide scan. Capped at 50 groups per call.",
+      ),
+    since: isoTimestamp.describe(
+      "ISO-8601 timestamp; ignore events before this time. Rejected if unparseable (so a typo can't silently widen the scan to all history).",
     ),
-  since: isoTimestamp.describe(
-    "ISO-8601 timestamp; ignore events before this time. Rejected if unparseable (so a typo can't silently widen the scan to all history).",
-  ),
-  until: isoTimestamp.describe(
-    "ISO-8601 timestamp; ignore events at or after this time. Rejected if unparseable.",
-  ),
-});
+    until: isoTimestamp.describe(
+      "ISO-8601 timestamp; ignore events at or after this time. Rejected if unparseable.",
+    ),
+  })
+  .superRefine((input, ctx) => {
+    if (!input.since || !input.until) return;
+    if (Date.parse(input.until) <= Date.parse(input.since)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["until"],
+        message: "until must be later than since.",
+      });
+    }
+  });
 
 interface ActivityResult {
   user_id: number;
@@ -161,13 +229,16 @@ interface ActivityResult {
     discussions_failed: number; // discussions whose event stream errored and were skipped
     discussions_truncated: number; // discussions that hit the per-thread page cap (events beyond it not counted)
     discussions_capped: boolean; // true if the global MAX_SCAN_DISCUSSIONS ceiling dropped some discussions
+    groups_truncated: number[]; // groups whose discussion listing hit MAX_DISCUSSION_PAGES
   };
   counts: {
     total: number;
     new_discussion: number;
     new_comment: number;
+    comment_edited: number;
     poll_created: number;
     stance_created: number;
+    stance_updated: number;
     outcome_created: number;
     reaction: number;
     other: number;
@@ -191,9 +262,10 @@ interface DiscussionsListResponse {
 
 async function listDiscussionIdsForGroup(
   groupId: number,
-): Promise<Array<{ id: number; group_id: number }>> {
+): Promise<{ discussions: Array<{ id: number; group_id: number }>; truncated: boolean }> {
   const all: Array<{ id: number; group_id: number }> = [];
   let offset = 0;
+  let truncated = false;
   // Pagination — Loomio returns at most ~200 per page. Cap iterations
   // to avoid runaway scans.
   for (let page = 0; page < MAX_DISCUSSION_PAGES; page++) {
@@ -207,8 +279,9 @@ async function listDiscussionIdsForGroup(
     for (const d of ds) all.push({ id: d.id, group_id: groupId });
     if (ds.length < EVENTS_PAGE_SIZE) break;
     offset += EVENTS_PAGE_SIZE;
+    if (page === MAX_DISCUSSION_PAGES - 1) truncated = true;
   }
-  return all;
+  return { discussions: all, truncated };
 }
 
 // Fetch a discussion's events, paginating up to MAX_EVENTS_PAGES.
@@ -244,6 +317,7 @@ async function runWithConcurrency<T, R>(
   items: T[],
   worker: (item: T) => Promise<R>,
   concurrency: number,
+  recoverError: (err: unknown) => boolean = () => true,
 ): Promise<Array<R | null>> {
   const results: Array<R | null> = new Array(items.length).fill(null);
   let next = 0;
@@ -253,13 +327,31 @@ async function runWithConcurrency<T, R>(
       if (i >= items.length) return;
       try {
         results[i] = await worker(items[i]!);
-      } catch {
+      } catch (err) {
+        if (!recoverError(err)) throw err;
         results[i] = null;
       }
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, take));
   return results;
+}
+
+function isRecoverableScanError(err: unknown): boolean {
+  if (err instanceof LoomioAuthError) return err.status === 403;
+  return err instanceof LoomioApiError;
+}
+
+function rememberRecentSample(samples: ActivityResult["sample_events"], e: LoomioEvent): void {
+  samples.push({
+    kind: e.kind,
+    discussion_id: e.discussion_id,
+    created_at: e.created_at,
+    eventable_type: e.eventable_type,
+    eventable_id: e.eventable_id,
+  });
+  samples.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  if (samples.length > 10) samples.length = 10;
 }
 
 export async function getUserActivity(
@@ -276,12 +368,15 @@ export async function getUserActivity(
     groupIds,
     (gid) => listDiscussionIdsForGroup(gid),
     CONCURRENCY,
+    isRecoverableScanError,
   );
   const groupsFailed: number[] = [];
+  const groupsTruncated: number[] = [];
   const discussions: Array<{ id: number; group_id: number }> = [];
   groupDiscussionLists.forEach((list, i) => {
     if (list) {
-      discussions.push(...list);
+      discussions.push(...list.discussions);
+      if (list.truncated) groupsTruncated.push(groupIds[i]!);
     } else {
       groupsFailed.push(groupIds[i]!);
     }
@@ -306,8 +401,10 @@ export async function getUserActivity(
     total: 0,
     new_discussion: 0,
     new_comment: 0,
+    comment_edited: 0,
     poll_created: 0,
     stance_created: 0,
+    stance_updated: 0,
     outcome_created: 0,
     reaction: 0,
     other: 0,
@@ -325,6 +422,7 @@ export async function getUserActivity(
       return { groupId: d.group_id, events, truncated };
     },
     CONCURRENCY,
+    isRecoverableScanError,
   );
 
   for (const s of eventStreams) {
@@ -353,15 +451,7 @@ export async function getUserActivity(
       byMonth[month] = (byMonth[month] ?? 0) + 1;
       if (!firstActivity || e.created_at < firstActivity) firstActivity = e.created_at;
       if (!lastActivity || e.created_at > lastActivity) lastActivity = e.created_at;
-      if (samples.length < 10) {
-        samples.push({
-          kind: e.kind,
-          discussion_id: e.discussion_id,
-          created_at: e.created_at,
-          eventable_type: e.eventable_type,
-          eventable_id: e.eventable_id,
-        });
-      }
+      rememberRecentSample(samples, e);
     }
   }
 
@@ -369,6 +459,7 @@ export async function getUserActivity(
     groupsFailed.length === 0 &&
     discussionsFailed === 0 &&
     discussionsTruncated === 0 &&
+    groupsTruncated.length === 0 &&
     !discussionsCapped;
 
   return {
@@ -384,6 +475,7 @@ export async function getUserActivity(
       discussions_failed: discussionsFailed,
       discussions_truncated: discussionsTruncated,
       discussions_capped: discussionsCapped,
+      groups_truncated: groupsTruncated,
     },
     counts,
     by_group: byGroup,

@@ -20,7 +20,7 @@ describe("listEvents", () => {
     expect((opts as RequestInit | undefined)?.method ?? "GET").toBe("GET");
   });
 
-  it("returns the response untouched when no `kinds` filter is set", async () => {
+  it("returns a full-stream response with completeness metadata when no page is requested", async () => {
     mockFetch(200, {
       events: [
         { id: 1, kind: "new_discussion", actor_id: 2 },
@@ -35,10 +35,31 @@ describe("listEvents", () => {
       events: Array<{ id: number; kind: string }>;
       users: unknown[];
       comments: unknown[];
+      scope: { complete: boolean; pages_fetched: number };
     };
     expect(r.events.map((e) => e.kind)).toEqual(["new_discussion", "new_comment", "reaction"]);
     expect(r.users).toHaveLength(2);
     expect(r.comments).toHaveLength(1);
+    expect(r.scope).toMatchObject({ complete: true, pages_fetched: 1 });
+    const [url] = vi.mocked(fetch).mock.calls[0]!;
+    expect(url).toContain("per=200");
+    expect(url).toContain("from=0");
+  });
+
+  it("paginates full event streams until a short page", async () => {
+    mockFetch(200, {
+      events: Array.from({ length: 200 }, (_, i) => ({ id: i + 1, kind: "new_comment" })),
+    });
+    mockFetch(200, { events: [{ id: 201, kind: "reaction" }] });
+
+    const { listEvents } = await import("../src/tools/events.js");
+    const r = (await listEvents({ discussion_id: 218 })) as {
+      events: Array<{ id: number }>;
+      scope: { complete: boolean; pages_fetched: number };
+    };
+    expect(r.events).toHaveLength(201);
+    expect(r.scope).toMatchObject({ complete: true, pages_fetched: 2 });
+    expect(vi.mocked(fetch).mock.calls[1]![0]).toContain("from=200");
   });
 
   it("applies `kinds` filter client-side, keeping embedded arrays intact", async () => {
@@ -247,6 +268,51 @@ describe("getUserActivity", () => {
     ).toBe(true);
   });
 
+  it("rejects inverted since/until windows at the schema layer", async () => {
+    const { getUserActivitySchema } = await import("../src/tools/events.js");
+    expect(
+      getUserActivitySchema.safeParse({
+        user_id: 2,
+        group_ids: [1],
+        since: "2026-02-01T00:00:00Z",
+        until: "2026-01-01T00:00:00Z",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("counts every tracked activity kind explicitly", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }] });
+    mockFetch(200, {
+      events: [
+        {
+          id: 1,
+          kind: "comment_edited",
+          actor_id: 99,
+          created_at: "2025-01-01T10:00:00Z",
+          discussion_id: 10,
+          eventable_type: "Comment",
+          eventable_id: 1,
+        },
+        {
+          id: 2,
+          kind: "stance_updated",
+          actor_id: 99,
+          created_at: "2025-01-02T10:00:00Z",
+          discussion_id: 10,
+          eventable_type: "Stance",
+          eventable_id: 2,
+        },
+      ],
+    });
+
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.counts.total).toBe(2);
+    expect(r.counts.comment_edited).toBe(1);
+    expect(r.counts.stance_updated).toBe(1);
+    expect(r.counts.other).toBe(0);
+  });
+
   it("reports a clean scan as complete with empty failure fields", async () => {
     mockFetch(200, { discussions: [{ id: 10 }] });
     mockFetch(200, {
@@ -269,6 +335,7 @@ describe("getUserActivity", () => {
     expect(r.scope.discussions_failed).toBe(0);
     expect(r.scope.discussions_truncated).toBe(0);
     expect(r.scope.discussions_capped).toBe(false);
+    expect(r.scope.groups_truncated).toEqual([]);
   });
 
   it("records a group whose discussion list 403s and marks the scan incomplete", async () => {
@@ -293,6 +360,47 @@ describe("getUserActivity", () => {
     expect(r.scope.complete).toBe(false);
     expect(r.scope.discussions_scanned).toBe(1); // only group 2's discussion
     expect(r.counts.total).toBe(1);
+  });
+
+  it("propagates invalid-key 401s instead of reporting partial activity", async () => {
+    mockFetch(401, { error: "bad api key" });
+    const { getUserActivity } = await import("../src/tools/events.js");
+    await expect(getUserActivity({ user_id: 99, group_ids: [2] })).rejects.toThrow(/401/);
+  });
+
+  it("reports group discussion-list truncation", async () => {
+    const fullDiscussionPage = (start: number) => ({
+      discussions: Array.from({ length: 200 }, (_, i) => ({ id: start + i })),
+    });
+    for (let page = 0; page < 20; page++) mockFetch(200, fullDiscussionPage(page * 200 + 1));
+    for (let i = 0; i < 500; i++) mockFetch(200, { events: [] });
+
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.scope.groups_truncated).toEqual([2]);
+    expect(r.scope.discussions_capped).toBe(true);
+    expect(r.scope.complete).toBe(false);
+  });
+
+  it("keeps sample_events sorted by recency", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }] });
+    mockFetch(200, {
+      events: Array.from({ length: 12 }, (_, i) => ({
+        id: i + 1,
+        kind: "new_comment",
+        actor_id: 99,
+        created_at: `2025-01-${String(i + 1).padStart(2, "0")}T10:00:00Z`,
+        discussion_id: 10,
+        eventable_type: "Comment",
+        eventable_id: i + 1,
+      })),
+    });
+
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.sample_events).toHaveLength(10);
+    expect(r.sample_events[0]!.created_at).toBe("2025-01-12T10:00:00Z");
+    expect(r.sample_events.at(-1)!.created_at).toBe("2025-01-03T10:00:00Z");
   });
 
   it("flags a discussion as truncated when it hits the per-thread page cap", async () => {

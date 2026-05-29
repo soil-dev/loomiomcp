@@ -7,19 +7,18 @@ exposes a small tool surface that calls Loomio's b2 API on behalf of
 authenticated MCP clients, plus optional b3 admin endpoints (gated by
 a separate, server-instance secret) when explicitly enabled.
 
-## HTTP / multi-user posture (the public deployment)
+## HTTP / multi-user posture (public deployments)
 
-The reference deployment (`mcp.openssl-communities.org`) runs in a
-specific shape that defines its blast radius. Understand this before
-exposing the connector publicly:
+A public, open-DCR deployment runs in a specific shape that defines its
+blast radius. Understand this before exposing the connector publicly:
 
 - **Open DCR.** Anyone who can reach the URL can register an OAuth
   client and connect (`MCP_OAUTH_INSECURE_AUTO_APPROVE=1`). The OAuth
   layer is therefore **not** an authentication boundary here — it gates
   protocol conformance, not identity.
 - **One shared upstream identity.** Every caller acts as the same
-  Loomio user — the "Communities Bot" behind `LOOMIO_API_KEY`. There is
-  no per-user upstream auth (Loomio's per-user v1 API is Turnstile-walled).
+  Loomio user — the bot account behind `LOOMIO_API_KEY`. There is no
+  per-user upstream auth (Loomio's per-user v1 API is Turnstile-walled).
 - **The bot's group memberships ARE the access boundary.** A caller
   reads exactly what the bot can read — no more. Scope the deployment by
   scoping the bot: add it only to groups whose data may be public.
@@ -131,14 +130,18 @@ reference deployment uses 300/min/IP).
 
 ## OAuth
 
-The HTTP transport's OAuth surface (under `src/auth/`) is HMAC-signed,
-stateless. Rotate `MCP_OAUTH_SIGNING_KEY` to invalidate every
-outstanding token at once. PKCE (S256) is enforced on the token
-exchange and the auth code is single-use, client- and redirect-bound,
-with a 5-minute TTL. In open-DCR mode the OAuth dance proves protocol
-conformance, not identity (see the multi-user posture section above);
-the `/mcp` rate limiter is keyed on source IP precisely because client
-ids are caller-mintable in that mode. See DEPLOY.md.
+The HTTP transport's access and refresh tokens (under `src/auth/`) are
+HMAC-signed and stateless. Rotate `MCP_OAUTH_SIGNING_KEY` to invalidate
+every outstanding token at once. Pending authorization codes and open-DCR
+client registrations are held in process memory: they are single-use /
+client- / redirect-bound with a 5-minute auth-code TTL, but the OAuth
+handshake must complete on the same running instance that issued the
+code and registered the client. Run Cloud Run with one instance for the
+current implementation, or add a shared OAuth store before horizontal
+scaling. In open-DCR mode the OAuth dance proves protocol conformance,
+not identity (see the multi-user posture section above); the `/mcp` rate
+limiter is keyed on source IP precisely because client ids are
+caller-mintable in that mode. See DEPLOY.md.
 
 ## Reporting
 

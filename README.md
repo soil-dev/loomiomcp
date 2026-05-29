@@ -25,13 +25,16 @@ Tools (b2, per-user `?api_key=`):
   visible groups by probing `b2/polls` across an id range. Loomio has no
   api-key-authed list-groups endpoint; this is the workaround. Default scans
   are ~50–200 outbound calls; a single invocation is capped at 500 ids
-- `list_events(discussion_id, limit?, offset?, kinds?)` — the full event stream for
-  one discussion (comments, reactions, stances, outcomes, …) with `actor_id`, `kind`,
-  timestamps, and embedded `users` / `comments` / `polls`
+- `list_events(discussion_id, limit?, offset?, kinds?)` — the event stream for one
+  discussion (comments, reactions, stances, outcomes, …) with `actor_id`, `kind`,
+  timestamps, and embedded `users` / `comments` / `polls`. With no `limit`/`offset`
+  it paginates up to a bounded cap and reports `scope.complete`; with either
+  pagination knob it returns that one page.
 - `get_user_activity(user_id, group_ids, since?, until?)` — aggregate one user's
   participation across groups (counts by kind / group / month, first/last activity).
   The primary tool for any user-centric question; fans out server-side with a bounded
-  budget and reports completeness via `scope.complete`
+  budget and reports completeness via `scope.complete`. If both `since` and `until`
+  are supplied, `until` must be later than `since`.
 - `manage_memberships({group_id, emails, remove_absent})` — add and (with
   `remove_absent: true`) **remove** members. See SECURITY.md before using
   `remove_absent`.
