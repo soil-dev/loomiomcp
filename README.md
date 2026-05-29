@@ -1,5 +1,10 @@
 # loomiomcp
 
+[![npm](https://img.shields.io/npm/v/loomiomcp)](https://www.npmjs.com/package/loomiomcp)
+[![CI](https://github.com/soil-dev/loomiomcp/actions/workflows/ci.yml/badge.svg)](https://github.com/soil-dev/loomiomcp/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Glama](https://glama.ai/mcp/servers/soil-dev/loomiomcp/badge)](https://glama.ai/mcp/servers/soil-dev/loomiomcp)
+
 Model Context Protocol server for [Loomio](https://www.loomio.com). Lets
 Claude (Desktop, Code, or web Projects via Custom Connector) read and
 write Loomio discussions, polls, comments, and group memberships — and

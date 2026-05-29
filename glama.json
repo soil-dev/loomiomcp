@@ -1,6 +1,6 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "description": "MCP server for Loomio (loomio.com and self-hosted instances). 9 tools across discussions, polls, comments, and group memberships via Loomio's b2 public API (auth: ?api_key=). Plus 2 opt-in instance-admin tools (deactivate / reactivate user) on the b3 namespace, gated by LOOMIO_B3_API_KEY. Read-only mode supported via LOOMIO_MCP_READONLY=1 — Cloud Run deployments default to this; local stdio enables writes by default. Read tools are annotated with readOnlyHint and destructive writes (manage_memberships with remove_absent, deactivate_user) carry destructiveHint so MCP clients can prompt before invocation.",
+  "description": "MCP server for Loomio (loomio.com and self-hosted instances). 12 tools (8 read, 4 write) covering discussions, polls, comments, group memberships, per-discussion event streams, and per-user activity analysis via Loomio's b2 public API (auth: ?api_key=). Plus 2 opt-in instance-admin tools (deactivate / reactivate user) on the b3 namespace, gated by LOOMIO_B3_API_KEY. Read-only mode via LOOMIO_MCP_READONLY=1 advertises only the 8 read tools — Cloud Run deployments default to this; local stdio enables writes. Every tool carries the full MCP ToolAnnotations set: reads are readOnlyHint + idempotentHint so clients can auto-approve them, and destructive writes (manage_memberships with remove_absent, deactivate_user) carry destructiveHint so clients prompt before invocation.",
   "categories": ["collaboration", "productivity"],
   "maintainers": ["arapov"]
 }
