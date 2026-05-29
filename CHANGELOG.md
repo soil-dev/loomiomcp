@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.0.6 — 2026-05-29
+
+Tooling and project-metadata only — **no API, tool, or behaviour
+changes** (the compiled output is identical to 0.0.5 apart from the
+advertised version string).
+
+- **CI**: added `.github/workflows/ci.yml` — typecheck + tests + lint +
+  build on every push/PR, across Node 22 and 24. (The repo had 121
+  tests but nothing ran them automatically.)
+- **`glama.json`**: corrected a stale inventory (it still said "9
+  tools", pre-dating `list_events` / `get_user_activity`). Now
+  accurately describes 12 tools (8 read, 4 write) plus the 2 opt-in b3
+  admin tools, and notes the ToolAnnotations.
+- **README**: npm / CI / license / Glama badges.
+
 ## 0.0.5 — 2026-05-29
 
 Audit follow-ups + general-purpose hygiene. No new tools; counts
