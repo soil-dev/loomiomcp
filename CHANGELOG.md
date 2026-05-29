@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.0.5 — 2026-05-29
+
+Audit follow-ups + general-purpose hygiene. No new tools; counts
+unchanged (8 reads + 4 writes + 2 b3 admin).
+
+`list_events`:
+
+- Without `limit`/`offset` it now **auto-paginates the full discussion
+  stream** (merging the embedded `comments` / `users` / `polls` arrays
+  across pages) up to a bounded cap, and reports `scope.complete` /
+  `scope.pages_fetched` / `scope.events_truncated`. Pass `limit` and/or
+  `offset` to get exactly one page as before. Previously a single
+  default-page fetch could silently miss later events in a long thread.
+
+`get_user_activity`:
+
+- **Count fix:** `comment_edited` and `stance_updated` events were in
+  the activity set but missing from the `counts` object, so they were
+  silently bucketed as `other`. They're now counted under their own
+  keys.
+- **New completeness signal `scope.groups_truncated`** — groups whose
+  discussion listing hit the per-group page cap (so some discussions
+  weren't scanned). Joins the `complete` / `groups_failed` /
+  `discussions_failed` / `discussions_truncated` / `discussions_capped`
+  set from 0.0.4.
+- **`until` must be later than `since`** when both are supplied
+  (rejected at the schema layer).
+
+General-purpose hygiene:
+
+- Removed deployment-specific references so the connector reads as the
+  general-purpose tool it is. Tool descriptions (which ship to every
+  client over MCP) now use neutral examples instead of one instance's
+  group names; docs use `example.org` placeholders and describe the
+  Cloud Run / IaC deployment pattern generically rather than naming a
+  specific operator's repos. No behaviour change.
+
 ## 0.0.4 — 2026-05-29
 
 Hardening + clearer errors from a full pre-release audit. No new tools,

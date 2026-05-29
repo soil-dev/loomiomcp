@@ -54,7 +54,7 @@ export function createLoomioMcpServer(): McpServer {
   const server = new McpServer({
     name: "loomiomcp",
     // Keep in sync with package.json on each release.
-    version: "0.0.4",
+    version: "0.0.5",
     description:
       "MCP server for Loomio (loomio.com / self-hosted). Wraps Loomio's b2 public API: read and create discussions, polls, and comments; list and manage group memberships; read per-discussion event streams; and aggregate a user's participation across groups. Read-only mode supported via LOOMIO_MCP_READONLY=1 (Cloud Run pattern). Optional b3 admin operations (deactivate / reactivate user) when LOOMIO_B3_API_KEY is set — instance operators only. Read tools annotated with readOnlyHint so MCP clients can auto-approve safe calls; destructive writes (manage_memberships with remove_absent, deactivate_user) carry destructiveHint.",
     websiteUrl: "https://github.com/soil-dev/loomiomcp",
