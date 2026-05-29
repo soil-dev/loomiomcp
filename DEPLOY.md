@@ -23,6 +23,12 @@ tools are reads vs writes.
 The HTTP entry exposes the same MCP server over OAuth 2.1 (RFC 7591)
 so Claude.ai's Custom Connector can reach it.
 
+Current OAuth handshake state (open-DCR client registrations and pending
+authorization codes) is in process memory. Access and refresh tokens are
+stateless after issuance, but registration/authorization/token exchange
+must complete on the same running instance. On Cloud Run, keep
+`--max-instances=1` unless you add a shared OAuth store.
+
 Required env in any HTTP deployment:
 
 | Variable | What it is |
@@ -77,7 +83,8 @@ docker build -t loomiomcp .
 gcloud run deploy loomiomcp --image … --set-env-vars \
   LOOMIO_API_KEY=…,PUBLIC_BASE_URL=https://mcp.openssl-communities.org,MCP_OAUTH_SIGNING_KEY=…,\
   MCP_OAUTH_INSECURE_AUTO_APPROVE=1,MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes,\
-  MCP_HTTP_RATE_LIMIT_MAX=300,LOOMIO_MCP_READONLY=1,LOOMIO_MCP_LOG_VERBOSE=1
+  MCP_HTTP_RATE_LIMIT_MAX=300,LOOMIO_MCP_READONLY=1,LOOMIO_MCP_LOG_VERBOSE=1 \
+  --max-instances=1
 ```
 
 For static-client mode instead, drop the three `MCP_OAUTH_INSECURE_*` /

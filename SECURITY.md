@@ -131,14 +131,18 @@ reference deployment uses 300/min/IP).
 
 ## OAuth
 
-The HTTP transport's OAuth surface (under `src/auth/`) is HMAC-signed,
-stateless. Rotate `MCP_OAUTH_SIGNING_KEY` to invalidate every
-outstanding token at once. PKCE (S256) is enforced on the token
-exchange and the auth code is single-use, client- and redirect-bound,
-with a 5-minute TTL. In open-DCR mode the OAuth dance proves protocol
-conformance, not identity (see the multi-user posture section above);
-the `/mcp` rate limiter is keyed on source IP precisely because client
-ids are caller-mintable in that mode. See DEPLOY.md.
+The HTTP transport's access and refresh tokens (under `src/auth/`) are
+HMAC-signed and stateless. Rotate `MCP_OAUTH_SIGNING_KEY` to invalidate
+every outstanding token at once. Pending authorization codes and open-DCR
+client registrations are held in process memory: they are single-use /
+client- / redirect-bound with a 5-minute auth-code TTL, but the OAuth
+handshake must complete on the same running instance that issued the
+code and registered the client. Run Cloud Run with one instance for the
+current implementation, or add a shared OAuth store before horizontal
+scaling. In open-DCR mode the OAuth dance proves protocol conformance,
+not identity (see the multi-user posture section above); the `/mcp` rate
+limiter is keyed on source IP precisely because client ids are
+caller-mintable in that mode. See DEPLOY.md.
 
 ## Reporting
 
