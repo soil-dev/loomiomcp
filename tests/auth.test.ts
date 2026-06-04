@@ -6,7 +6,12 @@ import {
   TokenSignatureError,
   TokenExpiredError,
 } from "../src/auth/token.js";
-import { FixedClientStore, InMemoryClientsStore, OAuthProvider } from "../src/auth/provider.js";
+import {
+  FixedClientStore,
+  InMemoryClientsStore,
+  OAuthProvider,
+  StatelessClientsStore,
+} from "../src/auth/provider.js";
 
 function autoApproveProvider(signingKey: string): OAuthProvider {
   return new OAuthProvider({
@@ -75,6 +80,91 @@ describe("InMemoryClientsStore", () => {
     } as Parameters<typeof store.registerClient>[0]);
     expect(a.client_id).not.toBe(b.client_id);
     expect(store.getClient(a.client_id)).toBeDefined();
+  });
+});
+
+describe("StatelessClientsStore", () => {
+  type RegArg = Parameters<StatelessClientsStore["registerClient"]>[0];
+
+  it("recognises a client registered on a *different* instance (same key)", () => {
+    // instance A registers; instance B (fresh process, same signing key)
+    // must resolve it without any shared storage — this is the whole fix.
+    const a = new StatelessClientsStore(KEY);
+    const reg = a.registerClient({ redirect_uris: ["https://a.test/cb"] } as RegArg);
+
+    const b = new StatelessClientsStore(KEY);
+    const got = b.getClient(reg.client_id);
+    expect(got).toBeDefined();
+    expect(got?.redirect_uris).toEqual(["https://a.test/cb"]);
+    // Derived secret is identical across instances → client_secret_post works.
+    expect(got?.client_secret).toBe(reg.client_secret);
+    expect(got?.client_secret_expires_at).toBe(0);
+  });
+
+  it("rejects a client_id signed with a different key", () => {
+    const reg = new StatelessClientsStore(KEY).registerClient({
+      redirect_uris: ["https://a.test/cb"],
+    } as RegArg);
+    expect(new StatelessClientsStore(`${KEY}-different`).getClient(reg.client_id)).toBeUndefined();
+  });
+
+  it("returns undefined for a garbage / unsigned client_id", () => {
+    const store = new StatelessClientsStore(KEY);
+    expect(store.getClient("not-a-signed-client-id")).toBeUndefined();
+    expect(store.getClient("")).toBeUndefined();
+  });
+
+  it("refresh succeeds on a different instance than the one that registered/authorized", async () => {
+    // The regression test for the re-auth bug: registration + the initial
+    // dance happen on instance 1; a day later the refresh lands on a fresh
+    // instance 2 (new store + provider, same key). It must work.
+    const store1 = new StatelessClientsStore(KEY);
+    const p1 = new OAuthProvider({
+      clientsStore: store1,
+      signingKey: KEY,
+      enableAuthCodeGc: false,
+    });
+    const client = store1.registerClient({ redirect_uris: ["https://a.test/cb"] } as RegArg);
+
+    let redirected: string | undefined;
+    const res = {
+      redirect(url: string) {
+        redirected = url;
+      },
+    } as unknown as import("express").Response;
+    await p1.authorize(
+      client,
+      {
+        codeChallenge: PKCE_CHALLENGE,
+        redirectUri: "https://a.test/cb",
+        scopes: [],
+      } as Parameters<typeof p1.authorize>[1],
+      res,
+    );
+    const code = new URL(redirected!).searchParams.get("code")!;
+    const tokens = await p1.exchangeAuthorizationCode(
+      client,
+      code,
+      PKCE_VERIFIER,
+      "https://a.test/cb",
+    );
+
+    // Instance 2: brand-new store + provider, same signing key.
+    const store2 = new StatelessClientsStore(KEY);
+    const p2 = new OAuthProvider({
+      clientsStore: store2,
+      signingKey: KEY,
+      enableAuthCodeGc: false,
+    });
+    const clientOnInstance2 = store2.getClient(client.client_id);
+    expect(clientOnInstance2).toBeDefined();
+
+    const refreshed = await p2.exchangeRefreshToken(clientOnInstance2!, tokens.refresh_token!);
+    expect(refreshed.access_token).toBeTruthy();
+    expect(refreshed.refresh_token).toBeTruthy();
+    // And the new access token verifies on instance 2.
+    const info = await p2.verifyAccessToken(refreshed.access_token);
+    expect(info.clientId).toBe(client.client_id);
   });
 });
 

@@ -131,14 +131,18 @@ reference deployment uses 300/min/IP).
 ## OAuth
 
 The HTTP transport's access and refresh tokens (under `src/auth/`) are
-HMAC-signed and stateless. Rotate `MCP_OAUTH_SIGNING_KEY` to invalidate
-every outstanding token at once. Pending authorization codes and open-DCR
-client registrations are held in process memory: they are single-use /
-client- / redirect-bound with a 5-minute auth-code TTL, but the OAuth
-handshake must complete on the same running instance that issued the
-code and registered the client. Run Cloud Run with one instance for the
-current implementation, or add a shared OAuth store before horizontal
-scaling. In open-DCR mode the OAuth dance proves protocol conformance,
+HMAC-signed and stateless — and so are open-DCR **client registrations**:
+the `client_id` is a signed blob (`StatelessClientsStore`), so a
+registered client survives restarts, scale-to-zero, redeploys, and
+multi-instance routing with no shared storage (callers aren't forced to
+re-authenticate when the process recycles). Rotate `MCP_OAUTH_SIGNING_KEY`
+to invalidate every outstanding token **and** every registered client at
+once. The only remaining in-process state is **pending authorization
+codes** — single-use, client-/redirect-bound, 5-minute TTL — so the brief
+initial authorize→token handshake should complete on one instance; at
+higher request volume across multiple instances, signing the auth codes
+too (as we do for tokens and clients) is the remaining step to make the
+handshake fully instance-independent. In open-DCR mode the OAuth dance proves protocol conformance,
 not identity (see the multi-user posture section above); the `/mcp` rate
 limiter is keyed on source IP precisely because client ids are
 caller-mintable in that mode. See DEPLOY.md.

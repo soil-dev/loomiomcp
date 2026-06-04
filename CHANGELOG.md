@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.0.7 — 2026-06-01
+
+Fixes frequent connector **re-authentication** on the public (open-DCR)
+deployment.
+
+Cause: registered OAuth clients were held in an in-memory map
+(`InMemoryClientsStore`), so any process recycle — a redeploy,
+scale-to-zero, or a refresh routed to a different instance — lost the
+registration and forced the client to re-authenticate. (Access/refresh
+tokens are stateless and survive; but the SDK re-validates the client
+against the store on every refresh, and the lookup missed.)
+
+Fix: new **`StatelessClientsStore`**. The `client_id` is now a signed
+blob (HMAC, same key as the tokens) encoding the registration metadata;
+`getClient` verifies the signature and reconstructs the client instead
+of a map lookup, and the `client_secret` is derived deterministically
+from the `client_id`. So **any instance recognises any client with zero
+shared state** — refresh and re-authorize survive restarts,
+scale-to-zero, redeploys, and multi-instance routing. It mirrors the
+existing stateless-token design. Open-DCR HTTP deployments use this
+store; `InMemoryClientsStore` is retained for local/dev (single process).
+
+Notes:
+
+- At the upgrade, clients registered under the old in-memory UUIDs will
+  re-authenticate **once**, then stay connected.
+- Revocation remains global only (rotate `MCP_OAUTH_SIGNING_KEY`, which
+  also invalidates outstanding tokens) — acceptable since all callers
+  share one upstream Loomio identity.
+- No tool/API changes; tool counts unchanged.
+
 ## 0.0.6 — 2026-05-29
 
 Tooling and project-metadata only — **no API, tool, or behaviour

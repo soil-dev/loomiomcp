@@ -57,6 +57,39 @@ export class TokenExpiredError extends Error {
   }
 }
 
+/**
+ * Generic signed-blob helpers built on the SAME HMAC construction as
+ * the tokens above. Used to make other OAuth artifacts stateless —
+ * notably the registered-client store (see `StatelessClientsStore` in
+ * provider.ts), so a client survives instance restarts / scale events
+ * without any shared storage. `signData` returns `payload.sig`;
+ * `verifyData` checks the signature and returns the parsed object, or
+ * throws `TokenSignatureError`.
+ */
+export function signData(obj: unknown, signingKey: string): string {
+  const payloadB64 = b64urlEncode(Buffer.from(JSON.stringify(obj), "utf8"));
+  return `${payloadB64}.${sign(payloadB64, signingKey)}`;
+}
+
+export function verifyData(blob: string, signingKey: string): unknown {
+  const parts = blob.split(".");
+  if (parts.length !== 2) {
+    throw new TokenSignatureError("malformed signed blob");
+  }
+  const [payloadB64, providedSig] = parts as [string, string];
+  const expectedSig = sign(payloadB64, signingKey);
+  const a = Buffer.from(providedSig);
+  const b = Buffer.from(expectedSig);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    throw new TokenSignatureError("invalid signature");
+  }
+  try {
+    return JSON.parse(b64urlDecode(payloadB64).toString("utf8"));
+  } catch {
+    throw new TokenSignatureError("malformed payload");
+  }
+}
+
 export function verifyToken(token: string, signingKey: string): SignedTokenClaims {
   const parts = token.split(".");
   if (parts.length !== 2) {

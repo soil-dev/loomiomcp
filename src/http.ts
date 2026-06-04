@@ -32,7 +32,7 @@
  */
 
 import { isReadOnly } from "./loomio/client.js";
-import { OAuthProvider, InMemoryClientsStore, FixedClientStore } from "./auth/provider.js";
+import { OAuthProvider, StatelessClientsStore, FixedClientStore } from "./auth/provider.js";
 import { resolveBaseConfig, selectMode } from "./http/config.js";
 import { createApp } from "./http/app.js";
 
@@ -72,7 +72,10 @@ const oauthProvider =
         resourceUrl: mcpResourceUrl,
       })
     : new OAuthProvider({
-        clientsStore: new InMemoryClientsStore(),
+        // Stateless open-DCR store: registered clients survive restarts,
+        // scale-to-zero, redeploys, and multi-instance routing, so callers
+        // aren't forced to re-authenticate when the process recycles.
+        clientsStore: new StatelessClientsStore(signingKey),
         signingKey,
         resourceUrl: mcpResourceUrl,
       });
