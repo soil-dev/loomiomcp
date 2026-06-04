@@ -23,11 +23,13 @@ tools are reads vs writes.
 The HTTP entry exposes the same MCP server over OAuth 2.1 (RFC 7591)
 so Claude.ai's Custom Connector can reach it.
 
-Current OAuth handshake state (open-DCR client registrations and pending
-authorization codes) is in process memory. Access and refresh tokens are
-stateless after issuance, but registration/authorization/token exchange
-must complete on the same running instance. On Cloud Run, keep
-`--max-instances=1` unless you add a shared OAuth store.
+Open-DCR client registrations and access/refresh tokens are stateless:
+they are signed with `MCP_OAUTH_SIGNING_KEY`, so clients survive
+restarts, scale-to-zero, redeploys, and multi-instance routing. The only
+remaining process-local OAuth state is the short-lived pending
+authorization code (5-minute TTL), so the initial authorize→token
+exchange should complete on one instance; signing those codes too is the
+remaining step for a fully instance-independent handshake.
 
 Required env in any HTTP deployment:
 

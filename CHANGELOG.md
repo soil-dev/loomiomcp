@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.0.8 — 2026-06-04
+
+Follow-up hardening on the stateless OAuth client store (0.0.7). No
+tool/API changes; tool counts unchanged.
+
+- **Public clients honoured.** A client that registers with
+  `token_endpoint_auth_method: "none"` (PKCE-only, no secret) is no
+  longer issued a `client_secret`. 0.0.7 derived a secret for *every*
+  client, leaving a public client in a contradictory state (auth method
+  `none` yet carrying a secret). Confidential (`client_secret_post`)
+  clients — including Claude.ai's — are unchanged, so there's no
+  re-auth at this upgrade.
+- **Oversized `client_id` guard.** `getClient` now rejects a
+  `client_id` larger than 16 KB before doing any HMAC/JSON work —
+  cheap defence against a crafted-input CPU drain. Legitimate signed
+  ids are ~400 bytes.
+
 ## 0.0.7 — 2026-06-01
 
 Fixes frequent connector **re-authentication** on the public (open-DCR)
