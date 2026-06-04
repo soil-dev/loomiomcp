@@ -114,6 +114,7 @@ const StatelessClientClaimsSchema = z.object({
 const DEFAULT_GRANT_TYPES = ["authorization_code", "refresh_token"];
 const DEFAULT_RESPONSE_TYPES = ["code"];
 const DEFAULT_AUTH_METHOD = "client_secret_post";
+const MAX_SIGNED_CLIENT_ID_BYTES = 16_384;
 
 /**
  * Open-DCR store with NO server-side state. `registerClient` mints a
@@ -140,8 +141,9 @@ export class StatelessClientsStore implements OAuthRegisteredClientsStore {
     this.signingKey = signingKey;
   }
 
-  // Deterministic per-client secret: any instance recomputes the same
-  // value, so client_secret_post auth works without storing the secret.
+  // Deterministic per-client secret for confidential clients: any instance
+  // recomputes the same value, so client_secret_post auth works without
+  // storing the secret.
   private deriveSecret(clientId: string): string {
     return createHmac("sha256", this.signingKey)
       .update(`client_secret:${clientId}`)
@@ -152,21 +154,28 @@ export class StatelessClientsStore implements OAuthRegisteredClientsStore {
     clientId: string,
     c: z.infer<typeof StatelessClientClaimsSchema>,
   ): OAuthClientInformationFull {
+    const authMethod = c.token_endpoint_auth_method ?? DEFAULT_AUTH_METHOD;
+    const isPublicClient = authMethod === "none";
     return {
       client_id: clientId,
-      client_secret: this.deriveSecret(clientId),
       client_id_issued_at: c.iat,
-      client_secret_expires_at: 0, // never expires — there's nothing to rotate per-client
       redirect_uris: c.redirect_uris,
       grant_types: c.grant_types ?? DEFAULT_GRANT_TYPES,
       response_types: c.response_types ?? DEFAULT_RESPONSE_TYPES,
-      token_endpoint_auth_method: c.token_endpoint_auth_method ?? DEFAULT_AUTH_METHOD,
+      token_endpoint_auth_method: authMethod,
+      ...(isPublicClient
+        ? {}
+        : {
+            client_secret: this.deriveSecret(clientId),
+            client_secret_expires_at: 0, // never expires — there's nothing to rotate per-client
+          }),
       ...(c.scope ? { scope: c.scope } : {}),
       ...(c.client_name ? { client_name: c.client_name } : {}),
     };
   }
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
+    if (Buffer.byteLength(clientId, "utf8") > MAX_SIGNED_CLIENT_ID_BYTES) return undefined;
     let raw: unknown;
     try {
       raw = verifyData(clientId, this.signingKey);
@@ -183,13 +192,15 @@ export class StatelessClientsStore implements OAuthRegisteredClientsStore {
   ): OAuthClientInformationFull {
     const iat = Math.floor(Date.now() / 1000);
     const redirectUris = client.redirect_uris ?? [];
+    const authMethod = client.token_endpoint_auth_method ?? DEFAULT_AUTH_METHOD;
+    const isPublicClient = authMethod === "none";
     const clientId = signData(
       {
         k: "client",
         redirect_uris: redirectUris,
         grant_types: client.grant_types ?? DEFAULT_GRANT_TYPES,
         response_types: client.response_types ?? DEFAULT_RESPONSE_TYPES,
-        token_endpoint_auth_method: client.token_endpoint_auth_method ?? DEFAULT_AUTH_METHOD,
+        token_endpoint_auth_method: authMethod,
         ...(client.scope ? { scope: client.scope } : {}),
         ...(client.client_name ? { client_name: client.client_name } : {}),
         iat,
@@ -199,13 +210,17 @@ export class StatelessClientsStore implements OAuthRegisteredClientsStore {
     return {
       ...client,
       client_id: clientId,
-      client_secret: this.deriveSecret(clientId),
       client_id_issued_at: iat,
-      client_secret_expires_at: 0,
       redirect_uris: redirectUris,
       grant_types: client.grant_types ?? DEFAULT_GRANT_TYPES,
       response_types: client.response_types ?? DEFAULT_RESPONSE_TYPES,
-      token_endpoint_auth_method: client.token_endpoint_auth_method ?? DEFAULT_AUTH_METHOD,
+      token_endpoint_auth_method: authMethod,
+      ...(isPublicClient
+        ? {}
+        : {
+            client_secret: this.deriveSecret(clientId),
+            client_secret_expires_at: 0,
+          }),
     };
   }
 }

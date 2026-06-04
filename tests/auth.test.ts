@@ -114,6 +114,29 @@ describe("StatelessClientsStore", () => {
     expect(store.getClient("")).toBeUndefined();
   });
 
+  it("preserves public-client registrations without forcing a client_secret", () => {
+    const store = new StatelessClientsStore(KEY);
+    const reg = store.registerClient({
+      redirect_uris: ["https://a.test/cb"],
+      token_endpoint_auth_method: "none",
+    } as RegArg);
+
+    expect(reg.token_endpoint_auth_method).toBe("none");
+    expect(reg.client_secret).toBeUndefined();
+    expect(reg.client_secret_expires_at).toBeUndefined();
+
+    const got = store.getClient(reg.client_id);
+    expect(got).toBeDefined();
+    expect(got?.token_endpoint_auth_method).toBe("none");
+    expect(got?.client_secret).toBeUndefined();
+    expect(got?.client_secret_expires_at).toBeUndefined();
+  });
+
+  it("rejects oversized signed-client ids before attempting verification", () => {
+    const store = new StatelessClientsStore(KEY);
+    expect(store.getClient("x".repeat(20_000))).toBeUndefined();
+  });
+
   it("refresh succeeds on a different instance than the one that registered/authorized", async () => {
     // The regression test for the re-auth bug: registration + the initial
     // dance happen on instance 1; a day later the refresh lands on a fresh
