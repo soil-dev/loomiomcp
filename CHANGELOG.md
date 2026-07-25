@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.0.10 — 2026-07-25
+
+Dependency security updates. No code, tool, or API changes.
+
+Clears every high-severity advisory in the tree (9 vulnerabilities →
+3; 5 high → 0):
+
+- **`undici` 8.3.0 → 8.9.0** (runtime dependency — the HTTP client for
+  every outbound Loomio call). Fixes HTTP response queue poisoning via
+  keep-alive socket reuse, cross-user information disclosure via a
+  shared-cache whitespace bypass, and a Set-Cookie SameSite downgrade.
+  The first and third matter most here: this is a multi-user service
+  that funnels all callers through one upstream identity over pooled
+  keep-alive connections.
+- Transitive bumps: `body-parser` 2.3.0, `fast-uri` 3.1.4,
+  `postcss` 8.5.23, `hono` 4.12.32, `vite` 8.1.5 (supersedes the
+  individual Dependabot PRs).
+
+Three advisories are left unfixed **deliberately**, all unreachable
+here:
+
+- `@hono/node-server` path traversal in `serve-static` on **Windows**
+  via encoded backslash. The connector never uses hono (it uses the
+  express / stdio transports), never serves static files, and ships in
+  a Linux container. npm's proposed fix is a **downgrade** of
+  `@modelcontextprotocol/sdk` to 1.24.3 — breaking our core dependency
+  to patch a bundled framework we don't invoke.
+- `esbuild` dev-server file read on **Windows** — a devDependency
+  (via tsup/vite), absent from the production image
+  (`npm ci --omit=dev`), and we never run its dev server.
+
+Verified against the live Loomio instance with the new undici: bearer
+auth, paginated reads, probe-based `list_groups`, and
+`get_user_activity` aggregation all return real data. (The unit suite
+mocks `undici`, so a live check is what actually exercises the upgrade.)
+
 ## 0.0.9 — 2026-07-25
 
 **Breaking upstream change — this release is required.** Loomio moved
