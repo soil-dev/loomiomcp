@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.9 — 2026-07-22
+## 0.0.9 — 2026-07-25
 
 **Breaking upstream change — this release is required.** Loomio moved
 API-key authentication to an HTTP bearer header and now rejects keys
