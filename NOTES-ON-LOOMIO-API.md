@@ -15,9 +15,9 @@ Loomio has three public-ish `/api/...` namespaces. We target **b2**.
   without the `group_id` parameter that b2 controllers require).
 - **`b2`** — documented at https://www.loomio.com/help/api2.
   Controllers in `app/controllers/api/b2/` are the actual
-  implementation. Same `?api_key=` auth as b1. **All non-admin tools
+  implementation. Same bearer auth as b1. **All non-admin tools
   in this connector hit `/b2/...`.**
-- **`b3`** — different auth (`?b3_api_key=` validated against
+- **`b3`** — different secret (bearer token validated against
   `ENV['B3_API_KEY']` on the Loomio server). Currently only
   `users#deactivate` / `users#reactivate`. Wrapped behind opt-in
   `LOOMIO_B3_API_KEY`.
@@ -29,9 +29,28 @@ DESIGN.md.
 
 ## Auth
 
-API key passed as `?api_key=…`. NOT a Bearer header. Consequences:
+API key passed in an HTTP bearer header:
 
-- The key lands in any URL log unless we redact (we do — `src/log.ts`).
+```text
+Authorization: Bearer API_KEY
+```
+
+**Changed 2026-07-22.** Previously the key travelled as `?api_key=…` in
+the query string. Loomio now REJECTS query-string keys — the request is
+treated as unauthenticated and returns
+`403 {"error":"You are not authorized to access this page."}`, which is
+byte-identical to the response for a wrong key or a missing role. That
+ambiguity is why an auth-scheme regression looks like a permissions
+problem; `tests/loomio-auth.test.ts` pins the scheme.
+
+Write integrations may still send the key in the request *body*, per
+Loomio; this connector does not — bearer covers reads and writes alike.
+
+Consequences:
+
+- No credential ever appears in a URL, so nothing to leak via access
+  logs. `src/log.ts` still drops query strings as defence in depth, and
+  no headers are logged.
 - Override base URLs are gated to https / loopback http in
   `src/loomio/client.ts`.
 
@@ -119,7 +138,7 @@ every other type requires the caller to pass `options`.
 
 ## b3 admin (opt-in)
 
-`?b3_api_key=…` validated server-side against `ENV['B3_API_KEY']`
+Bearer token validated server-side against `ENV['B3_API_KEY']`
 (must be >16 chars). `deactivate` schedules `DeactivateUserWorker`
 async; `reactivate` is synchronous via `UserService.reactivate`.
 Both take `id` (Loomio user id) in the URL query.
@@ -193,7 +212,7 @@ omitted `private` field fails on every public-only group. The b2 docs
 at `/help/api2` don't mention any of this.
 
 `create_discussion` in this connector auto-resolves when `private` is
-omitted: it fetches `GET /api/v1/groups/{group_id}?api_key=…`, reads
+omitted: it fetches `GET /api/v1/groups/{group_id}`, reads
 `discussion_privacy_options`, and picks the value Loomio's web UI
 would (the `Group#discussion_private_default` method — `false` only
 for `public_only`, `true` otherwise). On 403 (the group is hidden

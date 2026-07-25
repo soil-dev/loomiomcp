@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.0.9 — 2026-07-25
+
+**Breaking upstream change — this release is required.** Loomio moved
+API-key authentication to an HTTP bearer header and now rejects keys
+passed in the query string. Every request from 0.0.8 and earlier fails
+against an updated Loomio instance.
+
+- **Bearer authentication.** b2 and b3 now send
+  `Authorization: Bearer <key>`; URLs carry no credential. Auth
+  injection moved from `buildUrl()` to a single new `authHeaders()` in
+  `src/loomio/client.ts`. No configuration change: `LOOMIO_API_KEY` and
+  `LOOMIO_B3_API_KEY` are unchanged.
+- **Why it presented as a permissions bug.** Loomio answers a
+  query-string key with `403 {"error":"You are not authorized to access
+  this page."}` — the same response as an invalid key or a missing
+  group role. `tests/loomio-auth.test.ts` now pins the scheme so a
+  regression fails in CI instead of surfacing as a blanket 403.
+- b3 bearer support follows Loomio's published note but is **untested
+  here** — it needs a server-instance `B3_API_KEY`, which only Loomio
+  instance operators hold.
+- Docs updated throughout (README, INSTALL, DEPLOY, SECURITY, DESIGN,
+  CONTRIBUTING, NOTES-ON-LOOMIO-API, glama.json).
+
 ## 0.0.8 — 2026-06-04
 
 Follow-up hardening on the stateless OAuth client store (0.0.7). No

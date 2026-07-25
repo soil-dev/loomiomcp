@@ -15,7 +15,7 @@
  *     Required env: MCP_OAUTH_INSECURE_AUTO_APPROVE=1.
  *
  * Required env in all modes:
- *   LOOMIO_API_KEY        Loomio API key (passed as ?api_key=... on outbound calls)
+ *   LOOMIO_API_KEY        Loomio API key (sent as an Authorization: Bearer header)
  *   PUBLIC_BASE_URL       Public origin where this server is reachable
  *   MCP_OAUTH_SIGNING_KEY HMAC key for OAuth tokens (>=16 chars; stable
  *                         across instances)

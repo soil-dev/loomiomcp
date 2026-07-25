@@ -44,8 +44,9 @@
  *     options, discussion bodies, comment text, member emails stay
  *     out of operator logs.
  *   - Loomio API paths go through `redactPath()` to swap numeric IDs
- *     for `:id` placeholders. The full query string (which carries
- *     the api_key) is dropped.
+ *     for `:id` placeholders, and the query string is dropped. The API
+ *     key travels in an `Authorization` header, and headers are never
+ *     logged.
  *   - No request / response bodies, ever.
  */
 
@@ -110,8 +111,9 @@ export function logEvent(
  * placeholders, and drop the query string entirely. Used by every
  * event that includes a path (`loomio.request`) so we don't smear
  * specific discussion / poll / user IDs across log aggregators.
- * The query string is dropped because it carries the api_key, which
- * MUST NOT land in logs.
+ * The query string is dropped wholesale: it no longer carries the API
+ * key (that moved to a bearer header in 2026-07), but dropping it keeps
+ * incidental parameters out of logs and is cheap insurance.
  *
  * Patterns redacted:
  *   /b2/discussions/254022621        -> /b2/discussions/:id

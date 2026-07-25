@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mockFetch, setupLoomioTest } from "./test-helpers.js";
+import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
 import { fetch } from "undici";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
@@ -13,7 +13,7 @@ describe("getDiscussion", () => {
 
     const [url, opts] = vi.mocked(fetch).mock.calls[0]!;
     expect(url).toContain("/b2/discussions/42");
-    expect(url).toContain("api_key=test-key");
+    expectBearerAuth(0, "test-key");
     expect((opts as RequestInit | undefined)?.method ?? "GET").toBe("GET");
     expect(result).toEqual({ discussions: [{ id: 42, title: "Hi" }] });
   });
@@ -33,7 +33,7 @@ describe("getDiscussion", () => {
     await getDiscussion({ id_or_key: "../memberships?group_id=7" });
 
     const [url] = vi.mocked(fetch).mock.calls[0]!;
-    expect(url).toContain("/b2/discussions/..%2Fmemberships%3Fgroup_id%3D7?");
+    expect(url as string).toMatch(/\/b2\/discussions\/\.\.%2Fmemberships%3Fgroup_id%3D7$/);
     expect(url).not.toContain("/b2/memberships");
   });
 
@@ -64,7 +64,7 @@ describe("createDiscussion", () => {
     const [getUrl] = vi.mocked(fetch).mock.calls[0]!;
     expect(getUrl).toContain("/v1/groups/7");
     const [postUrl, postOpts] = vi.mocked(fetch).mock.calls[1]!;
-    expect(postUrl).toContain("/b2/discussions?");
+    expect(postUrl as string).toMatch(/\/b2\/discussions$/);
     expect((postOpts as RequestInit).method).toBe("POST");
     const body = JSON.parse((postOpts as RequestInit).body as string);
     expect(body).toEqual({ title: "T", group_id: 7, private: false });
@@ -154,7 +154,7 @@ describe("listDiscussions", () => {
     expect(url).toContain("status=all");
     expect(url).toContain("limit=100");
     expect(url).toContain("offset=50");
-    expect(url).toContain("api_key=test-key");
+    expectBearerAuth(0, "test-key");
     expect((opts as RequestInit | undefined)?.method ?? "GET").toBe("GET");
   });
 

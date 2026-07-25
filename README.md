@@ -13,7 +13,7 @@ analyse member activity — in plain English. Targets Loomio's **b2** API
 [/help/api2](https://www.loomio.com/help/api2) and the namespace where
 the controllers actually live in the open-source repo.
 
-Tools (b2, per-user `?api_key=`):
+Tools (b2, per-user API key):
 
 - `get_discussion(id_or_key)` — fetch one discussion
 - `list_discussions(group_id, status?, limit?, offset?)` — list a group's discussions
@@ -45,7 +45,7 @@ Tools (b2, per-user `?api_key=`):
   `remove_absent`.
 - `create_comment(discussion_id, body, body_format?)` — reply on a discussion
 
-Opt-in admin tools (b3, server-instance secret `?b3_api_key=`):
+Opt-in admin tools (b3, server-instance secret):
 
 Set `LOOMIO_B3_API_KEY` to enable. Only useful for Loomio instance operators.
 
@@ -67,13 +67,23 @@ See DEPLOY.md for Cloud Run.
 
 ## Auth
 
-Loomio's b2 API authenticates by API key passed as a `?api_key=…` query
-parameter. The connector injects it server-side; it never reaches the
-MCP client. Generate one in Loomio under your profile → API keys.
+Loomio authenticates by API key sent in an HTTP bearer header:
 
-The optional b3 admin namespace uses a different secret (`?b3_api_key=…`,
-validated against `ENV['B3_API_KEY']` on the Loomio server, >16 chars).
-Only relevant if you operate a Loomio instance.
+```text
+Authorization: Bearer <API_KEY>
+```
+
+The connector injects it server-side; it never reaches the MCP client.
+Generate one in Loomio under your profile → API keys.
+
+Keys passed in the query string (`?api_key=…`) are **rejected** — Loomio
+removed that scheme in July 2026 because URLs are retained in browser
+history, proxy logs, and monitoring systems. A request carrying its key
+that way is treated as unauthenticated and 403s.
+
+The optional b3 admin namespace uses the same bearer header with a
+different secret (validated against `ENV['B3_API_KEY']` on the Loomio
+server, >16 chars). Only relevant if you operate a Loomio instance.
 
 ## Read-only mode
 

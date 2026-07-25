@@ -6,7 +6,7 @@
  * install the standard mock + per-test env wiring.
  */
 
-import { afterEach, beforeEach, vi } from "vitest";
+import { afterEach, beforeEach, expect, vi } from "vitest";
 import { fetch } from "undici";
 
 /**
@@ -33,6 +33,22 @@ export function setupLoomioTest(env: Record<string, string> = {}): void {
     delete process.env["LOOMIO_API_KEY"];
     for (const k of Object.keys(env)) delete process.env[k];
   });
+}
+
+/**
+ * Assert that outbound call `index` authenticated the way Loomio
+ * requires since its 2026-07 change: `Authorization: Bearer <key>`,
+ * with the key absent from the URL. Both halves matter — Loomio now
+ * rejects keys passed in the query string, and a key in a URL leaks
+ * into access logs, proxies, and browser history.
+ */
+export function expectBearerAuth(index: number, key: string): void {
+  const call = vi.mocked(fetch).mock.calls[index];
+  expect(call, `expected a fetch call at index ${index}`).toBeDefined();
+  const [url, opts] = call!;
+  const headers = (opts as { headers?: Record<string, string> } | undefined)?.headers;
+  expect(headers?.["Authorization"]).toBe(`Bearer ${key}`);
+  expect(String(url)).not.toContain(key);
 }
 
 export function mockFetch(

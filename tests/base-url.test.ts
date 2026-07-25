@@ -12,7 +12,9 @@ describe("LOOMIO_API_BASE_URL validation", () => {
     const { getDiscussion } = await import("../src/tools/discussions.js");
     await getDiscussion({ id_or_key: 1 });
     const [url] = vi.mocked(fetch).mock.calls[0]!;
-    expect(url as string).toMatch(/^https:\/\/www\.loomio\.com\/api\/b2\/discussions\/1\?/);
+    // No query string: the credential rides in the Authorization
+    // header, and this call passes no other params.
+    expect(url as string).toBe("https://www.loomio.com/api/b2/discussions/1");
     delete process.env["LOOMIO_API_BASE_URL"];
   });
 

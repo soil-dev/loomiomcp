@@ -36,7 +36,7 @@ Required env in any HTTP deployment:
 | Variable | What it is |
 |---|---|
 | `LOOMIO_API_KEY` | Loomio API key. Shared by every authenticated MCP caller hitting this deployment. |
-| `LOOMIO_API_BASE_URL` | Loomio API root. Defaults to `https://www.loomio.com/api`. Set to e.g. `https://loomio.example.org/api` for a self-hosted instance. Override is gated to `https://` or loopback `http://` so the api_key (which travels as a query parameter) can't leak to a plaintext host. |
+| `LOOMIO_API_BASE_URL` | Loomio API root. Defaults to `https://www.loomio.com/api`. Set to e.g. `https://loomio.example.org/api` for a self-hosted instance. Override is gated to `https://` or loopback `http://` so the API key (sent as a bearer header) can't leak to a plaintext host. |
 | `PUBLIC_BASE_URL` | Public origin of the service, e.g. a custom domain `https://mcp.example.org` or the raw `https://loomiomcp-xyz.run.app`. Must match the URL clients fetch — it's the OAuth metadata issuer (RFC 8414). |
 | `MCP_OAUTH_SIGNING_KEY` | HMAC key for OAuth tokens (≥16 chars, stable across instances). |
 

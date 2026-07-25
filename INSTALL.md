@@ -18,7 +18,7 @@ the binary.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `LOOMIO_API_KEY` | yes | Per-user Loomio API key (profile → API keys). Passed as `?api_key=…` on every outbound call. |
+| `LOOMIO_API_KEY` | yes | Per-user Loomio API key (profile → API keys). Sent as `Authorization: Bearer …` on every outbound call. |
 | `LOOMIO_API_BASE_URL` | no | Loomio API root. Defaults to `https://www.loomio.com/api`; override for self-hosted instances, e.g. `https://loomio.example.org/api`. Override is gated to `https://` or loopback `http://`. |
 | `LOOMIO_MCP_READONLY` | no | Set to `1` to skip every write tool at registration. |
 | `LOOMIO_B3_API_KEY` | no | Opt-in for Loomio instance operators only. Enables `deactivate_user` / `reactivate_user`. See [DEPLOY.md](DEPLOY.md) and [SECURITY.md](SECURITY.md) before setting on any shared deployment. |

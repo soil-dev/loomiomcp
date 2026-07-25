@@ -10,11 +10,10 @@ const DEFAULT_BASE_URL = "https://www.loomio.com/api";
  * instances. Read at call time so tests can stub it.
  *
  * Validation: the override MUST be either https:// or http:// pointed
- * at a loopback host. Loomio's auth is an API key passed as a query
- * parameter; sending it to an arbitrary http:// host would exfiltrate
- * it in the URL itself (worse than a header — URLs land in access
- * logs). The validation here is defence-in-depth on top of operator
- * hygiene.
+ * at a loopback host. Every request carries the API key in an
+ * `Authorization: Bearer` header; sending that to an arbitrary http://
+ * host would hand the key to anyone on the path. The validation here
+ * is defence-in-depth on top of operator hygiene.
  */
 function baseUrl(): string {
   const override = process.env["LOOMIO_API_BASE_URL"];
@@ -236,24 +235,19 @@ async function handleResponse<T>(res: Response): Promise<T> {
 
 export type QueryParams = Record<string, string | number | boolean | undefined>;
 
-interface Auth {
-  /** Query-string field name carrying the secret (`api_key` for b2, `b3_api_key` for b3). */
-  field: string;
-  /** Reads the value at call time so tests / env reloads pick up changes. */
-  getValue: () => string;
-}
+/** Reads a credential at call time so tests / env reloads pick it up. */
+type Auth = () => string;
 
-const B2_AUTH: Auth = { field: "api_key", getValue: getApiKey };
-const B3_AUTH: Auth = { field: "b3_api_key", getValue: getB3ApiKey };
+const B2_AUTH: Auth = getApiKey;
+const B3_AUTH: Auth = getB3ApiKey;
 
 /**
- * Build a Loomio URL with the auth secret appended as a query
- * parameter. Loomio's public APIs (b2, b3) authenticate via query
- * string (not a Bearer header). The single injection site means
- * every outbound URL goes through one gate and the redaction in
- * `src/log.ts` covers both schemes.
+ * Build a Loomio URL. Carries no secret: as of Loomio's 2026-07
+ * change, both b2 and b3 authenticate via `Authorization: Bearer` and
+ * API keys in the query string are REJECTED (the request is treated as
+ * unauthenticated and 403s). See `authHeaders`.
  */
-function buildUrl(auth: Auth, path: string, params?: QueryParams): string {
+function buildUrl(path: string, params?: QueryParams): string {
   const url = new URL(`${baseUrl()}${path}`);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
@@ -262,8 +256,23 @@ function buildUrl(auth: Auth, path: string, params?: QueryParams): string {
       }
     }
   }
-  url.searchParams.set(auth.field, auth.getValue());
   return url.toString();
+}
+
+/**
+ * Base headers plus the bearer credential for one API namespace. This
+ * is the single auth-injection site: b2 sends the per-user API key,
+ * b3 the server-instance secret, both as `Authorization: Bearer …`.
+ *
+ * The value is read here (not at module load) so a missing env var
+ * raises `LoomioAuthError` on the call that needs it, and so tests can
+ * swap keys between cases.
+ */
+function authHeaders(auth: Auth): Record<string, string> {
+  return {
+    ...baseHeaders(),
+    Authorization: `Bearer ${auth()}`,
+  };
 }
 
 interface RequestStart {
@@ -314,8 +323,8 @@ function emitLoomioRequest(method: string, url: string, res: Response, durationM
 }
 
 export async function loomioGet<T>(path: string, params?: QueryParams): Promise<T> {
-  const url = buildUrl(B2_AUTH, path, params);
-  const start = await doFetch(url, { headers: baseHeaders() });
+  const url = buildUrl(path, params);
+  const start = await doFetch(url, { headers: authHeaders(B2_AUTH) });
   try {
     return await consumeBody(start, () => handleResponse<T>(start.res));
   } finally {
@@ -337,8 +346,8 @@ export async function loomioGet<T>(path: string, params?: QueryParams): Promise<
  * observability event still fires.
  */
 export async function loomioGetStatus(path: string, params?: QueryParams): Promise<number> {
-  const url = buildUrl(B2_AUTH, path, params);
-  const start = await doFetch(url, { headers: baseHeaders() });
+  const url = buildUrl(path, params);
+  const start = await doFetch(url, { headers: authHeaders(B2_AUTH) });
   try {
     return await consumeBody(start, async () => {
       try {
@@ -383,12 +392,12 @@ export async function loomioPost<T>(
   opts: PostOptions = {},
 ): Promise<T> {
   if (isReadOnly()) throw new LoomioReadOnlyError("POST");
-  const url = buildUrl(B2_AUTH, path, opts.params);
+  const url = buildUrl(path, opts.params);
   const encoding = opts.encoding ?? "json";
   const start = await doFetch(url, {
     method: "POST",
     headers: {
-      ...baseHeaders(),
+      ...authHeaders(B2_AUTH),
       "Content-Type":
         encoding === "form" ? "application/x-www-form-urlencoded" : "application/json",
     },
@@ -402,17 +411,17 @@ export async function loomioPost<T>(
 }
 
 /**
- * POST to a `/b3/...` admin endpoint. b3 uses a different auth secret
- * (`?b3_api_key=…`, validated against `ENV['B3_API_KEY']` on the
- * Loomio server) and is NOT the per-user API key. Caller must have
+ * POST to a `/b3/...` admin endpoint. b3 uses the same bearer scheme
+ * as b2 but a different secret — validated against `ENV['B3_API_KEY']`
+ * on the Loomio server, NOT the per-user API key. Caller must have
  * already gated on `hasB3ApiKey()`.
  */
 export async function loomioPostB3<T>(path: string, params?: QueryParams): Promise<T> {
   if (isReadOnly()) throw new LoomioReadOnlyError("POST");
-  const url = buildUrl(B3_AUTH, path, params);
+  const url = buildUrl(path, params);
   const start = await doFetch(url, {
     method: "POST",
-    headers: { ...baseHeaders(), "Content-Type": "application/json" },
+    headers: { ...authHeaders(B3_AUTH), "Content-Type": "application/json" },
     body: "{}",
   });
   try {

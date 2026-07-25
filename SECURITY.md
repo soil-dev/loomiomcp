@@ -47,26 +47,29 @@ gates who can connect.
 
 Two distinct secrets:
 
-- **`LOOMIO_API_KEY`** — per-user, passed as `?api_key=…` on every b2
-  request. Get one from your Loomio profile → API keys.
+- **`LOOMIO_API_KEY`** — per-user, sent as `Authorization: Bearer …` on
+  every b2 request. Get one from your Loomio profile → API keys.
 - **`LOOMIO_B3_API_KEY`** (optional) — server-instance admin secret,
-  passed as `?b3_api_key=…` on b3 requests. Equal to `ENV['B3_API_KEY']`
-  on the Loomio server. Only set this if you run the Loomio instance.
+  sent as `Authorization: Bearer …` on b3 requests. Equal to
+  `ENV['B3_API_KEY']` on the Loomio server. Only set this if you run the
+  Loomio instance.
 
-Both are appended as query parameters on every outbound Loomio call.
-URLs land in proxy access logs. Consequences:
+Both travel in the `Authorization` header, never in the URL. Loomio
+rejects keys passed in the query string (removed July 2026) precisely
+because URLs land in proxy access logs. Consequences:
 
 - Keys MUST NOT be embedded in client-facing URLs. The connector
   injects them server-side, in `src/loomio/client.ts`. They are never
   forwarded to the MCP client and never appear in the
-  `tool.call` / `loomio.request` events emitted by `src/log.ts`
-  (paths are run through `redactPath()` which drops the query string).
+  `tool.call` / `loomio.request` events emitted by `src/log.ts` (no
+  headers are ever logged, and paths are run through `redactPath()`,
+  which also drops the query string).
 - `LOOMIO_API_BASE_URL` overrides are validated at request time in
   `baseUrl()` (`src/loomio/client.ts`): the override MUST be either
   `https://`, or `http://` pointed at loopback (`localhost`,
   `127.0.0.1`, `[::1]`). A typo'd `http://` override to a public host
-  would put the api_key in plaintext in every intermediate access
-  log; the validation refuses to start the request in that case.
+  would hand the API key to anyone on the network path; the validation
+  refuses to start the request in that case.
 
 ## Read-only mode
 
