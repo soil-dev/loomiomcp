@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mockFetch, setupLoomioTest } from "./test-helpers.js";
+import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
 import { fetch } from "undici";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
@@ -16,7 +16,7 @@ describe("listMemberships", () => {
     expect(url).toContain("group_id=12");
     expect(url).toContain("limit=25");
     expect(url).toContain("offset=0");
-    expect(url).toContain("api_key=test-key");
+    expectBearerAuth(0, "test-key");
     expect((opts as RequestInit | undefined)?.method ?? "GET").toBe("GET");
   });
 

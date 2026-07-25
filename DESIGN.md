@@ -5,15 +5,15 @@ Short notes on the load-bearing choices.
 ## Surface area
 
 All non-admin tools target the **b2** API (`/api/b2/...`), with auth
-via `?api_key=…`. This is the namespace where Loomio's controllers
+via `Authorization: Bearer <api_key>`. This is the namespace where Loomio's controllers
 actually live in the open-source repo — `grep "Api::B1" loomio/` is
 empty, and the public b1 docs at `/help/api` are stale (e.g. they
 omit `group_id` on `POST /memberships`, which b2 controllers require).
 The canonical b2 docs are at https://www.loomio.com/help/api2.
 
 The **b3** namespace (`POST /b3/users/deactivate`,
-`POST /b3/users/reactivate`) uses a separate auth secret — `?b3_api_key=`
-validated against `ENV['B3_API_KEY']` on the Loomio server, >16 chars.
+`POST /b3/users/reactivate`) uses a separate auth secret — a bearer
+token validated against `ENV['B3_API_KEY']` on the Loomio server, >16 chars.
 This is a server-instance admin secret, not a per-user key. Tools are
 registered only when `LOOMIO_B3_API_KEY` is set (and skipped in
 readonly mode).
@@ -93,16 +93,18 @@ NOTES-ON-LOOMIO-API.md → "Gotcha 4" for the empirical detail.
 
 ## API-key injection
 
-Both Loomio public APIs (b2 and b3) take their auth secret as a query
-parameter — `?api_key=…` for b2, `?b3_api_key=…` for b3. The two
-injection points are `buildUrl()` (b2) and `loomioPostB3()` (b3) in
-`src/loomio/client.ts`. This means:
+Both Loomio public APIs (b2 and b3) take their auth secret in an
+`Authorization: Bearer` header — the per-user key for b2, the
+server-instance secret for b3. Loomio rejects keys in the query string
+(changed July 2026). There is one injection point, `authHeaders()` in
+`src/loomio/client.ts`; `buildUrl()` builds a URL that carries no
+credential at all. This means:
 
-- Keys never leak into structured logs (paths are redacted via
-  `src/log.ts`'s `redactPath`, which drops the query string).
+- Keys never leak into structured logs (no headers are logged, and
+  `src/log.ts`'s `redactPath` drops query strings besides).
 - A base-URL override is validated to be `https://` (or `http://` on
-  loopback) — sending the key to an arbitrary http host would put it
-  in plaintext in any logging proxy on the path.
+  loopback) — sending the bearer token to an arbitrary http host would
+  expose it to anyone on the path.
 
 ## Read-only mode
 

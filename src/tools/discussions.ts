@@ -96,8 +96,9 @@ export const createDiscussionSchema = z.object({
  *   private_only         → true
  *   public_or_private    → true   (Loomio's own default)
  *
- * Uses `GET /api/v1/groups/{id}?api_key=…`, which Loomio exposes
- * without session auth for any public-visible group. On 403 the
+ * Uses `GET /api/v1/groups/{id}`, which Loomio exposes without
+ * session auth for any public-visible group (v1 accepts the same
+ * bearer credential as b2). On 403 the
  * group is hidden — Loomio's validator forces every hidden group to
  * `private_only`, so `true` is the only valid choice.
  */

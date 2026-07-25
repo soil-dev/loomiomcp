@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mockFetch, setupLoomioTest } from "./test-helpers.js";
+import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
 import { fetch } from "undici";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
@@ -65,11 +65,11 @@ describe("listGroups", () => {
     const { listGroups } = await import("../src/tools/groups.js");
     await listGroups({ start_id: 1, end_id: 2 });
 
-    for (const [url] of vi.mocked(fetch).mock.calls) {
+    for (const [i, [url]] of vi.mocked(fetch).mock.calls.entries()) {
       expect(url).toContain("/b2/polls?");
       expect(url).toContain("limit=1");
       expect(url).toContain("status=all");
-      expect(url).toContain("api_key=test-key");
+      expectBearerAuth(i, "test-key");
       expect(url).not.toContain("/b2/memberships");
       expect(url).not.toContain("/b2/discussions");
     }

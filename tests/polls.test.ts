@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mockFetch, setupLoomioTest } from "./test-helpers.js";
+import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
 import { fetch } from "undici";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
@@ -13,7 +13,7 @@ describe("getPoll", () => {
 
     const [url] = vi.mocked(fetch).mock.calls[0]!;
     expect(url).toContain("/b2/polls/5");
-    expect(url).toContain("api_key=test-key");
+    expectBearerAuth(0, "test-key");
   });
 
   it("encodes string keys as a single path segment", async () => {
@@ -22,7 +22,7 @@ describe("getPoll", () => {
     await getPoll({ id_or_key: "../memberships?group_id=7" });
 
     const [url] = vi.mocked(fetch).mock.calls[0]!;
-    expect(url).toContain("/b2/polls/..%2Fmemberships%3Fgroup_id%3D7?");
+    expect(url as string).toMatch(/\/b2\/polls\/\.\.%2Fmemberships%3Fgroup_id%3D7$/);
     expect(url).not.toContain("/b2/memberships");
   });
 
@@ -47,7 +47,7 @@ describe("createPoll", () => {
     await createPoll({ title: "Choose", poll_type: "proposal", group_id: 3 });
 
     const [url, opts] = vi.mocked(fetch).mock.calls[0]!;
-    expect(url).toContain("/b2/polls?");
+    expect(url as string).toMatch(/\/b2\/polls$/);
     expect((opts as RequestInit).method).toBe("POST");
     const body = JSON.parse((opts as RequestInit).body as string);
     expect(body).toEqual({ title: "Choose", poll_type: "proposal", group_id: 3 });

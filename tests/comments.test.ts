@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { mockFetch, setupLoomioTest } from "./test-helpers.js";
+import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
 import { fetch } from "undici";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
@@ -14,7 +14,7 @@ describe("createComment", () => {
     const [url, opts] = vi.mocked(fetch).mock.calls[0]!;
     expect(url).toContain("/b2/comments?");
     expect(url).toContain("discussion_id=42");
-    expect(url).toContain("api_key=test-key");
+    expectBearerAuth(0, "test-key");
     const r = opts as RequestInit & { headers: Record<string, string> };
     expect(r.method).toBe("POST");
     expect(r.headers["Content-Type"]).toBe("application/x-www-form-urlencoded");

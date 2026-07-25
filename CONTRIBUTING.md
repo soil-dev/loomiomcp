@@ -17,7 +17,7 @@ npm run check          # biome lint + format
 - `src/index.ts` — stdio entrypoint
 - `src/http.ts` — HTTP entrypoint (Cloud Run)
 - `src/server.ts` — MCP server factory; tool registrations
-- `src/loomio/client.ts` — undici HTTP client; injects `?api_key=…` (or `?b3_api_key=…`)
+- `src/loomio/client.ts` — undici HTTP client; injects `Authorization: Bearer …` (b2 key, or the b3 secret)
 - `src/tools/_common.ts` — shared zod helpers (positiveId, idOrKey, PollTypeEnum)
 - `src/tools/{discussions,polls,memberships,groups,comments,admin}.ts` — tool schemas + handlers
 - `src/auth/` — OAuth provider and HMAC token signing
