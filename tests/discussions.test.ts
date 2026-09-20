@@ -100,8 +100,8 @@ describe("createDiscussion", () => {
     expect(body.private).toBe(true);
   });
 
-  it("propagates 401 from the private auto-resolve fetch", async () => {
-    mockFetch(401, { error: "bad api key" });
+  it("propagates a 401 from the private auto-resolve fetch (v1 path; Loomio's own session 401 or a proxy)", async () => {
+    mockFetch(401, { error: "you gotta be signed in" });
     const { createDiscussion } = await import("../src/tools/discussions.js");
     await expect(createDiscussion({ title: "T", group_id: 7 })).rejects.toThrow(/401/);
     expect(vi.mocked(fetch).mock.calls.length).toBe(1);
@@ -134,6 +134,24 @@ describe("createDiscussion", () => {
     await expect(createDiscussion({ title: "T", group_id: 7 })).rejects.toThrow();
   });
 
+  it("a generic 403 on the POST is the key, not group visibility (only the GET index is gated)", async () => {
+    // Same path as list_discussions, different method: DiscussionsController
+    // #create never calls records_visible_in_group, so Loomio's generic
+    // body on the write can only come from authenticate_api_key!. The
+    // method must reach the classifier for it to know that.
+    mockFetch(403, { error: "You are not authorized to access this page." });
+    const { LoomioAuthError } = await import("../src/loomio/client.js");
+    const { createDiscussion } = await import("../src/tools/discussions.js");
+    const err = await createDiscussion({ title: "T", group_id: 7, private: true }).catch((e) => e);
+    expect(err).toBeInstanceOf(LoomioAuthError);
+    expect(err.status).toBe(403);
+    expect(err.kind).toBe("unauthenticated");
+    expect(err.message).toContain("/b2/discussions");
+    expect(err.message).toMatch(/not a visibility or role problem/);
+    expect(err.message).not.toMatch(/not visible|visibility problem|\?group_id= list/);
+    expect(err.message).toContain("/profile/api_access");
+  });
+
   it("requires title and group_id at schema layer", async () => {
     const { createDiscussionSchema } = await import("../src/tools/discussions.js");
     expect(createDiscussionSchema.safeParse({ title: "T" }).success).toBe(false);
@@ -158,14 +176,27 @@ describe("listDiscussions", () => {
     expect((opts as RequestInit | undefined)?.method ?? "GET").toBe("GET");
   });
 
-  it("omits optional params when not supplied", async () => {
+  it("always sends status — 'open' by default — and omits limit/offset when not supplied", async () => {
+    // Loomio's own default for a missing `status` is `scope.kept`, i.e.
+    // EVERY kept thread including locked ones; the connector documents
+    // 'open' as its default, so it must say so on the wire.
     mockFetch(200, {});
     const { listDiscussions } = await import("../src/tools/discussions.js");
     await listDiscussions({ group_id: 7 });
     const [url] = vi.mocked(fetch).mock.calls[0]!;
-    expect(url).not.toContain("status=");
+    expect(url).toContain("status=open");
     expect(url).not.toContain("limit=");
     expect(url).not.toContain("offset=");
+  });
+
+  it("passes an explicit status through unchanged", async () => {
+    const { listDiscussions } = await import("../src/tools/discussions.js");
+    for (const status of ["open", "closed", "all"] as const) {
+      mockFetch(200, {});
+      await listDiscussions({ group_id: 7, status });
+      const [url] = vi.mocked(fetch).mock.calls.at(-1)!;
+      expect(url).toContain(`status=${status}`);
+    }
   });
 
   it("accepts all three status values", async () => {

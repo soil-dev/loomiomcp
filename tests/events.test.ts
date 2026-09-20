@@ -86,6 +86,41 @@ describe("listEvents", () => {
     expect(listEventsSchema.safeParse({}).success).toBe(false);
     expect(listEventsSchema.safeParse({ discussion_id: 218 }).success).toBe(true);
   });
+
+  // Loomio ≥ 3.4.0 deleted the v1 events controller and route; every
+  // GET /api/v1/events is a routing 404. Returning an empty stream for
+  // that would be a lie, so the tool throws a specific error.
+  it("throws the removed-endpoint error when v1/events answers 404 (single-page path)", async () => {
+    mockFetch(404, { error: "Not Found" });
+    const { listEvents, V1_EVENTS_REMOVED_MESSAGE, V1EventsRemovedError } = await import(
+      "../src/tools/events.js"
+    );
+    const err = await listEvents({ discussion_id: 218, limit: 25, offset: 0 }).catch((e) => e);
+    expect(err).toBeInstanceOf(V1EventsRemovedError);
+    expect(err.message).toContain(V1_EVENTS_REMOVED_MESSAGE);
+    expect(err.message).toContain("Loomio ≥ 3.4.0");
+    expect(err.message).toContain("GET /api/b2/threads/{topic_id}/items");
+    expect(err.message).toContain("v0.0.12");
+    // The one benign reading of a 404 is named too.
+    expect(err.message).toContain("discussion 218 does not exist");
+  });
+
+  it("throws the removed-endpoint error when v1/events answers 404 (auto-paginating path)", async () => {
+    mockFetch(404, "<!DOCTYPE html><h1>Not Found</h1>");
+    const { listEvents, V1_EVENTS_REMOVED_MESSAGE } = await import("../src/tools/events.js");
+    const err = await listEvents({ discussion_id: 218 }).catch((e) => e);
+    expect(err.message).toContain(V1_EVENTS_REMOVED_MESSAGE);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(1);
+  });
+
+  it("does NOT translate other statuses: a 403 is still the client's classified auth error", async () => {
+    const { LoomioAuthError } = await import("../src/loomio/client.js");
+    mockFetch(403, { error: "Not authorized to show Discussion." });
+    const { listEvents } = await import("../src/tools/events.js");
+    const err = await listEvents({ discussion_id: 218 }).catch((e) => e);
+    expect(err).toBeInstanceOf(LoomioAuthError);
+    expect(err.kind).toBe("not_authorized");
+  });
 });
 
 describe("getUserActivity", () => {
@@ -362,10 +397,108 @@ describe("getUserActivity", () => {
     expect(r.counts.total).toBe(1);
   });
 
-  it("propagates invalid-key 401s instead of reporting partial activity", async () => {
-    mockFetch(401, { error: "bad api key" });
+  it("propagates a 401 from an intermediary instead of reporting partial activity", async () => {
+    // Loomio's b2 API answers auth failures with 403; a 401 is a proxy or
+    // gate in front. Either way it is not a per-group soft failure.
+    mockFetch(401, { error: "proxy auth required" });
     const { getUserActivity } = await import("../src/tools/events.js");
     await expect(getUserActivity({ user_id: 99, group_ids: [2] })).rejects.toThrow(/401/);
+  });
+
+  it("v1/events gone: throws on the FIRST discussion's 404 and never fans out (no zero counts)", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }, { id: 11 }, { id: 12 }] });
+    mockFetch(404, { error: "Not Found" }); // first probe: GET /v1/events?discussion_id=10
+    const { getUserActivity, V1_EVENTS_REMOVED_MESSAGE, V1EventsRemovedError } = await import(
+      "../src/tools/events.js"
+    );
+
+    const err = await getUserActivity({ user_id: 99, group_ids: [2] }).catch((e) => e);
+    expect(err).toBeInstanceOf(V1EventsRemovedError);
+    expect(err.message).toContain(V1_EVENTS_REMOVED_MESSAGE);
+    expect(err).not.toHaveProperty("counts");
+    // list_discussions + the single serial probe. Discussions 11 and 12
+    // were never fetched.
+    expect(vi.mocked(fetch).mock.calls.length).toBe(2);
+    expect(vi.mocked(fetch).mock.calls[1]![0]).toContain("discussion_id=10");
+  });
+
+  it("a 404 on a LATER discussion is a per-record failure (discarded thread), not the removed endpoint", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }, { id: 11 }] });
+    mockFetch(200, {
+      events: [
+        {
+          id: 1,
+          kind: "new_comment",
+          actor_id: 99,
+          created_at: "2025-01-01T10:00:00Z",
+          discussion_id: 10,
+          eventable_type: "Comment",
+          eventable_id: 1,
+        },
+      ],
+    });
+    mockFetch(404, { error: "Not Found" }); // discussion 11 vanished mid-scan
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.counts.total).toBe(1);
+    expect(r.scope.discussions_failed).toBe(1);
+    expect(r.scope.complete).toBe(false);
+  });
+
+  it("a recoverable error on the FIRST discussion is still just a per-record failure", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }, { id: 11 }] });
+    mockFetch(403, { error: "Not authorized to show Discussion." }); // first probe refused
+    mockFetch(200, {
+      events: [
+        {
+          id: 1,
+          kind: "reaction",
+          actor_id: 99,
+          created_at: "2025-01-01T10:00:00Z",
+          discussion_id: 11,
+          eventable_type: "Reaction",
+          eventable_id: 1,
+        },
+      ],
+    });
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.counts.total).toBe(1);
+    expect(r.scope.discussions_failed).toBe(1);
+    expect(r.scope.discussions_scanned).toBe(2);
+  });
+
+  it("every event stream failed → throws instead of returning zero counts", async () => {
+    mockFetch(200, { discussions: [{ id: 10 }, { id: 11 }] });
+    mockFetch(500, { error: "boom" });
+    mockFetch(502, "Bad Gateway");
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const err = await getUserActivity({ user_id: 99, group_ids: [2] }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/could not read the event stream of any of the 2 discussion/);
+    expect(err.message).toMatch(/v1\/events/);
+    expect(err).not.toHaveProperty("counts");
+  });
+
+  it("every group listing failed → throws, carrying the client's 403 explanation", async () => {
+    mockFetch(403, { error: "You are not authorized to access this page." });
+    mockFetch(403, { error: "You are not authorized to access this page." });
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const err = await getUserActivity({ user_id: 99, group_ids: [2, 3] }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toMatch(/could not list the discussions of any of the 2 requested group/);
+    // The classified 403 (rotated key or hidden group) rides along.
+    expect(err.message).toContain("/profile/api_access");
+    expect(err).not.toHaveProperty("counts");
+  });
+
+  it("a group with NO discussions (but a readable list) still yields honest zero counts", async () => {
+    mockFetch(200, { discussions: [] });
+    const { getUserActivity } = await import("../src/tools/events.js");
+    const r = await getUserActivity({ user_id: 99, group_ids: [2] });
+    expect(r.counts.total).toBe(0);
+    expect(r.scope.discussions_scanned).toBe(0);
+    expect(r.scope.complete).toBe(true);
   });
 
   it("reports group discussion-list truncation", async () => {

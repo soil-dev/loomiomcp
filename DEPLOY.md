@@ -72,10 +72,11 @@ Other env:
 | `PORT` | `8080` | Listen port (Cloud Run injects). |
 | `MCP_HTTP_JSON_LIMIT` | `1mb` | Request body cap. |
 | `MCP_HTTP_TRUST_PROXY` | `1` | `app.set("trust proxy", …)`. `1` is correct for Cloud Run. |
-| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Request cap per window, keyed on the **source IP** (not the OAuth client_id — under open DCR a caller can mint unlimited client_ids, so IP is the only sound key). Tighten on open-DCR deployments; the reference deployment uses 300. `get_user_activity` fan-out is separately bounded by a global per-call budget. |
+| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Request cap per window, keyed on the **source IP** (not the OAuth client_id — under open DCR a caller can mint unlimited client_ids, so IP is the only sound key). Tighten on open-DCR deployments; the reference deployment uses 300. `get_user_activity` fan-out is separately bounded by a global per-call budget. The same config applies to `GET /health`, in a separate bucket. |
 | `MCP_HTTP_RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window. |
 | `MCP_HTTP_RATE_LIMIT_DISABLED` | unset | Set to `1` to disable rate limiting entirely (only useful for local dev). |
-| `LOOMIO_MCP_LOG_VERBOSE` | unset | When `1`, emits structured JSON events to stderr (Cloud Run auto-parses). See OPTIMIZATIONS.md. |
+| `LOOMIO_MCP_LOG_VERBOSE` | unset | When `1`, emits structured JSON events to stderr (Cloud Run auto-parses). See OPTIMIZATIONS.md. The key-health events `loomio.auth` and `loomio.version_drift` are **forced** — they are emitted regardless of this flag. |
+| `LOOMIO_MCP_HEALTH_PATH` | `/health` | Where the health page is served. Change it only if the hosting front-end reserves `/health` too (Cloud Run's frontend is known to reserve `/healthz`, which is why the default is `/health`; see the health-check section below); point the uptime check at the same path. Must be an absolute path with no query string. |
 | `LOOMIO_B3_API_KEY` | unset | Server-instance admin secret. When set, registers `deactivate_user` / `reactivate_user`. **Do not set on a multi-user deployment** — see SECURITY.md. |
 
 Build and deploy (open-DCR + read-only, matching the reference deployment):
@@ -93,12 +94,129 @@ For static-client mode instead, drop the three `MCP_OAUTH_INSECURE_*` /
 The production stack is managed by Pulumi, not this raw command — see
 [Reference deployment](#reference-deployment).
 
-## Rotating the API key
+## Health check: `GET /health`
 
-Set the new `LOOMIO_API_KEY` and redeploy / restart. Outstanding OAuth
-tokens stay valid (they prove caller identity to the connector, not to
-Loomio). To invalidate every outstanding OAuth token at once, rotate
+Besides the OAuth endpoints and `POST /mcp`, the HTTP server serves an
+**unauthenticated** `GET /health` that answers one question: does
+Loomio still accept the connector's API key?
+
+```json
+{
+  "status": "ok",
+  "connector_version": "0.0.11",
+  "key_status": "valid",
+  "loomio_version": "3.8.1",
+  "checked_at": "2026-09-20T10:00:00.000Z"
+}
+```
+
+- **HTTP 200** iff `key_status` is `valid`; **503** with
+  `status: "degraded"` for `rejected` (Loomio answered the probe 403
+  with its unauthenticated body — the key is dead) and `unreachable`
+  (network error, timeout, 5xx, or a CDN/WAF 403 that never reached
+  Loomio — the key's state is unknown). 503 for both so a checker rule
+  of "HTTP 200 and body contains `"key_status":"valid"`" is the whole
+  alert.
+- `Cache-Control: no-store` — a cached 200 would defeat the point.
+- The probe behind it (`GET /api/b2/groups` with the key, plus the
+  public `GET /api/v1/boot/version`) is **cached for 60 s** and shared
+  between concurrent callers, so a flood of `/health` hits costs Loomio
+  at most one request pair per minute. The endpoint is also under the
+  per-IP rate limiter (same `MCP_HTTP_RATE_LIMIT_*` config as `/mcp`,
+  separate bucket).
+- It exposes exactly the five fields above: no key material, no error
+  detail (which could quote the base URL), no Loomio hostname.
+- The same probe runs once at startup (after `listen`) and logs
+  `[loomiomcp] Loomio key_status=… loomio_version=…`, with a WARNING
+  paragraph when the key is rejected. The server keeps serving either
+  way — a crash-looping container tells you nothing; a live one with a
+  red `/health` and classified 403s tells you everything.
+- **Verify the path reaches the container before trusting an alert.**
+  Some hosting front-ends reserve `/healthz` (Cloud Run's does) and answer it with their
+  own 404 before the request reaches the container (this has been
+  observed on Cloud Run's `*.run.app` URL). An uptime check against such
+  a path fails closed forever — 404 is not 200 and has no content match
+  — and the one thing the check exists to detect stays undetected while
+  the alert trains everyone to ignore it. After deploying, `curl -si
+  https://<PUBLIC_BASE_URL>/health` and confirm the body is the
+  connector's JSON (`connector_version`, `key_status`), not an HTML
+  page. If it is the platform's 404, set `LOOMIO_MCP_HEALTH_PATH` (e.g.
+  `/-/health`) on the deployment and point the checker at that path;
+  the default page is then no longer served.
+
+**Recommended monitoring.** Create an uptime check (Cloud Monitoring, or
+any external checker) against `https://<PUBLIC_BASE_URL>/health` every
+**5 minutes**, protocol HTTPS, expecting **HTTP 200** *and* a content
+match on `"key_status":"valid"`, with an alert policy that notifies a
+channel someone reads. Connector traffic is often too sparse for a
+log-based error-rate alert to ever have enough samples; the active probe
+is what turns a silent 403 outage into an alert within minutes. As a
+second signal, alert on the forced log event `loomio.auth` with
+`key_status != "valid"` (it fires on every status change), and note
+`loomio.version_drift` — it means the instance moved to a Loomio
+`major.minor` this connector has not been verified against.
+
+## API key lifecycle (runbook)
+
+The Loomio API key is not a permanent credential. Loomio regenerates a
+user's key:
+
+- **whenever that user's password changes** (Loomio ≥ 3.1.0;
+  `UserService.rotate_credentials_after_password_change` also rotates the
+  user's other tokens and signs out other sessions) — the API access page
+  in Loomio says so;
+- **once for every user, on the upgrade to Loomio 3.3.1** (August 2026;
+  migration `RotateExposedUserApiKeys`, because group data exports had
+  contained keys);
+- when the account is redacted, and — for authentication purposes —
+  when the user is deactivated (`User.active` no longer matches).
+
+**Symptom.** Every call fails with
+`403 {"error":"You are not authorized to access this page."}` — the
+same body for every endpoint, because `authenticate_api_key!` runs before
+anything else. Nothing else is wrong; the process is up. The connector
+recognises this body and says "key rejected, probably rotated" with the
+steps below; on the HTTP transport `/health` goes 503 with
+`key_status: "rejected"`, and the startup log / stderr carries the same
+warning.
+
+**Check.** `GET /health` on the connector, or directly
+`GET https://<loomio>/api/b2/groups` with
+`Authorization: Bearer <key>` — 200 means the key is valid (even for a
+user with no groups), 403 means it is not.
+
+**Fix.**
+
+1. Sign in to Loomio **as the connector's user** and open the **API
+   access** page (`/profile/api_access`). It shows the current key. No
+   API can read another user's key — the b3 Server API's user payload
+   does not include it, and the User API only ever authenticates with
+   the caller's own — so this step needs that user's login (or an
+   instance admin's "sign in as" if the instance offers it).
+2. Put the new value in the deployment's secret (`LOOMIO_API_KEY`) and
+   redeploy / restart. Outstanding OAuth tokens stay valid — they prove
+   caller identity to the connector, not to Loomio.
+3. Confirm `/health` returns 200 with `"key_status":"valid"`.
+
+**Avoid the next one.** Do not change the connector user's password
+casually — pair any password change with the secret rotation above in
+one change. Read Loomio's release notes before the instance upgrades
+(the 3.3.1 notes announced the rotation; Loomio has no other
+compatibility policy). Keep the uptime check above in place so a
+rotation you did not cause is noticed in minutes, not weeks.
+
+To invalidate every outstanding OAuth token at once, rotate
 `MCP_OAUTH_SIGNING_KEY` — every issued token becomes unverifiable.
+
+## Loomio behind a CDN / WAF
+
+Every outbound request carries `User-Agent: loomiomcp/<version>`. If the
+Loomio instance sits behind Cloudflare or another WAF that blocks
+non-browser user-agents, allow that one. The connector tells a WAF 403
+apart from a Loomio 403 (Loomio's are always JSON; Cloudflare's problem
+body names cloudflare) and reports it as "blocked in front of Loomio —
+check WAF rules", with `/health` showing `unreachable` rather than
+`rejected`.
 
 ## Reference deployment
 
@@ -107,9 +225,12 @@ its own OAuth-at-the-edge layer, with `LOOMIO_API_KEY` and
 `MCP_OAUTH_SIGNING_KEY` held in a secret manager and injected as env
 vars. A production-grade setup wires that up with an IaC tool (e.g.
 Pulumi): KMS-backed secrets, bootstrap scripts for the API key /
-signing key / OAuth client, and a smoke test that walks the full OAuth
-dance against the deployed endpoint. None of that is connector-specific
-beyond the env vars documented above.
+signing key / OAuth client, an uptime check on `/health` with an alert
+policy (see above), and a smoke test that walks the full OAuth dance
+against the deployed endpoint **and** makes one round-trip to Loomio
+through a tool call (a shape-only assertion on `list_discussions` —
+never `list_groups`, which treats 403s as soft misses). None of that is
+connector-specific beyond the env vars documented above.
 
 ## Image build
 

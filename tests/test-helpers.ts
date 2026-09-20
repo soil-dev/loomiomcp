@@ -61,9 +61,45 @@ export function mockFetch(
     ok: status >= 200 && status < 300,
     headers: new Headers(headers),
     json: async () => body,
-    // `loomioGetStatus` (the access probe) drains the body via text();
-    // provide it so probes resolve cleanly in tests.
+    // The error path (`readErrorText`) and the raw probes behind the
+    // key-health check (`loomioGetRaw` / `loomioGetPublic`) read the body
+    // via text(); provide it so those resolve cleanly in tests.
     text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
     statusText: String(status),
   } as Awaited<ReturnType<typeof fetch>>);
+}
+
+export type MockRoute = { status: number; body: unknown; headers?: Record<string, string> } | Error;
+
+/**
+ * Route mock responses by URL-path suffix instead of call order. Use
+ * this when a tool issues requests whose ORDER is not what the test is
+ * about — e.g. the key-health probe's two parallel GETs, or a scan that
+ * consults the health probe after its own probes. `mockFetch`'s FIFO
+ * queue stays the right tool for strictly sequential call chains.
+ * Throws for a path no route matches, so an unexpected request fails
+ * the test loudly instead of returning `undefined`.
+ */
+export function mockFetchRoutes(routes: Record<string, MockRoute>): void {
+  vi.mocked(fetch).mockImplementation(async (input) => {
+    const path = new URL(String(input)).pathname;
+    const hit = Object.entries(routes).find(([suffix]) => path.endsWith(suffix))?.[1];
+    if (!hit) throw new Error(`unmocked route: ${path}`);
+    if (hit instanceof Error) throw hit;
+    return {
+      status: hit.status,
+      ok: hit.status >= 200 && hit.status < 300,
+      headers: new Headers(hit.headers ?? {}),
+      json: async () => hit.body,
+      text: async () => (typeof hit.body === "string" ? hit.body : JSON.stringify(hit.body)),
+      statusText: String(hit.status),
+    } as Awaited<ReturnType<typeof fetch>>;
+  });
+}
+
+/** The fetch calls whose URL path ends with `suffix`, in call order. */
+export function fetchCallsTo(suffix: string) {
+  return vi
+    .mocked(fetch)
+    .mock.calls.filter(([url]) => new URL(String(url)).pathname.endsWith(suffix));
 }

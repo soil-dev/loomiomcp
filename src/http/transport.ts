@@ -5,35 +5,18 @@
  */
 
 import express from "express";
-import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import type { OAuthProvider } from "../auth/provider.js";
-import { readPositiveInt } from "../env.js";
 import { createLoomioMcpServer } from "../server.js";
 import { withRequestContext } from "../log.js";
+import { createIpRateLimit } from "./rate-limit.js";
 
-const DEFAULT_MCP_RATE_LIMIT_WINDOW_MS = 60_000;
-const DEFAULT_MCP_RATE_LIMIT_MAX = 600;
-const MAX_MEMORY_STORE_WINDOW_MS = 2 ** 31 - 1;
-
-export function resolveMcpRateLimitConfig(): {
-  windowMs: number;
-  limit: number;
-  disabled: boolean;
-} {
-  const windowMs = Math.min(
-    readPositiveInt("MCP_HTTP_RATE_LIMIT_WINDOW_MS", DEFAULT_MCP_RATE_LIMIT_WINDOW_MS),
-    MAX_MEMORY_STORE_WINDOW_MS,
-  );
-  return {
-    windowMs,
-    limit: readPositiveInt("MCP_HTTP_RATE_LIMIT_MAX", DEFAULT_MCP_RATE_LIMIT_MAX),
-    disabled: process.env["MCP_HTTP_RATE_LIMIT_DISABLED"] === "1",
-  };
-}
+// The limiter config and keying rule live in ./rate-limit.ts so /health
+// can share them; re-exported here for callers that knew the old home.
+export { resolveMcpRateLimitConfig } from "./rate-limit.js";
 
 export interface TransportOptions {
   oauthProvider: OAuthProvider;
@@ -74,29 +57,9 @@ export function mountTransport(app: express.Express, opts: TransportOptions): vo
     next();
   };
 
-  const {
-    windowMs: rateLimitWindowMs,
-    limit: rateLimitMax,
-    disabled: rateLimitDisabled,
-  } = resolveMcpRateLimitConfig();
-  const mcpRateLimit = rateLimit({
-    windowMs: rateLimitWindowMs,
-    limit: rateLimitMax,
-    standardHeaders: "draft-7",
-    legacyHeaders: false,
-    // Key the limiter on the SOURCE IP, never the OAuth client_id.
-    // Under open DCR (the public deployment) any caller can POST
-    // /register for unlimited fresh client_ids, so keying on client_id
-    // would let one source mint a brand-new 300/min bucket at will —
-    // silently defeating the limit. trust proxy=1 (Cloud Run's single
-    // front-end hop) makes req.ip the real client address (not
-    // X-Forwarded-For-spoofable past that hop), and ipKeyGenerator
-    // normalises IPv6 to a /56 so a /128 walk can't sidestep it. In
-    // static-client mode this is also strictly better than the old
-    // behaviour, which bucketed every caller under the one shared
-    // client_id.
-    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ""),
-    skip: () => rateLimitDisabled,
+  // Keyed on the source IP, never the OAuth client_id — see
+  // ./rate-limit.ts for why. The /mcp surface answers in JSON-RPC shape.
+  const mcpRateLimit = createIpRateLimit({
     handler: (_req, res) => {
       res.status(429).json({
         jsonrpc: "2.0",

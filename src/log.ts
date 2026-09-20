@@ -33,7 +33,12 @@
  * The `event` field is dotted: "<area>.<verb>". Current areas:
  *
  *   tool.*    — call, chain (per /mcp-request aggregate)
- *   loomio.*  — request (one per outbound Loomio API call)
+ *   loomio.*  — request (one per outbound Loomio API call);
+ *               auth (FORCED: key_status changed — valid / rejected /
+ *               unreachable — from the key-health probe, src/loomio/health.ts);
+ *               version_drift (FORCED, once: the instance's Loomio
+ *               major.minor differs from the version this connector was
+ *               tested against)
  *
  * Adding new areas follows the same shape: pick a verb, populate the
  * relevant fields, call logEvent. **Privacy invariants** (load-bearing
@@ -47,7 +52,12 @@
  *     for `:id` placeholders, and the query string is dropped. The API
  *     key travels in an `Authorization` header, and headers are never
  *     logged.
- *   - No request / response bodies, ever.
+ *   - No request / response bodies, ever. This includes the FORCED
+ *     events: `loomio.auth` carries a closed-vocabulary `reason` code
+ *     (src/loomio/health-cache.ts `HealthReason`), never the probe's
+ *     free-text `detail`, which may quote an upstream body fragment or
+ *     error message and is reserved for the startup stderr warning.
+ *     Nothing logged is ever built from a configured URL either.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -79,7 +89,10 @@ const chainHandlers: Record<
  *
  * `opts.force: true` bypasses the gate. Reserved for low-cardinality,
  * uniformly-useful events that operators shouldn't have to flip
- * verbose on to see. No callers use it today.
+ * verbose on to see. Used by the key-health probe (`loomio.auth` on
+ * every key_status change, `loomio.version_drift` once): a rotated
+ * Loomio key is exactly the failure an operator needs to see without
+ * having anticipated it.
  *
  * stderr (not stdout) so the MCP-protocol JSON on stdout for the
  * stdio transport never collides with these. The HTTP transport
@@ -118,13 +131,21 @@ export function logEvent(
  * Patterns redacted:
  *   /b2/discussions/254022621        -> /b2/discussions/:id
  *   /b2/polls/abcDEF                 -> /b2/polls/:id  (string short-keys too)
+ *   /b2/groups/my-handle             -> /b2/groups/:id (keys and handles too)
+ *   /b2/threads/abcDEF/items         -> /b2/threads/:id/items
+ *   /b3/users/42/deactivate          -> /b3/users/:id/deactivate
  *   /b2/discussions/12?api_key=x     -> /b2/discussions/:id
  *   /b3/users/deactivate?id=42&b3_api_key=…   -> /b3/users/deactivate
  *
  * Both numeric ids AND alphanumeric short-keys are collapsed. The
- * collection-scoped second pass only targets `discussions` / `polls`
- * (the sole endpoints that take a string key in the PATH); it
- * deliberately leaves the `/b3/users/deactivate` action verb intact.
+ * collection-scoped second pass targets the resources Loomio's
+ * ModelLocator addresses by a string in the PATH — `discussions` and
+ * `polls` (friendly keys), `groups` (key or handle) and `threads`
+ * (topic keys). `users` is deliberately NOT in that list: Loomio's b3
+ * user routes take numeric ids only (covered by the first pass, so the
+ * member route `/b3/users/42/deactivate` becomes `/b3/users/:id/deactivate`),
+ * and including it would also erase the `deactivate` / `reactivate` verb
+ * of the legacy collection routes.
  */
 export function redactPath(path: string): string {
   const noQuery = path.split("?")[0] ?? path;
@@ -132,9 +153,10 @@ export function redactPath(path: string): string {
     noQuery
       // Numeric ids (including comma-separated lists).
       .replace(/\/\d+(?:,\d+)*/g, "/:id")
-      // Alphanumeric short-keys after the key-addressable collections.
-      // (Runs after the numeric pass, so a numeric id is already `:id`.)
-      .replace(/\/(discussions|polls)\/[^/]+/g, "/$1/:id")
+      // Alphanumeric short-keys / handles after the key-addressable
+      // collections. (Runs after the numeric pass, so a numeric id is
+      // already `:id` and is left alone.)
+      .replace(/\/(discussions|polls|groups|threads)\/[^/]+/g, "/$1/:id")
   );
 }
 

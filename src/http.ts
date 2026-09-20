@@ -20,6 +20,11 @@
  *   MCP_OAUTH_SIGNING_KEY HMAC key for OAuth tokens (>=16 chars; stable
  *                         across instances)
  *
+ * Endpoints besides the OAuth set and POST /mcp:
+ *   GET /health          Unauthenticated key-health check — 200 when the
+ *                         Loomio API key is accepted, 503 otherwise. Point
+ *                         an uptime checker at it (see DEPLOY.md).
+ *
  * Optional env:
  *   PORT                  Listen port (default 8080; Cloud Run injects)
  *   LOOMIO_MCP_READONLY   Same semantics as the stdio server
@@ -32,6 +37,7 @@
  */
 
 import { isReadOnly } from "./loomio/client.js";
+import { checkLoomioHealth, keyRejectedWarning } from "./loomio/health.js";
 import { OAuthProvider, StatelessClientsStore, FixedClientStore } from "./auth/provider.js";
 import { resolveBaseConfig, selectMode } from "./http/config.js";
 import { createApp } from "./http/app.js";
@@ -101,4 +107,31 @@ app.listen(port, () => {
         "Suitable only for local development or private-network deployments.",
     );
   }
+
+  // Probe the Loomio key once we are listening — non-blocking, and the
+  // server keeps serving whatever the verdict. A rejected key must be
+  // LOUD at startup (it is the most common silent-failure mode: the key
+  // was rotated under us) but not fatal: /health and per-call 403s
+  // stay diagnosable, whereas a crash-looping container tells the
+  // operator nothing. A transient network error at boot likewise must
+  // not take the server down. The probe also emits the forced
+  // `loomio.auth` event and caches its result for /health.
+  checkLoomioHealth()
+    .then((health) => {
+      console.log(
+        `[loomiomcp] Loomio key_status=${health.key_status} loomio_version=${health.loomio_version ?? "unknown"}`,
+      );
+      if (health.key_status === "rejected") {
+        console.warn(`[loomiomcp] WARNING: ${keyRejectedWarning()}`);
+      } else if (health.key_status === "unreachable") {
+        console.warn(
+          `[loomiomcp] WARNING: could not verify the Loomio API key at startup: ${health.detail ?? "unknown error"}. ` +
+            "Serving anyway; GET /health re-probes (cached 60 s).",
+        );
+      }
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[loomiomcp] WARNING: key-health probe failed at startup: ${message}`);
+    });
 });

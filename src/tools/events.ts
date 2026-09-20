@@ -8,14 +8,58 @@ const MAX_EVENTS_PAGES = 10; // hard cap per discussion to bound a single bad th
 const MAX_DISCUSSION_PAGES = 20; // hard cap per group when enumerating discussions
 const MAX_SCAN_DISCUSSIONS = 500; // global ceiling on discussions whose events we fetch
 
+// ── Loomio ≥ 3.4.0: v1/events no longer exists ──────────────────────────────
+//
+// Loomio 3.4.0 (August 2026) replaced the Event model with TopicItem and
+// deleted the v1 `events` controller together with its route — Loomio
+// 3.8.1's config/routes.rb has no `events` resource in any namespace.
+// Against such an instance every GET /api/v1/events answers 404: a Rails
+// routing miss, not a Loomio "record not found". The successor is
+// GET /api/b2/threads/{topic_id}/items, which this connector does not
+// call yet (the port is planned for v0.0.12).
+//
+// Until then the only honest behaviour is to FAIL LOUDLY. A 404 here is
+// not "this discussion has no events", and a fan-out that quietly
+// recovered from it would report `counts.total: 0` for every user in
+// every group — a plausible-looking, entirely wrong answer that an agent
+// would relay as "this person never participated".
+
+export const V1_EVENTS_REMOVED_MESSAGE =
+  "Loomio removed the v1/events endpoint (Loomio ≥ 3.4.0). list_events and get_user_activity do " +
+  "not work against this Loomio version until the connector is ported to " +
+  "GET /api/b2/threads/{topic_id}/items (planned for v0.0.12).";
+
+/**
+ * Thrown when GET /api/v1/events answers 404. Its own class (rather than
+ * a bare Error) so `getUserActivity` can refuse to swallow it while it
+ * still recovers from the per-discussion failures that make a scan
+ * merely partial.
+ */
+export class V1EventsRemovedError extends Error {
+  constructor(discussionId: number) {
+    super(
+      `${V1_EVENTS_REMOVED_MESSAGE} (If the instance is OLDER than 3.4.0 the same 404 would ` +
+        `instead mean discussion ${discussionId} does not exist — get_discussion tells the two apart.)`,
+    );
+    this.name = "V1EventsRemovedError";
+  }
+}
+
+function isV1EventsGone(err: unknown): boolean {
+  return err instanceof LoomioApiError && err.status === 404;
+}
+
 // ── list_events ─────────────────────────────────────────────────────────────
 //
-// Paginated wrapper around Loomio's v1 `events` endpoint, scoped to
-// one discussion. The v1 events controller has no api-key auth gate of
-// its own — visibility is enforced by the discussion's group membership
-// rules. The connector's bot needs membership in the discussion's group
-// (or the discussion's group must be public); admin role is NOT
-// required, unlike `list_memberships`.
+// Paginated wrapper around Loomio's v1 `events` endpoint (where it still
+// exists — see above), scoped to one discussion. Visibility caveat: v1
+// never read the API key (v1 resolves its user from the session cookie
+// only, so the bearer header the client sends is ignored), which means
+// this read always ran as Loomio's anonymous `LoggedOutUser`. It could
+// see PUBLIC discussions only — the connector user's memberships made
+// no difference, and a private discussion 403'd regardless of them.
+// The b2 successor runs as the key's user, so the 0.0.12 port also
+// changes what is visible, not just where it is read from.
 //
 // The server-side filter on v1/events is `discussion_id`. There is
 // no `actor_id` / `group_id` index; both are accepted as params but
@@ -107,10 +151,26 @@ function filterKinds<T extends EventsResponse>(resp: T, kinds?: string[]): T {
   };
 }
 
+/**
+ * One page of a discussion's events, with the 404-means-gone translation
+ * applied. Used by `listEvents` directly; `getUserActivity` uses the raw
+ * fetch and applies the translation only to its first probe (see there).
+ */
+async function getEventsPage(
+  discussionId: number,
+  page: { per?: number; from?: number },
+): Promise<EventsResponse> {
+  try {
+    return await loomioGet<EventsResponse>("/v1/events", { discussion_id: discussionId, ...page });
+  } catch (err) {
+    if (isV1EventsGone(err)) throw new V1EventsRemovedError(discussionId);
+    throw err;
+  }
+}
+
 export async function listEvents(input: z.infer<typeof listEventsSchema>) {
   if (input.limit !== undefined || input.offset !== undefined) {
-    const resp = await loomioGet<EventsResponse>("/v1/events", {
-      discussion_id: input.discussion_id,
+    const resp = await getEventsPage(input.discussion_id, {
       ...(input.limit !== undefined ? { per: input.limit } : {}),
       ...(input.offset !== undefined ? { from: input.offset } : {}),
     });
@@ -123,11 +183,7 @@ export async function listEvents(input: z.infer<typeof listEventsSchema>) {
   let truncated = false;
 
   for (let page = 0; page < MAX_EVENTS_PAGES; page++) {
-    const resp = await loomioGet<EventsResponse>("/v1/events", {
-      discussion_id: input.discussion_id,
-      per: EVENTS_PAGE_SIZE,
-      from: offset,
-    });
+    const resp = await getEventsPage(input.discussion_id, { per: EVENTS_PAGE_SIZE, from: offset });
     pagesFetched++;
     const evs = resp.events ?? [];
     mergeEventResponse(merged, resp);
@@ -153,12 +209,11 @@ export async function listEvents(input: z.infer<typeof listEventsSchema>) {
 
 // ── get_user_activity ───────────────────────────────────────────────────────
 //
-// Server-side aggregation of a user's activity across the bot's
-// visible discussions. Loomio doesn't have a per-user events index
-// (see comment above), so this fans out: for each discussion in the
-// requested groups (or every group the bot can see, if none
-// specified), fetch the event stream, filter to events authored by
-// the target user, and aggregate.
+// Server-side aggregation of a user's activity across the connector
+// user's visible discussions. Loomio doesn't have a per-user events
+// index (see comment above), so this fans out: for each discussion in
+// the requested groups, fetch the event stream, filter to events
+// authored by the target user, and aggregate.
 //
 // Cost: ~1 HTTP call per discussion in scope. On a mid-sized instance
 // (a few hundred discussions) that's a few hundred calls for an
@@ -171,8 +226,15 @@ export async function listEvents(input: z.infer<typeof listEventsSchema>) {
 // DISCUSSIONS caps the dominant cost (the per-discussion event fetch):
 // once that many discussions are in scope we stop and flag the result
 // `truncated`, so the aggregate is never silently partial. The cap sits
-// far above this instance's ~200 discussions, so normal scans are
-// unaffected.
+// well above a typical mid-sized instance's discussion count, so normal
+// scans are unaffected.
+//
+// Honesty guard: partial results are flagged, TOTAL failures are thrown.
+// A scan where every event fetch failed (or every group listing failed)
+// has counted nothing; returning `counts.total: 0` with `complete: false`
+// is technically labelled but reads as "this user did nothing" to
+// anyone who skips the scope block. See the two throws in
+// `getUserActivity`.
 
 const ACTIVITY_KINDS = new Set([
   "new_discussion",
@@ -225,7 +287,7 @@ interface ActivityResult {
     // counts below are a LOWER BOUND, not the whole picture — surfaced
     // explicitly so a partial scan is never mistaken for a complete one.
     complete: boolean;
-    groups_failed: number[]; // groups whose discussion list couldn't be read (e.g. 403 — bot not a member)
+    groups_failed: number[]; // groups whose discussion list couldn't be read (e.g. 403 — not visible to the connector's user)
     discussions_failed: number; // discussions whose event stream errored and were skipped
     discussions_truncated: number; // discussions that hit the per-thread page cap (events beyond it not counted)
     discussions_capped: boolean; // true if the global MAX_SCAN_DISCUSSIONS ceiling dropped some discussions
@@ -267,7 +329,9 @@ async function listDiscussionIdsForGroup(
   let offset = 0;
   let truncated = false;
   // Pagination — Loomio returns at most ~200 per page. Cap iterations
-  // to avoid runaway scans.
+  // to avoid runaway scans. `status: "all"` is explicit: activity in
+  // locked threads still counts, and Loomio's default for a missing
+  // `status` has not been stable across releases.
   for (let page = 0; page < MAX_DISCUSSION_PAGES; page++) {
     const resp = await loomioGet<DiscussionsListResponse>("/b2/discussions", {
       group_id: groupId,
@@ -289,6 +353,7 @@ async function listDiscussionIdsForGroup(
 // the thread has more events we didn't read) rather than because we
 // reached the end — so the caller can flag the aggregate as a lower
 // bound instead of presenting a silently-clipped count as complete.
+// Errors propagate untranslated; the caller decides which are fatal.
 async function fetchAllEventsForDiscussion(
   discussionId: number,
 ): Promise<{ events: LoomioEvent[]; truncated: boolean }> {
@@ -337,6 +402,12 @@ async function runWithConcurrency<T, R>(
   return results;
 }
 
+// A scan survives per-record refusals (403: the connector's user cannot
+// see that group / discussion) and per-record API errors (404 for a
+// discussion discarded mid-scan, 5xx, timeout) by skipping the record
+// and flagging the result incomplete. Anything else — a 401 from a proxy,
+// a configuration error, a V1EventsRemovedError — is not about one record
+// and aborts the scan.
 function isRecoverableScanError(err: unknown): boolean {
   if (err instanceof LoomioAuthError) return err.status === 403;
   return err instanceof LoomioApiError;
@@ -354,21 +425,34 @@ function rememberRecentSample(samples: ActivityResult["sample_events"], e: Loomi
   if (samples.length > 10) samples.length = 10;
 }
 
+interface EventStream {
+  groupId: number;
+  events: LoomioEvent[];
+  truncated: boolean;
+}
+
 export async function getUserActivity(
   input: z.infer<typeof getUserActivitySchema>,
 ): Promise<ActivityResult> {
   const groupIds = [...new Set(input.group_ids)];
 
   // 1. Enumerate discussions across the scoped groups. A group whose
-  // list can't be read (null = it errored, e.g. 403 because the bot
-  // isn't a member) is recorded in groupsFailed rather than silently
-  // dropped — otherwise its absence would understate the totals with
-  // no signal.
+  // list can't be read (null = it errored, e.g. 403 because the group is
+  // not visible to the connector's user) is recorded in groupsFailed
+  // rather than silently dropped — otherwise its absence would
+  // understate the totals with no signal. The last such error is kept
+  // so a total failure can say WHY (the client's 403 classification
+  // already distinguishes a rotated key from a hidden group).
+  let lastGroupError: unknown;
   const groupDiscussionLists = await runWithConcurrency(
     groupIds,
     (gid) => listDiscussionIdsForGroup(gid),
     CONCURRENCY,
-    isRecoverableScanError,
+    (err) => {
+      if (!isRecoverableScanError(err)) return false;
+      lastGroupError = err;
+      return true;
+    },
   );
   const groupsFailed: number[] = [];
   const groupsTruncated: number[] = [];
@@ -381,6 +465,17 @@ export async function getUserActivity(
       groupsFailed.push(groupIds[i]!);
     }
   });
+
+  // Every group failed: nothing was scanned, so there is nothing to
+  // aggregate. The recorded error explains the refusal.
+  if (groupsFailed.length === groupIds.length) {
+    const reason =
+      lastGroupError instanceof Error ? lastGroupError.message : String(lastGroupError);
+    throw new Error(
+      `get_user_activity could not list the discussions of any of the ${groupIds.length} requested ` +
+        `group(s) (${groupIds.join(", ")}), so no activity can be reported. Last error: ${reason}`,
+    );
+  }
 
   // Global ceiling on the expensive per-discussion event fetch. If the
   // scan turned up more discussions than the cap, fetch events for only
@@ -415,17 +510,34 @@ export async function getUserActivity(
   let lastActivity: string | null = null;
   const samples: ActivityResult["sample_events"] = [];
 
-  const eventStreams = await runWithConcurrency(
-    scanDiscussions,
-    async (d) => {
-      const { events, truncated } = await fetchAllEventsForDiscussion(d.id);
-      return { groupId: d.group_id, events, truncated };
-    },
-    CONCURRENCY,
-    isRecoverableScanError,
+  const fetchStream = async (d: { id: number; group_id: number }): Promise<EventStream> => {
+    const { events, truncated } = await fetchAllEventsForDiscussion(d.id);
+    return { groupId: d.group_id, events, truncated };
+  };
+
+  // 2a. Probe the FIRST discussion's stream on its own, before fanning
+  // out. If v1/events is gone (Loomio ≥ 3.4.0) this 404s — and so would
+  // every one of the hundreds of fetches behind it. Throwing here costs
+  // one request instead of one per discussion and, more importantly,
+  // never lets the scan degrade into "every discussion failed, here are
+  // zero counts". Other errors on the first discussion are treated
+  // exactly as they would be inside the fan-out.
+  const [first, ...rest] = scanDiscussions;
+  const streams: Array<EventStream | null> = [];
+  if (first) {
+    try {
+      streams.push(await fetchStream(first));
+    } catch (err) {
+      if (isV1EventsGone(err)) throw new V1EventsRemovedError(first.id);
+      if (!isRecoverableScanError(err)) throw err;
+      streams.push(null);
+    }
+  }
+  streams.push(
+    ...(await runWithConcurrency(rest, fetchStream, CONCURRENCY, isRecoverableScanError)),
   );
 
-  for (const s of eventStreams) {
+  for (const s of streams) {
     if (!s) {
       // null = this discussion's event fetch errored (403/500/timeout).
       // Count it so the aggregate is flagged incomplete rather than
@@ -453,6 +565,18 @@ export async function getUserActivity(
       if (!lastActivity || e.created_at > lastActivity) lastActivity = e.created_at;
       rememberRecentSample(samples, e);
     }
+  }
+
+  // 2b. Zero streams read, at least one failure: the counts below would
+  // all be zero for a reason that has nothing to do with the user.
+  // Refuse rather than return them.
+  if (discussionsFailed > 0 && discussionsFailed === scanDiscussions.length) {
+    throw new Error(
+      `get_user_activity could not read the event stream of any of the ${scanDiscussions.length} ` +
+        "discussion(s) in scope (every fetch failed with 403 / 404 / 5xx / timeout), so no activity " +
+        "counts can be reported. If this Loomio is ≥ 3.4.0 the cause is the removed v1/events " +
+        "endpoint; otherwise check the connector user's access to these discussions.",
+    );
   }
 
   const complete =
