@@ -1,5 +1,257 @@
 # Changelog
 
+## 0.0.11 — 2026-09-20
+
+Hotfix: **detect, explain, stop lying.** Between Loomio 3.0.24 (the
+release this connector was built against) and 3.8.1, Loomio changed
+its API in ways that made the connector fail *quietly*: a rotated API
+key turned every call into one generic 403, `get_user_activity`
+reported zero activity for everyone once its upstream endpoint was
+removed, and `list_groups` answered an empty list when the key was
+dead. This release makes each of those failures loud and specific.
+It adds no new Loomio endpoints — the ports to Loomio's newer b2
+surface (native groups listing, thread items, topic side-load) are
+0.0.12. Tool count unchanged (8 reads + 4 writes + 2 b3 admin).
+
+Tested against Loomio 3.8.1: every behaviour described below was
+checked against the controllers, serializers, routes and controller
+tests at Loomio tag `v3.8.1`. `TESTED_LOOMIO_VERSION` in
+`src/version.ts` records that, and the health probe warns once when
+the instance's `major.minor` differs from it — Loomio publishes no API
+compatibility policy, so a new minor is a prompt to re-verify.
+
+Added:
+
+- **Key-health probe** (`src/loomio/health.ts`). An authenticated
+  `GET /b2/groups` (200 → `valid`; 403 with Loomio's unauthenticated
+  body → `rejected`; anything else, including a CDN/WAF 403 that never
+  reached Loomio → `unreachable` with a `detail`) plus the public
+  `GET /v1/boot/version` for the instance's Loomio version. Cached 60 s
+  with a shared in-flight promise, so a hammered `/health` costs Loomio
+  one request pair per minute. Every `key_status` change (including the
+  first result) emits a **forced** `loomio.auth` event that bypasses the
+  `LOOMIO_MCP_LOG_VERBOSE` gate, carrying `key_status`, `loomio_version`
+  and a closed-vocabulary `reason` (`unauthenticated_body`, `waf`,
+  `unrecognised_403`, `http_<status>`, `timeout`, `network_error`,
+  `config_error`) — never the free-text `detail`, which may quote an
+  upstream body fragment or error message and is reserved for the
+  startup stderr warning. A one-time forced `loomio.version_drift` fires
+  on a `major.minor` mismatch. Never logs or returns the key.
+- **`GET /health`** on the HTTP transport (`src/http/health.ts`).
+  Unauthenticated, per-IP rate-limited (same config as `/mcp`, separate
+  bucket), `Cache-Control: no-store`. Body:
+  `{status, connector_version, key_status, loomio_version, checked_at}`
+  — HTTP 200 iff `key_status === "valid"`, else 503. Exposes exactly
+  those fields: no key material, no `detail`, no Loomio hostname. Point
+  an uptime check at it with content match `"key_status":"valid"`
+  (DEPLOY.md). `LOOMIO_MCP_HEALTH_PATH` moves the page (e.g. to
+  `/-/health`) for hosting front-ends that reserve `/healthz` and answer
+  it with their own 404 before the container is reached; verify with
+  `curl` that the connector's JSON comes back before trusting an alert.
+- **Startup key check.** The HTTP entry probes after `listen` and logs
+  the verdict; the stdio entry probes once and, on `rejected`, writes a
+  one-paragraph warning to stderr (key rotated? where the current one
+  is). Neither exits — a transient error must not kill the server, and a
+  live process with classified 403s is more diagnosable than a
+  crash-loop.
+- **`User-Agent: loomiomcp/<version>`** on every outbound request. A
+  CDN/WAF in front of an instance (Cloudflare is common) blocks default
+  library user-agents outright; an explicit UA also lets instance
+  operators pick the connector out of Loomio's logs.
+- **`src/version.ts`** — single source of truth for `VERSION` and
+  `TESTED_LOOMIO_VERSION`. `McpServer`, the User-Agent and `/health`
+  import it; `tests/version.test.ts` pins `package.json` to it (0.0.9
+  shipped with the two out of step).
+
+Changed:
+
+- **403s are classified** (`classifyForbidden` in `src/loomio/client.ts`,
+  pure and unit-tested). Loomio ≥ 3.1.1 answers 403 with a body that
+  says *why*, and the connector now reads it: a CDN/WAF body (JSON
+  problem `type` mentioning cloudflare, or non-JSON) → "blocked in front
+  of Loomio, not a permissions error — check WAF rules / User-Agent";
+  the generic `"You are not authorized to access this page."` →
+  **unauthenticated** — most often a rotated key (Loomio regenerates a
+  user's key when that user's password changes, and 3.3.1 rotated every
+  key once) — with remediation (`/health`, `GET /api/b2/groups`, the
+  user's API access page `/profile/api_access`). The classification is
+  **path-aware**: only `GET /b2/discussions?group_id=` and
+  `GET /b2/polls?group_id=` go through `records_visible_in_group`, so
+  only there does the message add "or the group is not visible to the
+  connector's user"; on `/b2/memberships` (a non-member gets `200 []`),
+  on every `/…/:id` read (which answers `"Not authorized to …"`) and on
+  writes the same body can only mean the key was rejected, and the
+  message says so. Writes include `POST /b2/discussions` and
+  `POST /b2/polls`, whose paths coincide with the two gated GET lists:
+  the classifier is **method-aware**, so a rotated key on `create_*` is
+  never hedged towards "group not visible" (the one bare refusal a
+  valid key can hit on a write — `POST /b2/polls` for an anonymous poll
+  with no future `closing_at`, raised after the poll was saved — is
+  named in the message). On `/b3/` paths the generic body is about the
+  **b3 server secret**: `LOOMIO_B3_API_KEY` must equal the Loomio
+  server's `ENV['B3_API_KEY']` (itself longer than 16 characters), and
+  the message says exactly that — never the per-user key, never
+  `/profile/api_access` — and the health verdict, which probes the b2
+  key only, does not colour it.
+  The key-health verdict colours the message only when
+  it is **fresh** (younger than the 60 s cache): a fresh `rejected` makes
+  it definitive, a fresh `valid` on a gated list points at visibility
+  first, and a stale verdict is ignored — so a startup `valid` from days
+  ago can never make a post-rotation 403 read as "not a key problem".
+  `"Not authorized to <action> <Model>."` → per-record permission,
+  surfaced verbatim; `"User is not an admin"` → needs the group admin
+  (coordinator) role on that group; a numeric body or
+  `action: "upgrade"` → Loomio subscription/plan limit; anything else →
+  the body text. The old "Loomio sends the same 403 whether the key is
+  invalid or the user lacks the role" text is gone — it described
+  Loomio ≤ 3.1.0. A **401** is explained per namespace: Loomio's b2/b3
+  API answers its own authentication failures with 403, so a 401 on a
+  b2/b3 path came from something in front of Loomio (proxy, CDN,
+  basic-auth gate); on a v1 path Loomio itself can answer 401
+  (`require_current_user`, "you gotta be signed in") because v1 is a
+  session-cookie API and the connector's key is not a v1 credential.
+- **Upstream text in error messages is clipped** to 200 characters
+  (`clip` in `src/loomio/client.ts`) at every echo site: non-JSON error
+  bodies (a CDN's multi-KB HTML 502 page), the uncatalogued-403 body,
+  `"Not authorized to …"` remainders, plan-limit and Cloudflare titles,
+  and Rack::Attack's 429 text. The suffix states the original length.
+  These messages land in MCP tool results (agent context) and inside
+  `get_user_activity`'s "Last error"; unbounded upstream text there is
+  both noise and an injection surface.
+- **429 handled.** Loomio's Rack::Attack throttle (per client IP, 900
+  requests per 5 minutes by default, `text/plain`) becomes a clear
+  `LoomioApiError` with the `Retry-After` header when present; the
+  invitation-limit JSON 429 is surfaced with Loomio's own message.
+- **`list_memberships`** passes Loomio's response through. When
+  `memberships` is empty it adds `scope.note`: on Loomio ≥ 3.8 a
+  non-member (or a hidden group) gets `200 []`, not 403, and a real
+  group always has at least its creator — so an empty roster almost
+  always means "the connector's user is not a member". Description
+  rewritten: **any member** can list the roster (ids, names, usernames,
+  roles, join state); `user_email` appears only for groups where the
+  connector's user is an admin, or for members it invited. The "caller
+  MUST be a group admin / 403" claims are removed.
+- **`manage_memberships`** sends `remove_absent: 1` on the wire when the
+  flag is true and **omits the key** otherwise. Loomio reads
+  `params[:remove_absent].to_i == 1`; a JSON boolean has no `#to_i` in
+  Ruby, so the previous body raised `NoMethodError` → HTTP 500 — *after*
+  the invitations had been sent. The zod schema keeps the boolean.
+  Description now states the role requirement (group admin/coordinator
+  on that group; Loomio answers `403 "User is not an admin"`; parent-
+  group admin and instance admin do not count) and the full blast radius
+  of `remove_absent`: pending invitees are revoked too, the revocation
+  cascades to subgroups, and the connector's own user is removed if its
+  email is absent.
+- **Membership 403 fence removed.** `src/loomio/access.ts`,
+  `tests/access.test.ts` and `explainForbidden` are deleted. The fence
+  existed because Loomio ≤ 3.1.0 returned a bare `{"error":403}` for
+  every refusal; the classified bodies make it redundant, and its extra
+  probe was one more way to spend Loomio's rate budget.
+- **`list_discussions` always sends `status`** (default `open`).
+  Loomio's own fall-through for a missing `status` is every kept thread
+  *including locked ones*, so omitting it silently widened the list.
+  The description states the default.
+- **`deactivate_user` / `reactivate_user`** use the member routes
+  `POST /b3/users/{id}/deactivate` and `…/{id}/reactivate`; the `?id=`
+  collection routes are marked `deprecated: true` in Loomio's OpenAPI
+  document. The response is typed as `{ success: true, user }` and
+  returned. Descriptions: deactivation runs **asynchronously**
+  server-side (the echoed user may still show `active: true`);
+  reactivation is synchronous and **restores the memberships the
+  deactivation revoked**.
+- **`list_groups`** no longer claims that `is_admin` bypasses membership
+  (Loomio ≥ 3.8 ignores it for the User API) and now states the probe's
+  blind spot: a group with **no polls** is never discovered, because the
+  group object only reaches the response as a side-load of the polls
+  that reference it. Scope now includes publicly visible groups (Loomio
+  ≥ 3.8 lets any authenticated user read them). The description no
+  longer claims that `b2/polls` embeds a subgroup's parent in `groups`:
+  Loomio side-loads it under a separate `parent_groups` root (with no
+  visibility check on the parent), which the probe deliberately does
+  not read, so a parent group is discovered only when its own id is
+  probed. When the scan finds
+  nothing it consults the health probe: `rejected` → throws the
+  key-rejected error instead of returning `groups: []`; otherwise the
+  result carries `scanned.note` saying what the emptiness does and does
+  not prove. Each probe records *why* it missed (404 vs 403), and when
+  any miss was a 403 the health probe is **forced** rather than served
+  from its 60 s cache — with a valid key a non-existent id answers 404
+  (`Group.find` runs after `authenticate_api_key!`), so an all-403 scan
+  is exactly what a key rotated seconds after the last `valid` probe
+  looks like. The `unreachable` note is fixed text; the probe's
+  operator-facing `detail` stays out of tool results, as it stays out
+  of `/health`.
+- **`list_polls` description** no longer says "Caller must be a group
+  member": polls and discussions share the `records_visible_in_group`
+  gate, so a publicly visible group's public polls are readable by any
+  authenticated user on Loomio ≥ 3.8 (same wording as
+  `list_discussions`).
+- **`create_poll` description** no longer presents the
+  public-discussions-only 422 as a current limitation: Loomio ≥ 3.1.0
+  derives the poll topic's privacy from the group
+  (`TopicService.private_default`) when `private` is omitted, so the
+  create should work in every group (not yet re-verified live; 0.0.12).
+  HOWTO.md carried the same stale paragraph and is fixed alongside.
+- **`LOOMIO_API_BASE_URL` validation** refuses a URL with userinfo
+  (`user:password@host`) before undici can quote the whole URL —
+  password included — back in an error message, and no validation
+  message repeats the configured value verbatim any more (the scheme
+  error names `protocol//host` only).
+- **`redactPath`** also collapses `/users/<id>` (b3 member routes),
+  `/groups/<id>` and `/threads/<id>` — the resources Loomio addresses by
+  a string key in the path — so no id or handle reaches a log line.
+- **Rate limiter** factored into `src/http/rate-limit.ts` so `/mcp` and
+  `/health` share one config and one keying rule (source IP) with
+  separate buckets. `resolveMcpRateLimitConfig` is re-exported from its
+  old home.
+- **Docs** brought in line with Loomio 3.8.1 throughout (README,
+  INSTALL, DEPLOY, SECURITY, DESIGN, HOWTO, NOTES-ON-LOOMIO-API,
+  OPTIMIZATIONS, CONTRIBUTING, glama.json). NOTES-ON-LOOMIO-API.md gains
+  a dated "Loomio 3.1 → 3.8 changes that matter" section; obsolete
+  gotchas are marked historical rather than deleted.
+
+Fixed:
+
+- **`get_user_activity` no longer reports zero activity when it counted
+  nothing.** Loomio ≥ 3.4.0 removed `GET /api/v1/events`; the previous
+  fan-out swallowed the resulting 404 on every discussion and returned
+  `counts.total: 0` for every user with only `scope.complete: false` to
+  hint otherwise. Now the FIRST discussion's stream is probed on its own
+  — a 404 there throws `V1EventsRemovedError` at the cost of one request
+  — and, as a backstop, a scan that ends with zero successful event
+  fetches and at least one failure throws instead of returning counts,
+  as does a scan where every group listing failed. Partial results are
+  still returned with the existing `scope.*` completeness flags.
+- **`list_events` on a 404** throws a clear error naming the removed
+  endpoint and the planned port instead of returning an empty stream.
+- **`manage_memberships` with `remove_absent: true` no longer 500s after
+  inviting** (see Changed).
+- **`list_groups` no longer returns an empty list for a rejected key**
+  (see Changed).
+- **Version skew** between `package.json` and the advertised MCP server
+  version can no longer recur (see `src/version.ts`).
+
+Known limitations:
+
+- **`list_events` and `get_user_activity` do not work against Loomio
+  ≥ 3.4.0** (August 2026), which removed the v1 `events` endpoint they
+  read (the Event model became TopicItem). Both tools now fail with a
+  clear error rather than lying; their descriptions say so. The port to
+  `GET /api/b2/threads/{topic_id}/items` is planned for 0.0.12.
+- **Write bodies pending verification.** Since Loomio 3.1.3 the b2
+  `permitted_params` prefers a wrapped resource hash (`{discussion:
+  {…}}`) when one is present and only falls back to the flat-body
+  handling this connector was built on. The flat/form-encoded write
+  behaviour is unchanged in this release and is re-verified against a
+  live 3.8.x instance in 0.0.12.
+- **`list_groups` is still probe-based** (misses poll-less groups; costs
+  one request per id). Native `GET /api/b2/groups` arrives in 0.0.12.
+- **Topic side-load not yet joined.** Since Loomio 3.1.0 a discussion's
+  `items_count`, `last_activity_at` and similar counters live on the
+  side-loaded `topics[]` record (and `compact=1` drops that record).
+  `list_discussions` / `get_discussion` return Loomio's response as-is;
+  the join is 0.0.12.
+
 ## 0.0.10 — 2026-07-25
 
 Dependency security updates. No code, tool, or API changes.

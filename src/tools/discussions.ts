@@ -29,7 +29,7 @@ export const listDiscussionsSchema = z.object({
     .enum(["open", "closed", "all"])
     .optional()
     .describe(
-      "Filter by status. 'open' = unlocked, 'closed' = locked, 'all' = every kept discussion. Loomio defaults to 'open'.",
+      "Filter by status. 'open' = unlocked (the connector's default), 'closed' = locked, 'all' = every kept discussion, locked or not. The connector always sends this parameter: Loomio's own default when it is absent is every kept thread INCLUDING locked ones, so omitting it would silently widen the list.",
     ),
   limit: z.number().int().min(1).max(200).optional().describe("Page size. Loomio defaults to 50."),
   offset: z.number().int().min(0).optional().describe("Page offset. Defaults to 0."),
@@ -38,7 +38,13 @@ export const listDiscussionsSchema = z.object({
 export async function listDiscussions(input: z.infer<typeof listDiscussionsSchema>) {
   return loomioGet<unknown>("/b2/discussions", {
     group_id: input.group_id,
-    ...(input.status ? { status: input.status } : {}),
+    // Always explicit. Loomio's DiscussionsController#accessible_records
+    // maps 'open'/'unlocked' → is_unlocked and 'closed'/'locked' →
+    // is_locked, and falls through to `scope.kept` — EVERY kept thread,
+    // locked ones included — when `status` is absent. The connector
+    // documents 'open' as its default, so it must send it rather than
+    // inherit whatever Loomio's fall-through happens to be.
+    status: input.status ?? "open",
     ...(input.limit !== undefined ? { limit: input.limit } : {}),
     ...(input.offset !== undefined ? { offset: input.offset } : {}),
   });
@@ -96,11 +102,13 @@ export const createDiscussionSchema = z.object({
  *   private_only         → true
  *   public_or_private    → true   (Loomio's own default)
  *
- * Uses `GET /api/v1/groups/{id}`, which Loomio exposes without
- * session auth for any public-visible group (v1 accepts the same
- * bearer credential as b2). On 403 the
- * group is hidden — Loomio's validator forces every hidden group to
- * `private_only`, so `true` is the only valid choice.
+ * Uses `GET /api/v1/groups/{id}`. v1 ignores the API key (it resolves
+ * its user from the session cookie only), so this is an ANONYMOUS
+ * read: it answers 200 for a publicly visible group and 403 for a
+ * hidden one — exactly the split the resolver needs, and independent of
+ * the connector user's memberships. On 403 the group is hidden —
+ * Loomio's validator forces every hidden group to `private_only`, so
+ * `true` is the only valid choice.
  */
 async function resolveDiscussionPrivate(groupId: number): Promise<boolean> {
   interface GroupShape {

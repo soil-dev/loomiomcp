@@ -8,6 +8,7 @@
 import express from "express";
 import type { OAuthProvider } from "../auth/provider.js";
 import { ICON_SVG } from "../icon.js";
+import { mountHealth } from "./health.js";
 import { mountOAuthRoutes } from "./oauth-routes.js";
 import { mountTransport } from "./transport.js";
 
@@ -45,6 +46,9 @@ export function createApp(opts: AppOptions): express.Express {
   };
   app.get("/icon.svg", iconHandler);
   app.get("/favicon.ico", iconHandler);
+
+  // Unauthenticated, rate-limited; exposes only health fields. See ./health.ts.
+  mountHealth(app);
 
   mountTransport(app, {
     oauthProvider,

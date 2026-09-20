@@ -10,17 +10,24 @@ architecture choices).
 
 ### What
 
-Three event types that give per-call visibility into runtime
+Three per-call event types that give visibility into runtime
 behaviour, emitted as single-line JSON to stderr and gated on
-`LOOMIO_MCP_LOG_VERBOSE=1`.
+`LOOMIO_MCP_LOG_VERBOSE=1` — plus two **forced** key-health events that
+bypass the gate, because a rotated Loomio key is exactly the failure an
+operator needs to see without having turned verbose logging on.
 
 | Event | Fires | Fields |
 |---|---|---|
 | `tool.call` | Once per tool invocation | `tool`, `clientId?`, `argFields` (field names only — never values), `durationMs`, `outcome` (`success` / `error`) |
-| `loomio.request` | Once per outbound Loomio API call | `method`, `path` (redacted: numeric IDs → `:id`, query stripped), `status`, `durationMs`, `responseBytes` |
+| `loomio.request` | Once per outbound Loomio API call | `method`, `path` (redacted: numeric IDs and string keys → `:id`, query stripped), `status`, `durationMs`, `responseBytes` |
 | `tool.chain` | Once per `/mcp` POST request (HTTP transport only) | `clientId?`, `tools` (sequence of tool names), `toolCount`, `loomioCalls`, `durationMs` |
+| `loomio.auth` (**forced**) | On every change of the key-health verdict, including the first probe (startup, `/health`, or a tool consulting it) | `key_status` (`valid` / `rejected` / `unreachable`), `loomio_version`, `reason?` — a closed vocabulary: `unauthenticated_body`, `waf`, `unrecognised_403`, `http_<status>`, `timeout`, `network_error`, `config_error`. Never the key, never the probe's free-text `detail` (that may quote an upstream body or error message and goes only to the startup stderr warning) |
+| `loomio.version_drift` (**forced**, once per process) | When the instance's Loomio `major.minor` differs from `TESTED_LOOMIO_VERSION` | `level: "warning"`, `loomio_version`, `tested_loomio_version`, `message` |
 
-All three are wired through `src/log.ts`. The aggregate `tool.chain`
+All of them are wired through `src/log.ts`; the key-health pair comes
+from `src/loomio/health.ts`. Alert on `loomio.auth` with
+`key_status != "valid"` as a second signal next to the `/health` uptime
+check (DEPLOY.md). The aggregate `tool.chain`
 event uses an `AsyncLocalStorage` request context (set up by
 `withRequestContext` in `src/http/transport.ts`) so the same `/mcp`
 request's tool calls and outbound API calls land in one summary line.
@@ -41,10 +48,15 @@ the unstructured error message.
   options, discussion bodies, comment text, member emails stay out
   of operator logs.
 - **Loomio API paths are redacted**: `/b2/discussions/254022621` →
-  `/b2/discussions/:id`. Query strings (which include the api_key)
-  are dropped entirely.
+  `/b2/discussions/:id`. Query strings are dropped entirely. The API
+  key travels in the `Authorization` header (never in a URL since
+  0.0.9) and headers are never logged; dropping the query keeps
+  incidental parameters such as `group_id` out of logs as well.
 - **No request / response bodies, ever.** Verbose mode unlocks
-  per-call shape and timing, not Loomio data.
+  per-call shape and timing, not Loomio data. The forced events obey
+  this too: `loomio.auth` carries a `reason` code, not the probe's
+  `detail` text, and nothing logged is built from the configured
+  Loomio URL.
 
 ### Why opt-in
 
@@ -250,8 +262,9 @@ If `get_discussion x10+` shows up often, the case for a `get_discussions`
 batch tool is empirical, not hypothetical.
 
 Note that `list_groups` legitimately fans out 50–200 outbound calls
-per invocation by design; that's not an N+1, it's the documented
-workaround for Loomio's missing groups index endpoint. See
+per invocation by design; that's not an N+1, it's the documented probe
+used until the native `GET /api/b2/groups` listing (Loomio ≥ 3.1.0,
+already used as the key-health probe) replaces it in 0.0.12. See
 NOTES-ON-LOOMIO-API.md → "Gotcha 4".
 
 ### Read vs write traffic mix
