@@ -7,6 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TESTED_LOOMIO_VERSION, VERSION } from "../src/version.js";
 import { fetch } from "undici";
 import { setCachedHealth } from "../src/loomio/health-cache.js";
 import { resetHealthForTests } from "../src/loomio/health.js";
@@ -392,8 +393,8 @@ describe("checkConnection", () => {
     const probeUrl = new URL(String(fetchCallsTo("/b2/groups")[0]![0]));
     expect(probeUrl.searchParams.get("exclude_types")).toBe("tag translation");
 
-    expect(r.connector_version).toBe("0.0.12");
-    expect(r.tested_loomio_version).toBe("3.8.1");
+    expect(r.connector_version).toBe(VERSION);
+    expect(r.tested_loomio_version).toBe(TESTED_LOOMIO_VERSION);
     expect(r.loomio_version).toBe("3.8.1");
     expect(r.key_status).toBe("valid");
     expect(r.checked_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);

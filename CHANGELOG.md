@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.0.13 — 2026-09-21
+
+Dependency security release. No behaviour change; tool catalogue,
+schemas and descriptions are byte-identical to 0.0.12 (35 631 B for the
+24 full-mode tools, re-measured with `scripts/catalog-size.mjs`).
+
+Changed:
+
+- Runtime dependencies updated within their declared ranges:
+  `@modelcontextprotocol/sdk` 1.29.0 → 1.30.0, `undici` 8.9.0 → 8.10.2,
+  `express-rate-limit` 8.5.2 → 8.7.0, `zod` 4.4.3 → 4.6.5. Development:
+  `vitest` 4.1.7 → 4.1.11, `@types/node` 25.9.1 → 25.9.8.
+- Transitive advisories cleared (`npm audit`: 0 vulnerabilities, was
+  8 — 3 high, 4 moderate, 1 low): `fast-uri` (via ajv, high) → 3.1.8,
+  `ip-address` (via express-rate-limit, high) → 10.7.2, `nanoid` (via
+  postcss/tsup, high) → 3.3.19, `hono` (via the MCP SDK, moderate) →
+  4.13.8, `qs` (via express, moderate) → 6.16.0, `esbuild` (dev, low)
+  pinned outside the affected range.
+
+Verified: biome, tsc, 572 tests and the build are green; the stdio
+server was exercised live against a Loomio 3.8.1 instance (read tools
+through the new SDK/undici) and the production smoke test runs after
+deploy.
+
 ## 0.0.12 — 2026-09-21
 
 **Adopt Loomio 3.8's API; make it efficient.** Every capability Loomio
