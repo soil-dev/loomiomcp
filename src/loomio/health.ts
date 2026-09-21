@@ -22,7 +22,14 @@
  *     negatives. 403 with Loomio's unauthenticated body means "no
  *     active user owns this key" → rejected. A 403 that did NOT come
  *     from Loomio (CDN/WAF), any other status, a timeout or a config
- *     error → unreachable: we do not know, and say so.
+ *     error → unreachable: we do not know, and say so. The 200 body —
+ *     the user's groups, parent groups, own membership rows and the
+ *     users those reference — is parsed and kept beside the verdict
+ *     (`getCachedGroupsIndex`), because `check_connection` wants
+ *     exactly that list and has just paid for it. The request sends
+ *     `exclude_types=tag translation` (the groups read profile) so the
+ *     once-a-minute probe does not haul tag and translation side-loads
+ *     it never reads.
  *   GET /v1/boot/version (public, no credential) — `{ "version": "3.8.1" }`.
  *     Failure here never affects `key_status`; it only leaves
  *     `loomio_version` null.
@@ -57,19 +64,23 @@ import {
   LoomioAuthError,
   loomioGetPublic,
   loomioGetRaw,
+  readParams,
 } from "./client.js";
 import {
   cachedHealthAgeMs,
+  getCachedGroupsIndex,
   getCachedHealth,
+  getFreshGroupsIndex,
   HEALTH_CACHE_TTL_MS,
   type HealthReason,
   type LoomioHealth,
   resetCachedHealth,
   setCachedHealth,
 } from "./health-cache.js";
+import type { GroupsIndexResponse } from "./types.js";
 
 export type { HealthReason, LoomioHealth };
-export { getCachedHealth, HEALTH_CACHE_TTL_MS };
+export { getCachedGroupsIndex, getCachedHealth, getFreshGroupsIndex, HEALTH_CACHE_TTL_MS };
 
 /** The authenticated probe target. See the module comment for why this endpoint. */
 export const HEALTH_PROBE_PATH = "/b2/groups";
@@ -113,7 +124,7 @@ async function runProbe(): Promise<LoomioHealth> {
     ...(key.reason ? { reason: key.reason } : {}),
     ...(key.detail ? { detail: key.detail } : {}),
   };
-  setCachedHealth(health);
+  setCachedHealth(health, Date.now(), key.groups);
 
   if (!previous || previous.key_status !== health.key_status) {
     // `reason`, never `detail`: this event is forced (cannot be turned
@@ -132,7 +143,27 @@ async function runProbe(): Promise<LoomioHealth> {
   return health;
 }
 
-type KeyVerdict = Pick<LoomioHealth, "key_status" | "reason" | "detail">;
+type KeyVerdict = Pick<LoomioHealth, "key_status" | "reason" | "detail"> & {
+  /** The parsed 200 body of the groups probe; only ever set with `key_status: "valid"`. */
+  groups?: GroupsIndexResponse;
+};
+
+/**
+ * Parse the groups probe's 200 body. A body that is not a JSON object
+ * is not an error for the PROBE — the status already proved the key —
+ * so it yields `undefined` and `check_connection` falls back to its own
+ * request. Never throws.
+ */
+function parseGroupsIndex(text: string): GroupsIndexResponse | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as GroupsIndexResponse)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Sort a thrown error from `loomioGetRaw` into the closed vocabulary.
@@ -151,7 +182,7 @@ async function probeKey(): Promise<KeyVerdict> {
   let status: number;
   let text: string;
   try {
-    ({ status, text } = await loomioGetRaw(HEALTH_PROBE_PATH));
+    ({ status, text } = await loomioGetRaw(HEALTH_PROBE_PATH, readParams("groups")));
   } catch (err) {
     // Network error, timeout, missing LOOMIO_API_KEY, invalid base URL —
     // none of these say anything about the key itself.
@@ -161,7 +192,7 @@ async function probeKey(): Promise<KeyVerdict> {
       detail: `GET ${HEALTH_PROBE_PATH} failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  if (status === 200) return { key_status: "valid" };
+  if (status === 200) return { key_status: "valid", groups: parseGroupsIndex(text) };
   if (status === 403) {
     // Only Loomio's own unauthenticated body proves the key is rejected.
     // A WAF's 403 never reached Loomio; any other JSON 403 on this
@@ -234,6 +265,28 @@ function warnOnVersionDrift(loomioVersion: string | null): void {
     },
     { force: true },
   );
+}
+
+/**
+ * The connector user's own Loomio id, from the LAST groups probe body of
+ * any age — or `undefined` before the first successful probe. The
+ * groups index side-loads only the API user's own membership rows, so
+ * any row's `user_id` names it.
+ *
+ * Why any age is fine here where `getFreshKeyStatus` insists on a fresh
+ * verdict: a key belongs to one user for its whole life (rotation
+ * invalidates the key, it never re-points it), so the identity a probe
+ * learned yesterday is the identity behind today's calls unless the
+ * operator swapped LOOMIO_API_KEY for a different user's key without
+ * restarting — and the startup probe runs on every start. Consumers use
+ * this to recognise the user's OWN stance among a thread's stances
+ * (`ownStanceFor`), where a missing id merely errs towards hiding poll
+ * results the user could see, never towards showing what it could not.
+ */
+export function cachedOwnUserId(): number | undefined {
+  const rows = getCachedGroupsIndex()?.memberships;
+  if (!Array.isArray(rows)) return undefined;
+  return rows.find((m) => typeof m.user_id === "number")?.user_id;
 }
 
 /**

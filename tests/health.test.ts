@@ -349,3 +349,85 @@ describe("forced events", () => {
     expect(stderrEvents().some((e) => e["event"] === "loomio.version_drift")).toBe(false);
   });
 });
+
+describe("groups body cache (for check_connection)", () => {
+  const GROUPS_BODY = {
+    groups: [{ id: 7, name: "Finance", handle: "finance-team", parent_id: 2 }],
+    parent_groups: [{ id: 2, name: "Example Org" }],
+    memberships: [
+      { id: 900, group_id: 7, user_id: 55, admin: false, accepted_at: "2026-01-01T00:00:00Z" },
+    ],
+    users: [{ id: 55, name: "Connector Bot", username: "bot" }],
+    meta: { root: "groups", total: 1 },
+  };
+
+  it("keeps the parsed 200 body beside the verdict and sends the groups read profile", async () => {
+    const { getCachedGroupsIndex, getFreshGroupsIndex } = await import("../src/loomio/health.js");
+    mockRoutes({
+      "/b2/groups": { status: 200, body: GROUPS_BODY },
+      "/v1/boot/version": VERSION_OK,
+    });
+    const h = await checkLoomioHealth();
+    expect(h.key_status).toBe("valid");
+    expect(getCachedGroupsIndex()).toEqual(GROUPS_BODY);
+    expect(getFreshGroupsIndex()).toEqual(GROUPS_BODY);
+    // The verdict itself never carries the groups (it is what /health serialises).
+    expect(h).not.toHaveProperty("groups");
+    const url = new URL(String(callsTo("/b2/groups")[0]?.[0]));
+    expect(url.searchParams.get("exclude_types")).toBe("tag translation");
+  });
+
+  it("is undefined when the probe did not answer 200, or answered non-JSON", async () => {
+    const { getCachedGroupsIndex } = await import("../src/loomio/health.js");
+    mockRoutes({ "/b2/groups": GENERIC_403, "/v1/boot/version": VERSION_OK });
+    await checkLoomioHealth();
+    expect(getCachedGroupsIndex()).toBeUndefined();
+
+    resetHealthForTests();
+    mockRoutes({
+      "/b2/groups": { status: 200, body: "<html>login</html>" },
+      "/v1/boot/version": VERSION_OK,
+    });
+    const h = await checkLoomioHealth();
+    expect(h.key_status).toBe("valid");
+    expect(getCachedGroupsIndex()).toBeUndefined();
+  });
+
+  it("a later non-200 probe replaces the body, so the cache never pairs a rejected verdict with stale groups", async () => {
+    const { getCachedGroupsIndex } = await import("../src/loomio/health.js");
+    mockRoutes({
+      "/b2/groups": { status: 200, body: GROUPS_BODY },
+      "/v1/boot/version": VERSION_OK,
+    });
+    await checkLoomioHealth();
+    expect(getCachedGroupsIndex()).toBeDefined();
+    mockRoutes({ "/b2/groups": GENERIC_403, "/v1/boot/version": VERSION_OK });
+    await checkLoomioHealth({ force: true });
+    expect(getCachedGroupsIndex()).toBeUndefined();
+  });
+
+  it("getFreshGroupsIndex expires with the verdict's TTL; getCachedGroupsIndex does not", async () => {
+    const { getCachedGroupsIndex, getFreshGroupsIndex } = await import("../src/loomio/health.js");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-20T10:00:00Z"));
+    mockRoutes({
+      "/b2/groups": { status: 200, body: GROUPS_BODY },
+      "/v1/boot/version": VERSION_OK,
+    });
+    await checkLoomioHealth();
+    vi.setSystemTime(new Date(Date.parse("2026-09-20T10:00:00Z") + HEALTH_CACHE_TTL_MS + 1));
+    expect(getFreshGroupsIndex()).toBeUndefined();
+    expect(getCachedGroupsIndex()).toEqual(GROUPS_BODY);
+  });
+
+  it("resetHealthForTests clears it", async () => {
+    const { getCachedGroupsIndex } = await import("../src/loomio/health.js");
+    mockRoutes({
+      "/b2/groups": { status: 200, body: GROUPS_BODY },
+      "/v1/boot/version": VERSION_OK,
+    });
+    await checkLoomioHealth();
+    resetHealthForTests();
+    expect(getCachedGroupsIndex()).toBeUndefined();
+  });
+});

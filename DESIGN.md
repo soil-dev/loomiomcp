@@ -11,22 +11,30 @@ via `Authorization: Bearer <api_key>`. This is the namespace where
 Loomio's controllers live in the open-source repo (the `b1` namespace
 was removed in Loomio 3.1.0) and the one Loomio's OpenAPI document
 describes. The canonical b2 docs are at https://www.loomio.com/help/api2.
+As of 3.8.1 the connector wraps every b2 resource except `/b2/chatbots`
+(group-admin webhook configuration whose serializer returns the webhook
+URL — nothing an AI caller needs, and a leak surface), `GET
+/b2/threads/{id}` alone (its row is what `list_threads` returns and the
+items / markdown tools fill the header themselves) and the participation
+report's `base` / `countries` sections.
 
 The **b3** namespace uses a separate auth secret — a bearer token
 validated against `ENV['B3_API_KEY']` on the Loomio server, >16 chars.
 This is a server-instance admin secret, not a per-user key. The
-connector wraps two of its routes, the member routes
-`POST /b3/users/{id}/deactivate` and `POST /b3/users/{id}/reactivate`
-(Loomio's OpenAPI marks the older `?id=` collection routes
-`deprecated: true`). Since Loomio 3.1 the namespace also offers user
-listing, show/update/destroy/redact and lookup by external identity;
-the connector deliberately does not wrap those, but the secret unlocks
-them (SECURITY.md). Tools are registered only when `LOOMIO_B3_API_KEY`
-is set (and skipped in readonly mode).
+connector wraps four of its routes: the member routes
+`POST /b3/users/{id}/deactivate` and `…/reactivate` (Loomio's OpenAPI
+marks the older `?id=` collection routes `deprecated: true`), and the
+reads `GET /b3/users/{id}` / `GET /b3/users/identity/{type}/{uid}`
+(`get_user`) and `GET /b3/users[?is_admin=]` (`list_users`). The reads
+return every account's email, so they are gated exactly like the writes
+— registered only when `LOOMIO_B3_API_KEY` is set AND the server is not
+read-only — and documented as single-tenant only. Update / destroy /
+redact are deliberately not wrapped: irreversible, and Loomio records no
+actor identity for b3 calls (SECURITY.md).
 
 The internal `v1` API (~37 controllers — groups, stances/votes,
-reactions, search, …) is out of scope for this connector. That isn't
-an oversight; v1 is fundamentally hostile to programmatic third-party
+reactions, the browser's own search, …) is out of scope. That isn't an
+oversight; v1 is fundamentally hostile to programmatic third-party
 access on the loomio.com SaaS:
 
 - **Auth wall.** Both session creation (`POST /api/v1/sessions`) and
@@ -40,134 +48,232 @@ access on the loomio.com SaaS:
 - **Cookie lifecycle.** Sessions expire (Loomio's config: ~2 weeks). A
   connector that needs the user to re-paste cookies on a fortnightly
   cadence is a poor experience.
+- **The key is not a v1 credential.** v1 resolves `current_user` from
+  the session cookie only, so any v1 read the connector made ran
+  anonymously and covered only public content, whatever the key's
+  memberships.
 
-Two v1 endpoints are exceptions the connector has relied on. The
-unauthenticated `GET /api/v1/boot/version` (`{ "version": "3.8.1", … }`)
-is what the key-health probe reads for the instance's Loomio version —
-public, no credential sent. And `GET /api/v1/events?discussion_id=` is
-what `list_events` / `get_user_activity` read until Loomio 3.4.0
-(August 2026) replaced the Event model with TopicItem and removed the
-endpoint. v1 never honoured the API key — it resolves `current_user`
-from the session cookie only, so the bearer header the client sent was
-ignored — which means those reads ran anonymously and covered only
-**public** discussions, whatever the connector user's memberships.
-(The same is true of the `GET /api/v1/groups/{id}` privacy resolver in
-`create_discussion`: an anonymous read that 200s for public groups and
-403s for hidden ones.) Both tools now fail with a clear error against a
-≥ 3.4.0 instance rather than returning empty data; the port to the b2
-successor `GET /api/b2/threads/{topic_id}/items` is 0.0.12 — and since
-that endpoint runs as the key's user, the port also widens what is
-visible to the private threads the user belongs to, one more reason it
-is a release of its own.
+The connector now makes exactly one v1 request: the unauthenticated
+`GET /api/v1/boot/version` (`{ "version": "3.8.1", … }`), which the
+key-health probe reads for the instance's Loomio version with no
+credential sent. The two v1 reads earlier releases relied on —
+`GET /api/v1/events?discussion_id=` (removed by Loomio 3.4.0 when the
+Event model became TopicItem; `list_events` and the old
+`get_user_activity` read it) and `GET /api/v1/groups/{id}` (the
+`create_discussion` privacy resolver) — are gone with the tools that
+used them. Their b2 successors run as the key's user, so the port also
+widened what is visible to the private threads the user belongs to.
 
-A self-hosted Loomio with `TURNSTILE_SECRET_KEY` unset removes the
-auth wall, so v1 could be wrapped there — but that's a niche enough
-deployment that it's left as a future opt-in (e.g. behind a
-`LOOMIO_SESSION_COOKIE` env var) rather than part of the default tool
-catalog.
+## Write bodies: nested for discussions and polls, flat for comments
 
-## Flat bodies (no resource-name wrapping) — re-verification pending
+Two Rails mechanisms meet in `Api::B2::BaseController#permitted_params`
+(Loomio ≥ 3.1.3): it takes the wrapped resource hash
+(`{"discussion": {…}}`) when one is present, and Rails'
+`wrap_parameters format: [:json]` builds that hash itself from a flat
+JSON body — but only from the keys that are COLUMNS of the model. So a
+flat JSON discussion or poll body arrives pre-wrapped with `group_id`,
+`private`, `options` and `recipient_*` silently dropped: the record is
+created in the wrong place with HTTP 200. Confirmed live on 2026-09-20 —
+a flat discussion became a group-less private thread, a flat poll a
+group-less poll with no options. The connector therefore sends the
+resource **nested** (`nestedBody` in `src/loomio/client.ts`), which makes
+the first rule take the hash verbatim and the second never run.
 
-The connector was built against a b2 base controller whose
-`permitted_params` *stripped* the incoming `:discussion` / `:poll` keys
-before re-wrapping under the resource name. So a body like
-`{discussion: {title, …}}` lost its wrapper, leaving empty params that
-were re-wrapped to `{discussion: {}}` — an empty record with zero
-validation errors, silent data loss. Flat top-level fields were the only
-shape that worked, and that is what the connector sends. For the
-comments endpoint the connector posts form-encoded with `discussion_id`
-in the URL query (NOTES-ON-LOOMIO-API.md, Gotcha 2).
+Comments are the exception: `CommentsController#create` reads
+`params[:discussion_id]` from the TOP level (not a Comment column, so
+wrapping leaves it there) and the permitted `comment` hash is the one
+Rails builds from `body`, `body_format`, `parent_id`, `parent_type` —
+all columns. A comment body is therefore **flat JSON** (`flatBody`),
+exactly as Loomio's own controller tests post it; wrapping it hides
+`discussion_id` and answers 400, and the ≤ 3.1.2 form-encoded workaround
+400s too. Form encoding is gone from the client.
 
-Loomio 3.1.3 (July 2026) changed the rule: `permitted_params` now
-**prefers** a wrapped resource hash when one is present
-(`params[resource_name].respond_to?(:permit)`) and only otherwise strips
-`api_key` / `format` / `controller` / `action` / `discussion` / `poll` /
-`id` and wraps the flat remainder. Read from the source, the flat shape
-should therefore still be accepted; the b2 comments controller lost its
-own override in the same release and reads top-level `discussion_id`
-directly. This release (a hotfix) leaves the write path untouched; the
-flat and form-encoded shapes are re-verified against a live Loomio ≥ 3.8
-in 0.0.12, and that verification — not source reading — is what will
-settle the shape.
+Because a misdirected write is a 200, the create tools verify Loomio's
+echo: `create_discussion` throws if the returned `group_id` differs from
+the request, `create_poll` if the thread / group differ or the poll came
+back with no options although options were sent — each naming the
+created id so the caller can find and discard it. A poll attaches to a
+thread by `topic_id` (`PermittedParams#poll_attributes` has no
+`discussion_id`; it is 400), so `create_poll` resolves a `discussion_id`
+with the same one-call `resolveThread` the thread tools use and, when a
+`group_id` was given alongside, refuses a mismatch BEFORE writing.
+`PollService.invite` reads the `recipient_*` keys from the raw top-level
+params on create, so those travel both nested and top-level there, and
+nested only on update.
 
-## Probe-based group enumeration (until 0.0.12)
+## Native group index
 
-`list_groups` exists because, when it was written, Loomio had no
-api-key-authed endpoint that returned the caller's group list: v1's
-`profile/groups` needs a session, the v1 `explore` endpoint returns only
-publicly-listed groups, and b2 had no `groups` resource. So the tool
-probes: one `b2/polls?group_id=N&limit=1&status=all` per candidate id
-over a range, collecting the group objects side-loaded in the 200
-responses.
+`GET /b2/groups` (Loomio ≥ 3.1.0) is `current_user.groups`: every group
+the key's user holds an un-revoked membership in, pending invitations
+included, with the user's own membership rows side-loaded (the `admin`
+flag lives there) and each subgroup's parent side-loaded without a
+visibility check. `list_groups` is that one call, shaped: member rows
+with `member: true` and a `membership` summary, parents appended with
+`member: false`, deduped, sorted by `full_name`, Loomio's `meta.total` as
+`total`. What it is NOT: a list of everything readable. Loomio ≥ 3.8
+lets any authenticated user read a publicly visible group's public
+threads without membership, and such a group is absent here yet
+readable by id (`get_group`, `list_discussions`, `list_polls`) and
+present in `list_threads` / `search_content`. The description says so,
+because the model has to know that "not in list_groups" is not "cannot
+see".
 
-Loomio 3.1.0 added `GET /api/b2/groups` (`current_user.groups`) and
-`GET /api/b2/groups/{id}`. This hotfix release does not adopt it —
-that port is 0.0.12 — but it does use the index as the key-health probe
-(see below), because it answers 200 for any valid key, even one with no
-groups.
+The same endpoint is the key-health probe (200 for any valid key, even
+one with zero groups), and since 0.0.12 the probe keeps its parsed body
+beside the verdict (`getCachedGroupsIndex`) so `check_connection` can
+answer "does the connector work and what can it see" from one forced
+probe — and `cachedOwnUserId` can name the API user (its own membership
+rows' `user_id`) for the poll-visibility rule below. The body is stored
+next to `LoomioHealth`, never on it: `/health` serialises the verdict and
+must not grow a list of the user's groups.
 
-What each probe status means today (Loomio 3.8.1):
+The 0.0.11 id probe — one `GET /b2/polls?group_id=N` per candidate id,
+50–500 calls, blind to poll-less groups, and (after 3.8.0) listing
+public groups the user had never joined — is gone, and so are its three
+inputs: an older client's call still parses because unknown keys are
+dropped, and it gets the same one-call result.
 
-- 200 → the group exists and `can?(:show, group)`: the connector's user
-  is a member, **or the group is publicly visible** (Loomio ≥ 3.8 lets
-  any authenticated user read public groups), or it is a subgroup
-  visible to parent-group members. Instance `is_admin` is **not**
-  consulted — the earlier claim that an admin "sees every group" was
-  true before 3.8 and is false now.
-- 404 → no group with that id.
-- 403 → the group exists but is not visible to the connector's user —
-  **or** the API key is rejected, in which case every probe looks
-  exactly like this (authentication runs before the group lookup).
+## Response shaping: join, slim, truncate, link
 
-Two consequences shape the tool. First, the **blind spot**: the group
-object reaches the response only as a side-load of the polls that
-reference it, so a group with no polls is never discovered even when
-the user can read it. A missing group is not proof of invisibility;
-the description says so, and the empty result carries a note. Second,
-the **rejected-key trap**: an all-403 scan and a no-visible-groups scan
-are indistinguishable per probe, so when the scan finds nothing the tool
-asks the cached key-health verdict and, on `rejected`, throws instead of
-returning `groups: []`.
+Loomio's responses are built for its own browser client: side-loaded
+roots joined by id, every user with avatar metadata, every discussion
+with its full HTML body, every thread's counters on a `topics[]` row.
+Handed to a model verbatim that is mostly irrelevant, large (a 50-row
+list is tens of kilobytes of markup) and subtly misleading (the
+interesting numbers sit in a root the model must join by hand). Every
+read therefore goes through `src/loomio/shape.ts`, in one place so the
+rules stay identical across tools:
 
-Why `b2/polls` rather than the other list endpoints, then and now:
-`b2/memberships` answers a non-member with `200 []` (Loomio ≥ 3.8; it
-was 403 before), so it cannot tell "member" from "not a member" — the
-one thing an enumeration needs; `b2/discussions` and `b2/polls` both go
-through the same visibility gate, and polls was the cheaper of the two.
+- **join** — `joinTopics` folds `items_count`, `replies_count`,
+  `last_activity_at`, `locked_at`, `pinned_at`, `tags`, `members_count`,
+  `seen_by_count`, `active_polls_count`, `closed_polls_count` from the
+  `topics[]` row onto the discussion or poll (`discussion.topic_id` →
+  `topic.id`); `reader_*` state, `ranges` and internals are dropped. A
+  record whose topic Loomio withheld comes back WITHOUT the fields, not
+  with zeros — a missing join must look missing.
+- **slim** — users become `{id, name, username}` (+ `email` only on the
+  b3 tools; a roster's member emails travel as `user_email` on the
+  membership row, and the API user's own `users[].email` — the one
+  Loomio always adds — is dropped); groups keep
+  identity, privacy and counters; attachments become a count; link
+  previews, `mentioned_usernames`, chart knobs and cover urls go.
+- **truncate** — `truncateField` caps a body at `*_max_chars` and marks
+  the record `<field>_truncated: true` with `<field>_chars`; `0` omits
+  the field (`<field>_omitted`), `-1` keeps it whole. No ellipsis is
+  appended (in a Markdown body it would be indistinguishable from
+  content) and cuts never split a surrogate pair. Lists cap by default
+  (1500 for descriptions, 4000 for thread-item bodies, 60000 for the
+  Markdown rendering, a 120000-character reply budget for thread items
+  with `next_offset` to continue); `get_*` return full text.
+  `truncateBody` first strips the attributes off an HTML body that
+  exceeds its cap (`compactHtml`: Loomio stores `target` / `rel` on
+  every link and an `id` on every heading; `href` and `alt` survive) so
+  the capped characters carry words; bodies that fit and `get_*` are
+  byte-for-byte what Loomio stored.
+- **link** — `discussionUrl` & co. build Loomio's own URL formats
+  (`/d/{key}[/{slug}]`, `/p/{key}`, `?comment_id=` / `?sequence_id=`
+  deep links, `/{handle}` for groups) on the API base minus `/api`, so
+  an answer can point a human at the record.
 
-The 500-id per-call cap is the load-protection lever (one HTTP call
-per probed id; default scans of 1..200 cost ~50–200 outbound calls).
-Loomio's own Rack::Attack throttle is 900 requests per 5 minutes per
-client IP, which is the other reason the native listing cannot come
-soon enough.
+Which side-loads arrive at all is decided upstream by the read profiles
+in `src/loomio/client.ts` (`EXCLUDE_TYPES` / `readParams`): lists drop
+group / parent / membership / reaction / translation but keep `topics`
+(the counters), shows keep the group as well, the groups index keeps the
+user's own `memberships`, `list_threads` sends compact minus `tag`,
+rosters / search / thread items by bare `topic_id` send `compact=1`, and
+thread items for a thread whose record is already known also exclude
+`discussion`. `tag` is never excluded where topic rows are read: Loomio
+gates the rows' `tags` FIELD on `include_type?('tag')`, not only the
+side-loaded root. `compact=1` is never sent where `topics` are needed, because
+`topic` is in Loomio's compact list. Writes carry no profile: Loomio's
+`:raise` mode would answer 400.
+
+## Poll result visibility is applied client-side
+
+Loomio's rule (`app/models/poll.rb`) has two halves: results are
+*available* unless `hide_results = until_closed` and the poll is open,
+and *visible* only if additionally `hide_results != until_vote`, or the
+poll is closed, or the viewer has voted. `PollSerializer` implements the
+first half only and leaves `until_vote` to the browser client — which an
+API user that never votes would bypass, seeing every voter's choice on a
+poll whose author said "vote first". `src/loomio/visibility.ts` applies
+the full predicate with "voted" = the API user's own latest stance is
+cast (the `my_stance` side-load on a poll show; in a thread's items the
+stance whose `participant_id` is the id the health probe learned),
+strips `results` / `stance_counts` / `total_score` / `stv_results` and
+other voters' `option_scores` / `reason` when it says no, and always
+emits `results_visible` + `results_hidden_reason` so a caller can tell
+"hidden" from "zero". With no cached identity the thread tools assume
+"not voted", which hides more, never less, and `scope.own_user_known`
+says so. `get_thread_markdown` needs no gate: `ThreadMarkdownService`
+applies `results_visible?(voted:)` itself. Anonymous polls carry
+`participant_id: null` on every stance; nothing here can or should
+de-anonymise them, and the server instructions tell the model not to
+try.
+
+## Thread addressing
+
+Loomio's thread routes take the THREAD id (`topic_id`), not the
+discussion's or poll's own id, and resolve it with
+`TopicQuery.visible_to(user).find` — so an unknown id and an invisible
+thread both answer 404, never 403. Every thread tool accepts exactly one
+of `topic_id` (free), `discussion_id` or `poll_id` (one `compact=1` GET
+to read the record's `topic_id`, `resolveThread`), and every record the
+connector returns carries its `topic_id` so a caller that already holds
+one never pays the extra call. `get_discussion` with `include_items`
+uses the `topic_id` already on the record — never two fetches for the
+same id in one call.
+
+## Participation from Loomio's report, not from scanning
+
+`GET /b2/reports?section=users` (Loomio ≥ 3.7.0) is the participation
+page every member sees: per user, threads / comments / polls / outcomes
+authored, reactions given, ballots issued vs cast vs missed, for a group
+set and a month window, in one call. `get_participation_report` is that
+call for a whole group set (ranking, "a card per member");
+`get_user_activity` keeps its 0.0.11 input contract and makes one call
+per group (so it can say where the activity was) plus one author-mode
+search for linkable recent examples — N + 1 calls, ≤ 4 in flight, where
+0.0.11 walked every discussion's event stream (~200 calls) and could not
+work at all on Loomio ≥ 3.4. The report's properties are relayed rather
+than papered over: whole calendar months (`since` / `until` widen
+outward and `since_effective` / `until_effective` say what was counted;
+no per-user per-month series exists, so there is no `by_month`),
+anonymous polls excluded from the vote columns, a vote attributed to the
+month its counted stance row was created (ballot issued at poll open or
+when the voter was added; a vote Loomio replaced on change counts in the
+month of the change), rows for everyone who ever held a membership. Requested groups the user is not a member of are dropped by
+Loomio silently and echoed back as the effective set — the connector
+names them in `groups_not_visible` and sets `complete: false`.
 
 ## Honest failures over plausible zeros
 
 The 0.0.11 hotfix exists because several tools produced results that
-were *technically labelled* but read as facts: `get_user_activity`
-returned `counts.total: 0` with `scope.complete: false` when every
-event fetch had 404'd, and an agent relayed it as "this person never
-participated"; `list_groups` returned `groups: []` when the key was
-dead; `list_memberships` returned `[]` for a group the user was not in,
-indistinguishable from an empty group. The rule now applied
+were *technically labelled* but read as facts. The rule, applied
 throughout:
 
 - A result that counted **nothing** for a reason unrelated to the data
-  is an **error**, not a result. `get_user_activity` probes the first
-  discussion alone and throws on the removed-endpoint 404; it also
-  throws when every group listing failed, or when every event fetch
-  failed. `list_events` throws on that 404. `list_groups` throws on a
-  zero-group scan with a rejected key.
-- A result that is **partial** stays a result, with the existing
-  `scope.*` completeness flags — partial data is useful; fabricated
-  completeness is not.
+  is an **error**, not a result. `get_user_activity` throws when every
+  report call failed; `list_groups` throws the classified key message on
+  a 403 (on that path nothing else produces one); `create_discussion` /
+  `create_poll` throw on a misdirected echo instead of reporting the
+  wrong record as success.
+- A result that is **partial** stays a result, with `scope.*` saying
+  what is missing: `groups_not_visible` / `groups_failed` / `complete`
+  on the report tools, `capped: true` on search (Loomio's 20-result
+  cap), `*_truncated` on capped bodies, `matched` / `returned` against
+  `total` on thread items, `page_size` against `returned` on a
+  client-side-filtered `list_threads`.
 - A result whose emptiness is **ambiguous** carries a note saying what
-  it can and cannot mean (`list_memberships` → `scope.note`,
-  `list_groups` → `scanned.note`).
+  it can and cannot mean (`list_memberships` → `scope.note`, a 404 from
+  the thread routes → "unknown OR invisible", `check_connection` → "valid
+  key but no groups").
+- Absent poll counts mean **hidden**, never zero (`results_visible` /
+  `results_hidden_reason` on every poll).
 
-Tool descriptions state each limitation plainly, because the model
-reading them is the last line of defence against a confident wrong
-answer.
+Tool descriptions state each limitation plainly, and the server-level
+`instructions` repeat the routing-level ones, because the model reading
+them is the last line of defence against a confident wrong answer.
 
 ## 403 classification
 
@@ -180,28 +286,30 @@ function over the body text, unit-tested per shape:
 | Body | Meaning | Kind |
 |---|---|---|
 | non-JSON, or JSON whose `type` URL names cloudflare | a CDN/WAF answered; Loomio never saw the request | `waf` |
-| `"You are not authorized to access this page."` | unauthenticated — no active user owns the key (rotated?); on the `b2/discussions` and `b2/polls` `?group_id=` lists also "group not visible" (never on `b2/memberships` or a `/:id` read) | `unauthenticated` |
-| `"Not authorized to <action> <Model>."` | valid key, user lacks permission for that record/action | `not_authorized` |
+| `"You are not authorized to access this page."` | unauthenticated — no active user owns the key (rotated?); on the `b2/discussions` and `b2/polls` `?group_id=` GET lists also "group not visible"; on `/b2/threads…`, `/b2/search`, `/b2/reports` and the `/b2/groups` index (where Loomio filters or 404s instead of refusing) the key and nothing else; on `/b3/` the b3 secret | `unauthenticated` |
+| `"Not authorized to <action> <Model>."` | valid key, user lacks permission for that record/action; `show Group` on `GET /b2/groups/:id` = a hidden group (the id is right, the remedy is membership) | `not_authorized` |
 | `"User is not an admin"` | `manage_memberships` without the coordinator role on that group | `not_admin` |
 | numeric body, or `action: "upgrade"` | subscription / plan cap | `plan_limit` |
-| anything else | surfaced verbatim | `unknown` |
+| anything else | surfaced verbatim (clipped) | `unknown` |
 
-The classifier is path-aware (only the two visibility-gated lists may
-hedge towards "group not visible") and receives the key-health cache's
-verdict **only while it is fresh** (younger than the 60 s cache): a
-fresh `rejected` makes the unauthenticated case definitive, a fresh
-`valid` on a gated list points at visibility first, and a stale
-verdict is ignored — the startup probe under stdio may be days old, and
-a stale `valid` must never make a post-rotation 403 read as "not a key
-problem". A 401 is mapped separately and per namespace: Loomio's b2/b3
-API answers its own authentication failures with 403, so a 401 on a
-b2/b3 path came from something in front of Loomio; Loomio's v1 API can
-itself answer 401 (`require_current_user`) because it is a
-session-cookie API and the key is not a v1 credential. 429
-(Rack::Attack, `text/plain`) becomes a clear retry message with
-`Retry-After` when present. Every echo of upstream text is clipped to
-200 characters — a CDN's HTML error page must not land whole in an
-agent's context.
+The classifier is path- and method-aware (only the two visibility-gated
+GET lists may hedge towards "group not visible"; a POST to the same paths
+is `#create`, whose refusals carry a message; `POST /b2/polls` names the
+one bare refusal a valid key can hit there — an anonymous poll with no
+future `closing_at`, raised after the poll was saved) and receives the
+key-health cache's verdict **only while it is fresh** (younger than the
+60 s cache): a fresh `rejected` makes the unauthenticated case
+definitive, a fresh `valid` on a gated list points at visibility first,
+and a stale verdict is ignored — the startup probe under stdio may be
+days old, and a stale `valid` must never make a post-rotation 403 read as
+"not a key problem". A 401 is mapped separately and per namespace:
+Loomio's b2/b3 API answers its own authentication failures with 403, so
+a 401 on a b2/b3 path came from something in front of Loomio; Loomio's
+v1 API can itself answer 401 (`require_current_user`) because it is a
+session-cookie API. 429 (Rack::Attack, `text/plain`) becomes a clear
+retry message with `Retry-After` when present. Every echo of upstream
+text is clipped to 200 characters — a CDN's HTML error page must not
+land whole in an agent's context.
 
 ## Key-health probe
 
@@ -212,19 +320,23 @@ process is healthy). Loomio rotates a user's key on password change,
 rotated every key once in 3.3.1, and publishes no compatibility policy.
 So the connector probes actively (`src/loomio/health.ts`):
 
-- `GET /api/b2/groups` with the key — 200 for any valid key (even with
-  zero groups), 403 with Loomio's unauthenticated body for a rejected
-  one; a WAF 403 or any other failure is `unreachable`, never a false
-  "rejected". Plus the public `GET /api/v1/boot/version` for
-  `loomio_version`, whose failure never affects `key_status`.
+- `GET /api/b2/groups` with the key (and the groups read profile, so
+  the probe does not haul tag / translation side-loads) — 200 for any
+  valid key (even with zero groups), 403 with Loomio's unauthenticated
+  body for a rejected one; a WAF 403 or any other failure is
+  `unreachable`, never a false "rejected". Plus the public
+  `GET /api/v1/boot/version` for `loomio_version`, whose failure never
+  affects `key_status`.
 - Cached 60 s with a shared in-flight promise: `/health`, startup and
   the tools that consult it cost Loomio at most one request pair per
-  minute in aggregate.
+  minute in aggregate. The parsed groups body is kept beside the verdict
+  for `check_connection` and for the API user's own id.
 - Every `key_status` change emits a **forced** `loomio.auth` event
   (bypassing the verbose gate — the one event an operator must see
   without having anticipated it); a one-time forced
   `loomio.version_drift` fires on a `major.minor` mismatch with
-  `TESTED_LOOMIO_VERSION`.
+  `TESTED_LOOMIO_VERSION`; `check_connection` repeats the drift warning
+  in its `notes`.
 - Startup probes but never exits on the verdict: a transient network
   error must not kill the server, and a running process with classified
   403s and a red `/health` is more diagnosable than a crash loop.
@@ -254,8 +366,9 @@ operators should be able to find the connector in Loomio's logs. This
 means:
 
 - Keys never leak into structured logs (no headers are logged, and
-  `src/log.ts`'s `redactPath` drops query strings and collapses ids and
-  string keys besides).
+  `src/log.ts`'s `redactPath` drops query strings — search text, group
+  id lists — and collapses ids, keys, handles and identity uids
+  besides).
 - A base-URL override is validated to be `https://` (or `http://` on
   loopback) — sending the bearer token to an arbitrary http host would
   expose it to anyone on the path.
@@ -264,13 +377,18 @@ means:
 
 `LOOMIO_MCP_READONLY=1` does two things:
 
-1. Skips registration of all write tools in `src/server.ts`
-   (`create_*`, `manage_*`, `deactivate_user`, `reactivate_user`).
-2. Causes `loomioPost` / `loomioPostB3` in `src/loomio/client.ts` to
-   throw before issuing the HTTP request.
+1. Skips registration of every write tool in `src/server.ts` —
+   `create_*`, `update_*`, `delete_*`, `manage_memberships` — and of
+   every b3 tool, the two b3 reads included (they return emails, so
+   they share the writes' gate).
+2. Causes `loomioPost` / `loomioPatch` / `loomioDelete` / `loomioPostB3`
+   in `src/loomio/client.ts` to throw before issuing the HTTP request;
+   `create_poll` checks it before its resolution GET as well, so a
+   read-only server spends no call on a poll it will never create.
 
 The first removes them from the catalog (the MCP client can't see
-them); the second is the defence in depth.
+them); the second is the defence in depth. Read-only mode advertises 14
+tools; full mode 24; with the b3 secret 28.
 
 ## `manage_memberships` safety
 
@@ -283,9 +401,15 @@ annotation in `src/server/register-tool.ts` all flag it; the default of
 the flag is the integer `1` or absent — Loomio reads
 `params[:remove_absent].to_i == 1`, and a JSON boolean makes it 500
 *after* the invitations went out. `deactivate_user` also carries the
-destructive hint. See SECURITY.md.
+destructive hint, and so do the three `delete_*` tools — Loomio's soft
+discard is restorable by an admin in its UI, but not by this connector
+— and the three `update_*` tools, because the MCP spec defines
+`destructiveHint: false` as "performs only additive updates" and a
+PATCH that replaces a body, shortens a `closing_at` or tightens
+`hide_results` is not additive (they stay `idempotentHint: true`). The
+descriptions say to confirm with the human first. See SECURITY.md.
 
-## Tool annotations
+## Tool annotations and server instructions
 
 `inferAnnotations` in `src/server/register-tool.ts` returns the full
 four-flag MCP `ToolAnnotations` set for every tool —
@@ -296,28 +420,48 @@ Per MCP spec, `destructiveHint` defaults to `true` when unset, and
 "read-only, but may also be destructive" — contradictory — and
 conservative clients (Claude.ai's auto-approval flow included) fall
 back to per-call prompting. Emitting all four flags explicitly removes
-the ambiguity and lets the connector's reads auto-approve in
-Claude.ai.
+the ambiguity and lets the connector's reads auto-approve in Claude.ai.
+Reads are recognised by prefix (`get_`, `list_`, `search_`, `check_`
+for `check_connection`, …); `update_*` and `delete_*` are idempotent
+(the same PATCH twice leaves the same record; discarding a discarded
+record changes nothing); `create_*`, `manage_memberships` and
+`deactivate_user` are not.
+
+The server also ships a ten-line routing guide as MCP `instructions`
+(`SERVER_INSTRUCTIONS` in `src/server.ts`), delivered in the
+`initialize` result before the client has read a single description:
+which tool answers which KIND of question (check_connection first,
+list_threads for "what's new", get_thread_markdown for summaries,
+search_content for keywords, get_participation_report for rankings,
+get_user_activity per user), and the two things a model must never do
+(infer anonymous voters; read absent poll counts as zero). Registration
+order — discovery, reading, analysis, writes, admin — is the order
+clients list the tools in, so the first tool a model sees is the one
+that tells it what the rest can do.
 
 ## What we deliberately don't have
 
 - **No data cache layer.** The capsulemcp sibling caches reference-data
-  endpoints (`list_pipelines`, `list_boards`) because LLM chains
-  re-query them. Loomio's surface has no equivalent — `list_memberships`
-  IS the authoritative read for any membership write, so caching it
-  would mask the very thing the caller is checking. The only cache in
-  the codebase is the 60 s key-health verdict, which caches a yes/no
-  about the credential, not data, and exists to keep `/health` from
-  becoming a way to make the connector hammer Loomio.
+  endpoints because LLM chains re-query them. Loomio's surface has no
+  equivalent — `list_memberships` IS the authoritative read for any
+  membership write, so caching it would mask the very thing the caller
+  is checking. The only cache in the codebase is the 60 s key-health
+  verdict (with the groups body it came with), which exists to keep
+  `/health` from becoming a way to make the connector hammer Loomio.
 - **No retry on 429.** Loomio's throttle is per client IP over five
   minutes; a retry loop inside a tool call would only deepen the hole.
-  The connector maps 429 to a clear message naming the fan-out tools
-  that usually cause it; retiring those fan-outs (0.0.12) is the real
-  fix.
+  The one remaining fan-out (`get_user_activity`, one report per group,
+  four in flight, at most 50 groups) is bounded by its schema; the
+  connector maps 429 to a clear message naming it.
+- **No client-side search or pagination emulation over Loomio's caps.**
+  Search stops at Loomio's 20 results and says `capped: true`; the
+  thread items route is fetched whole because Loomio offers no paging
+  there. Pretending otherwise would cost calls or hide the limit.
 - **No async task store.** Loomio writes are single-request and fast;
   the sibling's task-polling surface adds complexity we don't need.
 - **No batch fan-out helper.** A future `batch_manage_memberships`
   across groups would re-introduce this — at that point, the
   capsulemcp shape (concurrency-capped `Promise.allSettled` with
-  per-item idempotency and a `batch.complete` event) is the
-  reference. Until then, keeping the codebase smaller is the win.
+  per-item idempotency and a `batch.complete` event) is the reference;
+  `mapWithConcurrency` in `src/tools/reports.ts` is its minimal
+  ancestor. Until then, keeping the codebase smaller is the win.

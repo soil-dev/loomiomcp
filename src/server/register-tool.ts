@@ -7,22 +7,42 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { z, ZodRawShape } from "zod";
+import { readBool } from "../env.js";
 import { getRequestContext, logEvent } from "../log.js";
 
 /**
  * Prefixes that identify a tool as read-only by naming convention.
+ * `check_` is here for `check_connection`: it runs the key-health
+ * probe (two GETs) and reads the cached groups body — nothing on
+ * Loomio changes — so it must be advertised as a read, or a client
+ * would prompt before the very call meant to tell it what works.
  */
-const READ_PREFIXES = ["search_", "filter_", "get_", "list_", "show_", "run_"];
+const READ_PREFIXES = ["search_", "filter_", "get_", "list_", "show_", "run_", "check_"];
 
 function isReadOnlyByName(name: string): boolean {
   return READ_PREFIXES.some((p) => name.startsWith(p));
 }
 
 function isDestructive(name: string): boolean {
-  // `manage_memberships` can remove members when remove_absent=true.
-  // `deactivate_user` disables a user account instance-wide (b3 admin).
-  // Surface a destructiveHint so clients can prompt before invocation.
-  return name.startsWith("delete_") || name === "manage_memberships" || name === "deactivate_user";
+  // The MCP spec defines `destructiveHint: false` as "the tool performs
+  // ONLY ADDITIVE updates". Everything that removes or overwrites is
+  // therefore true:
+  //   - `delete_*`: Loomio's soft discard (restorable by an admin, not
+  //     by this connector).
+  //   - `update_*`: a PATCH REPLACES the title / body / details it is
+  //     given (Loomio keeps versions, but the live text is gone), can
+  //     shorten a poll's `closing_at`, tighten `hide_results`
+  //     irreversibly, flip a discussion's `private`. Idempotent, yes;
+  //     additive, no.
+  //   - `manage_memberships` removes members when remove_absent=true.
+  //   - `deactivate_user` disables a user account instance-wide (b3).
+  // Surface the hint so clients can prompt before invocation.
+  return (
+    name.startsWith("delete_") ||
+    name.startsWith("update_") ||
+    name === "manage_memberships" ||
+    name === "deactivate_user"
+  );
 }
 
 /**
@@ -43,21 +63,28 @@ function isDestructive(name: string): boolean {
  *
  *   readOnlyHint   — true for `get_…` / `list_…` / etc. by naming
  *                     convention
- *   destructiveHint — true only for tools that may delete/overwrite
- *                     (manage_memberships with remove_absent;
- *                     deactivate_user; any future `delete_…`)
- *   idempotentHint  — reads are idempotent (no side effects). Writes
- *                     vary; we conservatively report false for them
- *                     (`create_…` always creates a new row).
+ *   destructiveHint — true for every tool that may delete OR overwrite
+ *                     (`delete_…`, `update_…`, manage_memberships with
+ *                     remove_absent, deactivate_user); false only for
+ *                     reads and the purely additive `create_…` /
+ *                     reactivate_user. See `isDestructive`.
+ *   idempotentHint  — reads are idempotent (no side effects), and so
+ *                     are `update_…` (a PATCH with the same fields
+ *                     twice leaves the same record) and `delete_…`
+ *                     (Loomio's soft discard of an already discarded
+ *                     record changes nothing). `create_…` always adds
+ *                     a row and `manage_memberships` / `deactivate_…`
+ *                     have per-call side effects, so they report false.
  *   openWorldHint   — true for every tool here; this connector exists
  *                     to call out to the Loomio API.
  */
 export function inferAnnotations(name: string): ToolAnnotations {
   const readOnly = isReadOnlyByName(name);
+  const idempotentWrite = name.startsWith("update_") || name.startsWith("delete_");
   return {
     readOnlyHint: readOnly,
     destructiveHint: isDestructive(name),
-    idempotentHint: readOnly,
+    idempotentHint: readOnly || idempotentWrite,
     openWorldHint: true,
   };
 }
@@ -83,11 +110,25 @@ function emitToolCall(opts: {
   });
 }
 
+/**
+ * Serialise a tool result for the model. COMPACT by default: the
+ * indentation and newlines of a pretty-printed document are pure
+ * overhead for a reader that parses JSON, and measured over the shaped
+ * 3.8.1 fixtures they added 10–37 % to every reply (a 50-row discussion
+ * list ≈ 113 KB compact vs ≈ 124 KB indented). `LOOMIO_MCP_PRETTY_JSON=1`
+ * restores the indented form for a human reading a stdio session.
+ */
+export function serializeToolResult(result: unknown): string {
+  return readBool("LOOMIO_MCP_PRETTY_JSON")
+    ? JSON.stringify(result, null, 2)
+    : JSON.stringify(result);
+}
+
 function wrapAsText(result: unknown): {
   content: Array<{ type: "text"; text: string }>;
 } {
   return {
-    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    content: [{ type: "text", text: serializeToolResult(result) }],
   };
 }
 

@@ -52,7 +52,7 @@ describe("b2 auth", () => {
   });
 
   it("keeps the key out of the URL on writes too", async () => {
-    mockFetch(200, {});
+    mockFetch(200, { comments: [{ id: 1 }] });
     const { createComment } = await import("../src/tools/comments.js");
     await createComment({ discussion_id: 1, body: "hello" });
 
@@ -81,7 +81,7 @@ describe("User-Agent", () => {
     await listDiscussions({ group_id: 7 });
     expect(userAgentOf(0)).toBe(USER_AGENT);
 
-    mockFetch(200, {});
+    mockFetch(200, { comments: [{ id: 1 }] });
     const { createComment } = await import("../src/tools/comments.js");
     await createComment({ discussion_id: 1, body: "hello" });
     expect(userAgentOf(1)).toBe(USER_AGENT);
@@ -532,11 +532,12 @@ describe("other error statuses", () => {
   });
 
   it("401 on a v1 path names Loomio's own session-only 401 as a possible source", async () => {
-    // createDiscussion's privacy resolver reads GET /v1/groups/{id}.
+    // No tool reads v1 any more (0.0.12 dropped create_discussion's
+    // GET /v1/groups/{id} pre-flight), but the client's wording for a v1
+    // 401 stays correct for any future v1 read; exercise it directly.
     mockFetch(401, { error: "you gotta be signed in" });
-    const { LoomioAuthError } = await import("../src/loomio/client.js");
-    const { createDiscussion } = await import("../src/tools/discussions.js");
-    const err = await createDiscussion({ title: "T", group_id: 7 }).catch((e) => e);
+    const { LoomioAuthError, loomioGet } = await import("../src/loomio/client.js");
+    const err = await loomioGet("/v1/groups/7").catch((e) => e);
     expect(err).toBeInstanceOf(LoomioAuthError);
     expect(err.status).toBe(401);
     expect(err.message).toContain("/v1/groups/:id");
@@ -578,7 +579,6 @@ describe("other error statuses", () => {
   it("422 validation errors are still flattened field: message", async () => {
     mockFetch(422, { errors: { title: ["can't be blank"], group: "is required" } });
     const { createDiscussion } = await import("../src/tools/discussions.js");
-    // createDiscussion first auto-resolves privacy via a group read; give it a discussion-less 200.
     const err = await createDiscussion({ title: "T", group_id: 7, private: true }).catch((e) => e);
     expect(err.status).toBe(422);
     expect(err.message).toContain("title: can't be blank");
@@ -620,5 +620,86 @@ describe("LOOMIO_API_BASE_URL validation never echoes the configured value", () 
     expect(err.message).toMatch(/must be https/);
     expect(err.message).toContain("http://loomio.example.org:8080");
     expect(err.message).not.toContain("debug=1");
+  });
+});
+
+describe("classifyForbidden — Loomio 3.8 read endpoints (0.0.12)", () => {
+  it("(2) generic body on threads / search / reports / groups index → key rejected; visibility is a filter there", async () => {
+    // Api::B2::ThreadsController scopes with TopicQuery.visible_to and
+    // answers 404 for a thread the user cannot see (upstream test "does
+    // not expose an inaccessible thread"); search intersects
+    // GroupQuery.visible_to; reports drop non-member group ids; the
+    // groups index is current_user.groups. None calls
+    // records_visible_in_group, so the generic body there is the key.
+    const { classifyForbidden } = await import("../src/loomio/client.js");
+    for (const path of [
+      "/b2/threads",
+      "/api/b2/threads/:id",
+      "/b2/threads/:id/items",
+      "/api/b2/threads/:id/markdown",
+      "/b2/search",
+      "/api/b2/reports",
+      "/b2/groups",
+    ]) {
+      const c = classifyForbidden(JSON.stringify({ error: GENERIC_BODY }), { path });
+      expect(c.kind).toBe("unauthenticated");
+      expect(c.message).toContain(path);
+      expect(c.message).toMatch(/visibility as a FILTER/);
+      expect(c.message).toMatch(/answers 404/);
+      expect(c.message).toMatch(/exactly one thing/);
+      expect(c.message).not.toMatch(/visibility problem/);
+      expect(c.message).toContain("/profile/api_access");
+    }
+  });
+
+  it("(2, fresh valid) on a filtered endpoint still says 'rotated in between', never 'visibility'", async () => {
+    const { classifyForbidden } = await import("../src/loomio/client.js");
+    const c = classifyForbidden(JSON.stringify({ error: GENERIC_BODY }), {
+      path: "/b2/threads/:id/items",
+      keyStatus: "valid",
+    });
+    expect(c.kind).toBe("unauthenticated");
+    expect(c.message).toMatch(/rotated in between/);
+    expect(c.message).toMatch(/visibility as a FILTER/);
+    expect(c.message).not.toMatch(/visibility problem/);
+  });
+
+  it("(3a) 'Not authorized to show Group.' on GET /b2/groups/:id → a HIDDEN group, with the membership remedy", async () => {
+    // app/models/ability/group.rb `can [:show]`: public, or member, or
+    // entitled parent-group member. The id is fine (unknown ids are 404).
+    const { classifyForbidden } = await import("../src/loomio/client.js");
+    for (const path of ["/b2/groups/:id", "/api/b2/groups/:id"]) {
+      const c = classifyForbidden(JSON.stringify({ error: "Not authorized to show Group." }), {
+        path,
+      });
+      expect(c.kind).toBe("not_authorized");
+      expect(c.message).toContain(path);
+      expect(c.message).toMatch(/HIDDEN from the connector's user/);
+      expect(c.message).toMatch(/group admin/);
+      expect(c.message).toMatch(/list_groups/);
+      expect(c.message).toMatch(/404/);
+      expect(c.message).not.toMatch(/rotated/i);
+    }
+  });
+
+  it("(3) other 'Not authorized to …' bodies, and the same body on other paths, keep the generic explanation", async () => {
+    const { classifyForbidden } = await import("../src/loomio/client.js");
+    const onShow = classifyForbidden(
+      JSON.stringify({ error: "Not authorized to show Discussion." }),
+      {
+        path: "/b2/discussions/:id",
+      },
+    );
+    expect(onShow.kind).toBe("not_authorized");
+    expect(onShow.message).toMatch(/lacks permission/);
+    expect(onShow.message).not.toMatch(/HIDDEN from/);
+    // A group message on a non-group path is not the hidden-group case.
+    const elsewhere = classifyForbidden(
+      JSON.stringify({ error: "Not authorized to update Group." }),
+      {
+        path: "/b2/groups/:id",
+      },
+    );
+    expect(elsewhere.message).toMatch(/lacks permission/);
   });
 });

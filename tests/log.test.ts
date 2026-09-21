@@ -63,3 +63,36 @@ describe("redactPath", () => {
     expect(redactPath("/b2/threads/abcDEF12/markdown")).toBe("/b2/threads/:id/markdown");
   });
 });
+
+describe("redactPath — 0.0.12 routes", () => {
+  it("redacts both segments of the b3 identity routes (the uid is often an email) and keeps the verb", () => {
+    expect(redactPath("/b3/users/identity/saml/jane@example.org")).toBe(
+      "/b3/users/identity/:type/:uid",
+    );
+    expect(redactPath("/b3/users/identity/oauth/12345/deactivate")).toBe(
+      "/b3/users/identity/:type/:uid/deactivate",
+    );
+    expect(redactPath("/api/b3/users/identity/saml/x-y_z/reactivate?force=1")).toBe(
+      "/api/b3/users/identity/:type/:uid/reactivate",
+    );
+    expect(redactPath("/b3/users/identity/saml/jane@example.org")).not.toContain("jane");
+  });
+
+  it("drops the search query text and the report parameters with the query string", () => {
+    expect(redactPath("/b2/search?query=secret%20project&compact=1")).toBe("/b2/search");
+    expect(redactPath("/b2/search?author_id=42")).toBe("/b2/search");
+    expect(redactPath("/b2/reports?section=users&group_ids=1,2&start_month=2026-01")).toBe(
+      "/b2/reports",
+    );
+    expect(redactPath("/b2/threads?compact=1&limit=20&offset=40")).toBe("/b2/threads");
+  });
+
+  it("collapses group keys / handles on the b2 show route and thread ids on every member route", () => {
+    expect(redactPath("/b2/groups/finance-team?exclude_types=tag%20translation")).toBe(
+      "/b2/groups/:id",
+    );
+    expect(redactPath("/b2/threads/546/items?compact=1")).toBe("/b2/threads/:id/items");
+    expect(redactPath("/b2/threads/546/markdown")).toBe("/b2/threads/:id/markdown");
+    expect(redactPath("/b3/users?is_admin=true")).toBe("/b3/users");
+  });
+});

@@ -134,23 +134,32 @@ export function logEvent(
  *   /b2/groups/my-handle             -> /b2/groups/:id (keys and handles too)
  *   /b2/threads/abcDEF/items         -> /b2/threads/:id/items
  *   /b3/users/42/deactivate          -> /b3/users/:id/deactivate
+ *   /b3/users/identity/saml/jane@example.org/deactivate
+ *                                    -> /b3/users/identity/:type/:uid/deactivate
  *   /b2/discussions/12?api_key=x     -> /b2/discussions/:id
+ *   /b2/search?query=budget          -> /b2/search        (the query text never logs)
+ *   /b2/reports?group_ids=1,2        -> /b2/reports
  *   /b3/users/deactivate?id=42&b3_api_key=…   -> /b3/users/deactivate
  *
  * Both numeric ids AND alphanumeric short-keys are collapsed. The
  * collection-scoped second pass targets the resources Loomio's
  * ModelLocator addresses by a string in the PATH — `discussions` and
  * `polls` (friendly keys), `groups` (key or handle) and `threads`
- * (topic keys). `users` is deliberately NOT in that list: Loomio's b3
+ * (topic ids). `users` is deliberately NOT in that list: Loomio's b3
  * user routes take numeric ids only (covered by the first pass, so the
  * member route `/b3/users/42/deactivate` becomes `/b3/users/:id/deactivate`),
  * and including it would also erase the `deactivate` / `reactivate` verb
- * of the legacy collection routes.
+ * of the legacy collection routes. The b3 IDENTITY routes
+ * (`users/identity/:identity_type/:uid`) get their own pass, first: the
+ * `uid` is whatever the identity provider issued — frequently an email
+ * address — and must never reach a log aggregator.
  */
 export function redactPath(path: string): string {
   const noQuery = path.split("?")[0] ?? path;
   return (
     noQuery
+      // b3 identity routes: the provider uid is personal data.
+      .replace(/\/users\/identity\/[^/]+\/[^/]+/g, "/users/identity/:type/:uid")
       // Numeric ids (including comma-separated lists).
       .replace(/\/\d+(?:,\d+)*/g, "/:id")
       // Alphanumeric short-keys / handles after the key-addressable

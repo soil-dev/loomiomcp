@@ -5,22 +5,26 @@ import { fetch } from "undici";
 vi.mock("undici", () => ({ fetch: vi.fn() }));
 setupLoomioTest();
 
+/** A minimal discussion show body: getDiscussion treats a record-less 200 as a shape error. */
+const SHOW_OK = { discussions: [{ id: 1, key: "abcDEF12", title: "T", topic_id: 5 }] };
+
 describe("LOOMIO_API_BASE_URL validation", () => {
   it("accepts the default (no override)", async () => {
     delete process.env["LOOMIO_API_BASE_URL"];
-    mockFetch(200, {});
+    mockFetch(200, SHOW_OK);
     const { getDiscussion } = await import("../src/tools/discussions.js");
     await getDiscussion({ id_or_key: 1 });
-    const [url] = vi.mocked(fetch).mock.calls[0]!;
-    // No query string: the credential rides in the Authorization
-    // header, and this call passes no other params.
-    expect(url as string).toBe("https://www.loomio.com/api/b2/discussions/1");
+    const url = new URL(String(vi.mocked(fetch).mock.calls[0]![0]));
+    // The credential rides in the Authorization header; the only query
+    // parameter is the read profile's exclude_types.
+    expect(url.origin + url.pathname).toBe("https://www.loomio.com/api/b2/discussions/1");
+    expect([...url.searchParams.keys()]).toEqual(["exclude_types"]);
     delete process.env["LOOMIO_API_BASE_URL"];
   });
 
   it("accepts https:// overrides", async () => {
     process.env["LOOMIO_API_BASE_URL"] = "https://loomio.example.org/api";
-    mockFetch(200, {});
+    mockFetch(200, SHOW_OK);
     const { getDiscussion } = await import("../src/tools/discussions.js");
     await getDiscussion({ id_or_key: 1 });
     const [url] = vi.mocked(fetch).mock.calls[0]!;
@@ -30,7 +34,7 @@ describe("LOOMIO_API_BASE_URL validation", () => {
 
   it("accepts http://localhost overrides (for tests / dev)", async () => {
     process.env["LOOMIO_API_BASE_URL"] = "http://localhost:3000/api";
-    mockFetch(200, {});
+    mockFetch(200, SHOW_OK);
     const { getDiscussion } = await import("../src/tools/discussions.js");
     await getDiscussion({ id_or_key: 1 });
     expect(vi.mocked(fetch).mock.calls[0]![0] as string).toContain("http://localhost:3000/");
@@ -40,7 +44,7 @@ describe("LOOMIO_API_BASE_URL validation", () => {
   it("accepts http://127.0.0.1 and http://[::1] loopback overrides", async () => {
     for (const host of ["http://127.0.0.1:3000/api", "http://[::1]/api"]) {
       process.env["LOOMIO_API_BASE_URL"] = host;
-      mockFetch(200, {});
+      mockFetch(200, SHOW_OK);
       const { getDiscussion } = await import("../src/tools/discussions.js");
       await getDiscussion({ id_or_key: 1 });
     }
