@@ -1,6 +1,120 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "description": "MCP server for Loomio (loomio.com and self-hosted instances). 12 tools (8 read, 4 write) covering discussions, polls, comments, group memberships (any member lists the roster; emails only where the connector's user is a group admin), per-discussion event streams, and per-user activity analysis via Loomio's b2 public API (auth: Authorization: Bearer). Plus 2 opt-in instance-admin tools (deactivate / reactivate user) on the b3 namespace, gated by LOOMIO_B3_API_KEY. Read-only mode via LOOMIO_MCP_READONLY=1 advertises only the 8 read tools — Cloud Run deployments default to this; local stdio enables writes. Every tool carries the full MCP ToolAnnotations set: reads are readOnlyHint + idempotentHint so clients can auto-approve them, and destructive writes (manage_memberships with remove_absent, deactivate_user) carry destructiveHint so clients prompt before invocation. Tested against Loomio 3.8.1; classifies Loomio's 403 bodies (rotated key vs. missing role vs. WAF), probes key health at startup and on GET /health (HTTP transport). Known limitation: list_events / get_user_activity fail with a clear error on Loomio >= 3.4.0, which removed the v1/events endpoint (port to b2 thread items planned).",
+  "description": "MCP server for Loomio (loomio.com and self-hosted instances), built on Loomio 3.8's b2 API. 24 tools: 14 reads (connection check, native groups index and single group, discussions and polls with thread counters joined and poll results gated by Loomio's own visibility rule, threads across every visible group, one thread's items or its server-rendered Markdown, full-text search, Loomio's participation report per group set or per user, group rosters) and 10 writes (create / update / soft-delete discussions, polls and comments; invite or remove members), plus 4 opt-in instance-admin tools on the b3 namespace (deactivate / reactivate / get / list users — the last two include emails, single-tenant deployments only) gated by LOOMIO_B3_API_KEY. Efficient by design: one upstream call per read wherever Loomio has an aggregate (list_groups 50-500 calls → 1; get_user_activity ~200 → N+1), explicit exclude_types / compact side-load profiles, slimmed users and groups, list bodies capped with explicit *_truncated flags, Loomio's exact `total` on every collection. Read-only mode via LOOMIO_MCP_READONLY=1 advertises only the 14 reads (the Cloud Run default). Every tool carries the full MCP ToolAnnotations set (reads readOnlyHint + idempotentHint so clients auto-approve them; update_* / delete_* (they overwrite or discard), manage_memberships and deactivate_user carry destructiveHint) and the server ships a routing guide as MCP `instructions`. Auth: Authorization: Bearer; 403 bodies classified (rotated key vs. missing role vs. WAF); key-health probe at startup and GET /health. Tested against Loomio 3.8.1.",
   "categories": ["collaboration", "productivity"],
-  "maintainers": ["arapov"]
+  "maintainers": ["arapov"],
+  "tools": [
+    {
+      "name": "check_connection",
+      "description": "Key status, the account the API key belongs to, its groups (member / pending / parent), readonly and b3 flags — call first when unsure what the connector can see."
+    },
+    {
+      "name": "list_groups",
+      "description": "The connector user's member groups (pending invitations included) plus their parents, one call on GET /b2/groups."
+    },
+    {
+      "name": "get_group",
+      "description": "One group's full record by id, key or handle, incl. permission flags and the user's own membership; works for public groups the user has not joined."
+    },
+    {
+      "name": "get_discussion",
+      "description": "One discussion with full body, thread counters and url; include_items embeds the thread's items in the same call."
+    },
+    {
+      "name": "list_discussions",
+      "description": "A group's discussions newest-activity first with thread counters, capped bodies and Loomio's exact total; status defaults to open."
+    },
+    {
+      "name": "get_poll",
+      "description": "One poll with options, current outcome, the user's own stance and results gated by Loomio's visibility rule (results_visible / results_hidden_reason)."
+    },
+    {
+      "name": "list_polls",
+      "description": "A group's polls newest first as slim rows (identity, schedule, gated stance_counts, options, outcome, own stance; the per-voter results[] breakdown is get_poll's), capped details, exact total; status defaults to active."
+    },
+    {
+      "name": "list_threads",
+      "description": "Every thread visible to the user across all groups, newest activity first — the cheapest 'what is new' call; `since` bounds it client-side with an exhausted flag for paging."
+    },
+    {
+      "name": "list_thread_items",
+      "description": "One thread's structured items (comments, polls, votes, outcomes, edits) with slimmed records; client-side paging and a reply-size budget over Loomio's unpaginated route."
+    },
+    {
+      "name": "get_thread_markdown",
+      "description": "One thread rendered to Markdown by Loomio (front matter, body, comments, polls with results tables, outcomes) — the best single call for a summary."
+    },
+    {
+      "name": "search_content",
+      "description": "Full-text search across everything visible (query, or author_id for a user's recent posts); 20-result cap, snippets with **match** emphasis (vote-reason hits are dropped from query searches where the poll hides results from the user), deep-link urls."
+    },
+    {
+      "name": "get_participation_report",
+      "description": "Loomio's participation report for a group set in one call: every user's threads, comments, polls, votes cast vs issued, outcomes — sorted by total."
+    },
+    {
+      "name": "get_user_activity",
+      "description": "One user's participation across groups (one report call per group + one author search for linkable examples), month-grained window."
+    },
+    {
+      "name": "list_memberships",
+      "description": "A group's roster (ids, names, roles, join state; member emails only as user_email on rows where the user is a group admin, never on users[]); an empty list is annotated as 'not a member'."
+    },
+    {
+      "name": "create_discussion",
+      "description": "Start a thread in a group (nested JSON body verified against Loomio 3.8.1); throws if Loomio's echo lands in another group."
+    },
+    {
+      "name": "update_discussion",
+      "description": "Edit a discussion's title, body (replaced), privacy, comment / reaction / concurrent-poll settings, or add recipients."
+    },
+    {
+      "name": "delete_discussion",
+      "description": "Soft-discard a discussion (Loomio keeps the records; an admin can restore)."
+    },
+    {
+      "name": "create_poll",
+      "description": "Create a poll of any Loomio 3.8 type (proposal, poll, count, check, question, score, ranked_choice, stv, meeting, dot_vote) standalone or inside a discussion; closing_at opens it, notify_on_open controls the announcement."
+    },
+    {
+      "name": "update_poll",
+      "description": "Edit an open poll: title, details, closing time (next full hour = end voting soon), options to add (the current set is read first so Loomio's replace-the-set PATCH deletes nothing), hide_results (tighten only), voters."
+    },
+    {
+      "name": "delete_poll",
+      "description": "Soft-discard a poll (votes retained server-side; an admin can restore)."
+    },
+    {
+      "name": "create_comment",
+      "description": "Post a comment in a thread (discussion id or short key), top-level or as a reply to a comment, poll, stance or outcome."
+    },
+    {
+      "name": "update_comment",
+      "description": "Replace a comment's body (Loomio marks it edited)."
+    },
+    {
+      "name": "delete_comment",
+      "description": "Soft-discard a comment (body blanked, record and replies kept)."
+    },
+    {
+      "name": "manage_memberships",
+      "description": "Invite members by email; with remove_absent, remove everyone not listed (destructive; requires group admin)."
+    },
+    {
+      "name": "deactivate_user",
+      "description": "b3, instance operators only: deactivate an account instance-wide (asynchronous on Loomio's side)."
+    },
+    {
+      "name": "reactivate_user",
+      "description": "b3, instance operators only: reactivate a deactivated account and restore the memberships the deactivation revoked."
+    },
+    {
+      "name": "get_user",
+      "description": "b3, single-tenant only: one account by id or external identity, email included."
+    },
+    {
+      "name": "list_users",
+      "description": "b3, single-tenant only: every account on the instance (optionally instance admins only), emails included."
+    }
+  ]
 }

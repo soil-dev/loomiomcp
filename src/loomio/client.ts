@@ -50,6 +50,17 @@ function baseUrl(): string {
 }
 
 /**
+ * The validated API base URL (`…/api`), for callers that derive other
+ * URLs from it — `shape.ts` strips the `/api` to build the canonical
+ * web links (`/d/{key}`, `/p/{key}`) it puts on records. Same
+ * validation as every request, so a bad override fails here with the
+ * same message rather than producing a link to nowhere.
+ */
+export function apiBaseUrl(): string {
+  return baseUrl();
+}
+
+/**
  * Bound an upstream string before it lands in an error message. Loomio's
  * own error strings are short, but the error path also echoes what a
  * CDN or reverse proxy answers — an HTML 502 page runs to several KB —
@@ -315,7 +326,11 @@ async function fetchWithTimeout(
 //       So the body means "unauthenticated" everywhere, and additionally
 //       "group not visible" on the two visibility-gated lists only —
 //       their GET index; #create on the same paths goes through the
-//       service's `authorize!`, whose refusal carries a message.
+//       service's `authorize!`, whose refusal carries a message. The
+//       3.8 reads added in 0.0.12 — /b2/threads(/:id(/items|/markdown)),
+//       /b2/search, /b2/reports, the /b2/groups index — never 403 for
+//       visibility at all (see `VISIBILITY_FILTERED`): an invisible
+//       thread is 404, the rest silently narrow to what the user can see.
 //       `classifyForbidden` is path- AND method-aware for exactly this
 //       reason: on /b2/memberships (or a show path, or a POST) it must
 //       not send the operator off to check group visibility when the key
@@ -393,6 +408,40 @@ function isPollCreate(path: string | undefined, method: string | undefined): boo
   return (
     path !== undefined && (method ?? "GET").toUpperCase() === "POST" && /\/b2\/polls$/.test(path)
   );
+}
+
+/**
+ * The b2 reads where Loomio applies visibility as a FILTER and never as
+ * a 403 (Loomio 3.8.1): threads (`TopicQuery.visible_to(user).find` —
+ * an invisible or unknown topic answers 404, test "does not expose an
+ * inaccessible thread"), search (`GroupQuery.visible_to` ∩ a correlated
+ * `TopicQuery` — invisible rows are simply absent), reports
+ * (`ParticipationReportService` intersects the requested `group_ids`
+ * with the user's groups and echoes the EFFECTIVE set), and the groups
+ * index (`current_user.groups`). None of them calls
+ * `records_visible_in_group` or `authorize!`, so the generic body on
+ * these paths has exactly one meaning: the key. Matched on the redacted
+ * tail (`/b2/threads/:id/items`, `/api/b2/search`, …).
+ */
+const VISIBILITY_FILTERED = /\/b2\/(threads(\/:id(\/items|\/markdown)?)?|search|reports|groups)$/;
+
+function isVisibilityFiltered(path: string | undefined): boolean {
+  return path !== undefined && VISIBILITY_FILTERED.test(path);
+}
+
+/**
+ * `GET /b2/groups/{id|key|handle}` — `load_and_authorize(:group)` runs
+ * `can?(:show, group)` (app/models/ability/group.rb): the group must be
+ * kept AND (visible to the public, OR the user a member, OR visible to
+ * parent-group members and the user one of those). A refusal is the
+ * message-bearing "Not authorized to show Group." — the one 403 a valid
+ * key produces on this path, and it means "hidden group", not "bad id"
+ * (an unknown id is 404).
+ */
+const GROUP_SHOW = /\/b2\/groups\/:id$/;
+
+function isGroupShow(path: string | undefined): boolean {
+  return path !== undefined && GROUP_SHOW.test(path);
 }
 
 /**
@@ -527,11 +576,14 @@ export function classifyForbidden(
         "`closing_at` also produces this body, from PollService.invite, AFTER the poll itself was " +
         "saved — check whether the poll now exists before retrying, and give anonymous polls a closing_at."
       : "";
-    const onlyCause =
-      "On this endpoint Loomio produces this body only when no active user owns the bearer key " +
-      "(b2/memberships answers a non-member 200 with an empty list, and record reads answer " +
-      '"Not authorized to <action> <Model>." instead), so this is not a visibility or role problem.' +
-      pollCreateCaveat;
+    const onlyCause = isVisibilityFiltered(opts.path)
+      ? "On this endpoint Loomio applies visibility as a FILTER, never as a 403 (a thread the user " +
+        "cannot see answers 404; search, reports and the groups index simply omit what it cannot " +
+        "see), so this body means exactly one thing: no active user owns the bearer key."
+      : "On this endpoint Loomio produces this body only when no active user owns the bearer key " +
+        "(b2/memberships answers a non-member 200 with an empty list, and record reads answer " +
+        '"Not authorized to <action> <Model>." instead), so this is not a visibility or role problem.' +
+        pollCreateCaveat;
     if (opts.keyStatus === "valid") {
       return {
         kind: "unauthenticated",
@@ -554,6 +606,21 @@ export function classifyForbidden(
   // path the key was never evaluated, so the message must not vouch
   // for it there: v1 authorizes a session-less caller as logged out.
   if (/^not authorized to /i.test(errorText)) {
+    // (3a) A hidden group, named as such. `can?(:show, group)` refuses
+    // only when the group is not public AND the user is neither a member
+    // nor an entitled parent-group member — the id itself is fine (an
+    // unknown id is 404). The remedy is membership, not a different id.
+    if (isGroupShow(opts.path) && /^not authorized to show group\.?$/i.test(errorText)) {
+      return {
+        kind: "not_authorized",
+        message:
+          `Loomio returned 403 for ${where}: "${clip(errorText)}". The API key is valid and the group ` +
+          "exists, but it is HIDDEN from the connector's user: it is not publicly visible and the user " +
+          "is not a member (nor a member of a parent group it is shown to). Loomio lists such groups " +
+          "nowhere for this user — list_groups shows only member groups — so the only remedy is for a " +
+          "group admin to add the connector's user. An unknown id or key answers 404 instead.",
+      };
+    }
     const explanation = isV1Path(opts.path)
       ? "Loomio's v1 (browser) API does not evaluate the API key, so this says nothing about it: " +
         "the record is not visible to a caller without a browser session. Check whether the record " +
@@ -622,8 +689,8 @@ function rateLimitedMessage(text: string, res: Response, where: string): string 
   return (
     `Loomio rate limit hit (HTTP 429 for ${where}). Loomio's Rack::Attack throttle caps requests ` +
     "per client IP over a 5-minute window (900 by default; instances may raise it). " +
-    `${wait} Fan-out tools — list_groups' id probe and get_user_activity — are the usual cause: ` +
-    "narrow the id range or group set, or space calls out." +
+    `${wait} Rapid tool chains and get_user_activity's one-report-per-group fan-out are the usual ` +
+    "cause: narrow the group set, or space calls out." +
     (text && !json ? ` Loomio said: ${clip(text)}` : "")
   );
 }
@@ -716,17 +783,147 @@ async function throwForStatus(res: Response, url: string, method?: string): Prom
   );
 }
 
+/**
+ * Parse a successful response. Read as TEXT first, then parse, for two
+ * reasons `res.json()` cannot give us:
+ *
+ *   - An EMPTY 2xx body is legitimate. Loomio's `respond_ok` renders
+ *     `{}`, but a reverse proxy can strip a body on 204/205, and a
+ *     DELETE that some future Loomio answers with 204 would otherwise
+ *     surface as a `SyntaxError: Unexpected end of JSON input` — an
+ *     error about our parser, for a request that succeeded. An empty
+ *     body becomes `{}` so tools can treat it as "no payload".
+ *   - A NON-JSON 2xx body is a misconfiguration we want named: a
+ *     captive portal, a proxy's maintenance page or a wrong
+ *     LOOMIO_API_BASE_URL pointing at the Loomio web app (which answers
+ *     HTML 200 for every path) all land here. The message says what was
+ *     received (clipped) instead of a bare parse error.
+ */
 async function handleResponse<T>(res: Response, url: string, method?: string): Promise<T> {
   await throwForStatus(res, url, method);
+  let text: string;
   try {
-    return (await res.json()) as T;
+    text = await res.text();
   } catch (err) {
     if (isAbortError(err)) timeoutError();
     throw err;
   }
+  if (text.trim() === "") return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new LoomioApiError(
+      res.status,
+      `Loomio answered HTTP ${res.status} for ${pathHintFor(url)} with a body that is not JSON ` +
+        `(${clip(text, 120)}). The Loomio API always answers JSON; check that LOOMIO_API_BASE_URL ` +
+        "points at the API root (…/api) and that no proxy or captive portal is answering in its place.",
+    );
+  }
 }
 
-export type QueryParams = Record<string, string | number | boolean | undefined>;
+/**
+ * One query-string value. Arrays are sent Rails-style as repeated
+ * `key[]=v` pairs — the form `Array(params[:tag])` in Loomio's search
+ * controller reads. Loomio's OTHER multi-valued b2 parameters are NOT
+ * arrays on the wire: `exclude_types` is a space-separated string and
+ * `types` / `group_ids` are comma-separated strings (the controllers
+ * `.split(',')`), so those go through `csvParam` / `EXCLUDE_TYPES`
+ * rather than an array.
+ */
+export type QueryValue = string | number | boolean | undefined | ReadonlyArray<string | number>;
+export type QueryParams = Record<string, QueryValue>;
+
+/** Join values for Loomio's comma-separated parameters (`types=`, `group_ids=`). */
+export function csvParam(values: ReadonlyArray<string | number>): string {
+  return values.map(String).join(",");
+}
+
+// ── Read profiles ───────────────────────────────────────────────────────────
+//
+// Every b2 read accepts `exclude_types` (space-separated, singular type
+// names) and `compact=1`. `compact=1` is sugar for
+// `exclude_types=topic group parent membership reaction tag translation`
+// (Api::B2::ResponseOptions::COMPACT_EXCLUDE_TYPES) — note `topic` is IN
+// that list. The side-loaded `topics[]` root is where Loomio 3.8 keeps a
+// thread's counters (items_count, replies_count, last_activity_at,
+// locked_at, pinned_at, tags, members_count, …), joined by
+// `discussion.topic_id` / `poll.topic_id`. So a discussions or polls
+// read MUST NOT send compact; it names the side-loads to drop instead
+// and keeps `topics` (and `users`, which are never droppable and are
+// slimmed client-side). The profiles below are the only shapes the
+// tools send; `list` drops the group too (the caller passed the group
+// id), `show` keeps it for the name and privacy fields.
+//
+// `tag` is NOT excluded wherever a topic row is read. Excluding a type
+// does more than drop its side-loaded root: active_model_serializers
+// 0.8 applies `include_<attr>?` to ATTRIBUTES too, and
+// `ApplicationSerializer#include_tags?` is `include_type?('tag')` — so
+// `exclude_types=… tag …` (or `compact=1`) also removes the `tags`
+// FIELD from every TopicSerializer row (verified on live 3.8.1
+// captures: the connector's former list profile returned topics
+// without `tags`; the unprofiled request returned them). The `tags`
+// root that the discussion / poll SHOW then gains (GroupSerializer's
+// `has_many :tags`, the group's tag definitions) is never relayed; the
+// list has no serializer with a tags association once `group` is
+// excluded, so nothing extra arrives there.
+
+export const EXCLUDE_TYPES = {
+  /** Discussion / poll LISTS: keep `topics` (with `tags`) and `users`, drop everything else. */
+  list: "group parent membership reaction translation",
+  /** Discussion / poll SHOWS: also keep `groups` for the record's group name and privacy. */
+  show: "parent membership reaction translation",
+  /**
+   * GET /b2/groups and /b2/groups/{id}: keep `parent_groups`,
+   * `memberships` (own rows, admin flag) and `users`. Here `tag` IS
+   * excluded: no topic row is involved and the group's tag definitions
+   * (`tags` root, `tag_ids`) are not what a caller asks a group for.
+   */
+  groups: "tag translation",
+  /**
+   * GET /b2/threads: `compact` minus `tag`, so the `threads[]` rows keep
+   * their `tags` field. `topic` stays excluded — the rows ARE topics and
+   * the fronting discussions' / polls' own `has_one :topic` would only
+   * side-load them a second time.
+   */
+  threads: "topic group parent membership reaction translation",
+  /**
+   * GET /b2/threads/{id}/items when the thread's own record is already
+   * in hand (a `discussion_id` was resolved, or get_discussion passed
+   * its record through): `compact` plus `discussion`, which stops
+   * TopicItemSerializer from serialising the opening post — full HTML
+   * body included — a second time under `discussions`
+   * (`include_itemable?` is false for a `new_discussion` item when
+   * `discussion` is excluded). Nothing here carries a `tags` field the
+   * tool emits, so `tag` stays excluded.
+   */
+  items_known_thread: "topic group parent membership reaction tag translation discussion",
+  /**
+   * GET /b2/threads/{id}/items when the caller wants reactions: exactly
+   * `compact` minus `reaction`, spelled out because `compact=1` is
+   * all-or-nothing. `parent` stays excluded — TopicItemSerializer would
+   * otherwise side-load every item's parent item again under
+   * `parent_topic_items`, doubling the payload for a tree the `parent_id`
+   * field already describes. `discussion` must stay INCLUDED here: the
+   * opening post's reactions enter the `reactions` root only through
+   * DiscussionSerializer's `has_many :reactions`.
+   */
+  items_with_reactions: "topic group parent membership tag translation",
+} as const;
+
+export type ReadProfile = keyof typeof EXCLUDE_TYPES | "compact";
+
+/**
+ * The query parameters for one read profile, to spread into a
+ * `loomioGet` call. `compact` is for reads that need neither the topics
+ * join nor a `tags` field (memberships, thread items by bare topic_id,
+ * the record resolvers, search); every other profile spells out what to
+ * drop. Never spread these into a write: the write controllers ignore
+ * them and `PermittedParams` (`:raise` mode) would 400 on the unknown
+ * keys if they ever reached the resource hash.
+ */
+export function readParams(profile: ReadProfile): QueryParams {
+  return profile === "compact" ? { compact: 1 } : { exclude_types: EXCLUDE_TYPES[profile] };
+}
 
 /** Reads a credential at call time so tests / env reloads pick it up. */
 type Auth = () => string;
@@ -744,7 +941,11 @@ function buildUrl(path: string, params?: QueryParams): string {
   const url = new URL(`${baseUrl()}${path}`);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined) {
+      if (value === undefined) continue;
+      if (Array.isArray(value)) {
+        // Rails array convention; see `QueryValue`.
+        for (const item of value) url.searchParams.append(`${key}[]`, String(item));
+      } else {
         url.searchParams.set(key, String(value));
       }
     }
@@ -898,47 +1099,151 @@ export async function loomioGetPublic(path: string, params?: QueryParams): Promi
   }
 }
 
-function encodeForm(body: Record<string, unknown>): string {
-  const u = new URLSearchParams();
-  for (const [k, v] of Object.entries(body)) {
-    if (v === undefined || v === null) continue;
-    if (Array.isArray(v)) {
-      for (const item of v) u.append(`${k}[]`, String(item));
-    } else {
-      u.append(k, String(v));
-    }
-  }
-  return u.toString();
+// ── Write bodies ────────────────────────────────────────────────────────────
+//
+// Every b2 write is JSON (`Content-Type: application/json`). What the
+// body must LOOK like follows from two Rails mechanisms meeting in
+// `Api::B2::BaseController#permitted_params` (Loomio 3.8.1):
+//
+//   1. `permitted_params` uses `params[resource_name]` — the WRAPPED
+//      hash `{"discussion": {…}}` — when it is present, and otherwise
+//      falls back to the flat top-level hash minus a few reserved keys.
+//   2. Rails' `wrap_parameters format: [:json]` is on (config/
+//      initializers/wrap_parameters.rb). For a JSON body it builds the
+//      wrapped hash ITSELF from the top-level keys — but only the keys
+//      that are COLUMNS of the resource's model (`attribute_names`).
+//
+// Put together: a flat JSON discussion body reaches the controller
+// already wrapped, containing only the column names. `group_id`,
+// `private`, `recipient_*`, a poll's `options` / `poll_option_names` —
+// none of these are columns on Discussion / Poll, so a FLAT body
+// silently loses them and the record is created in the wrong place, or
+// fails validation with an empty `errors` hash. Sending the resource
+// NESTED (`{"discussion": {…}}`) makes rule 1 take the hash verbatim
+// and rule 2 never runs (the wrapper key is already present). That is
+// `nestedBody`. Loomio's `action_on_unpermitted_parameters = :raise`
+// means any key PermittedParams does not list answers 400, so the tool
+// layer must send exactly the permitted attribute names.
+//
+// Comments are the exception: `CommentsController#create` reads
+// `params[:discussion_id]` from the TOP level (it is not a Comment
+// column, so wrapping leaves it there) and PermittedParams takes the
+// wrapped `comment` hash rule 2 built from `body`, `body_format`,
+// `parent_id`, `parent_type` — all columns. So a comment body is FLAT
+// (`flatBody`), exactly as Loomio's own controller test posts it
+// (test/controllers/api/b2/comments_controller_test.rb, "create accepts
+// a bearer token with flat parameters"). PollService.invite reads
+// `recipient_user_ids` / `recipient_emails` / `recipient_audience` from
+// the top-level `params`, not the resource hash — `nestedBody` takes a
+// third argument for exactly those keys.
+//
+// Form encoding is gone. It existed for Loomio ≤ 3.1.2, whose comments
+// controller double-wrapped a JSON body (NOTES-ON-LOOMIO-API.md, Gotcha
+// 2, now historical); 3.1.3 removed that override and the flat JSON
+// path above is the one Loomio tests.
+
+export type JsonBody = Record<string, unknown>;
+
+/** Copy without `undefined` values (JSON.stringify drops them anyway; this keeps the intent visible and the object inspectable in tests). */
+export function flatBody(attrs: JsonBody): JsonBody {
+  return Object.fromEntries(Object.entries(attrs).filter(([, v]) => v !== undefined));
 }
 
-export interface PostOptions {
+/**
+ * `{ [resource]: attrs, ...topLevel }` — the wire shape for discussion
+ * and poll writes. `topLevel` is for the keys a SERVICE reads from
+ * `params` directly (a poll's `recipient_*`); everything the model owns
+ * goes under the resource key.
+ */
+export function nestedBody(
+  resource: "discussion" | "poll" | "comment" | "user",
+  attrs: JsonBody,
+  topLevel: JsonBody = {},
+): JsonBody {
+  return { ...flatBody(topLevel), [resource]: flatBody(attrs) };
+}
+
+export interface WriteOptions {
   params?: QueryParams;
-  /**
-   * Body wire format. Defaults to "json". Use "form" when Loomio's
-   * b2 controllers reject JSON bodies due to Rails' wrap_parameters
-   * doubly-wrapping the payload (observed on `/b2/comments` — see
-   * NOTES-ON-LOOMIO-API.md).
-   */
-  encoding?: "json" | "form";
 }
 
+type WriteMethod = "POST" | "PATCH" | "DELETE";
+
+/**
+ * The single b2 write path. `isReadOnly()` is checked FIRST — before
+ * the URL is built, before the key is read — so a read-only deployment
+ * refuses with a clear message and never opens a connection. Every
+ * verb sends `Content-Type: application/json`; DELETE sends `{}` (no
+ * body would also work, but an explicit empty object keeps the same
+ * code path and content type on every write).
+ */
+async function loomioWrite<T>(
+  method: WriteMethod,
+  path: string,
+  body: JsonBody | undefined,
+  opts: WriteOptions,
+): Promise<T> {
+  if (isReadOnly()) throw new LoomioReadOnlyError(method);
+  const url = buildUrl(path, opts.params);
+  const start = await doFetch(url, {
+    method,
+    headers: { ...authHeaders(B2_AUTH), "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  try {
+    return await consumeBody(start, () => handleResponse<T>(start.res, start.url, start.method));
+  } finally {
+    start.cleanup();
+  }
+}
+
+/** POST a JSON body to a b2 collection (`/b2/discussions`, `/b2/polls`, `/b2/comments`, `/b2/memberships`). */
 export async function loomioPost<T>(
   path: string,
-  body: Record<string, unknown>,
-  opts: PostOptions = {},
+  body: JsonBody,
+  opts: WriteOptions = {},
 ): Promise<T> {
-  if (isReadOnly()) throw new LoomioReadOnlyError("POST");
-  const url = buildUrl(path, opts.params);
-  const encoding = opts.encoding ?? "json";
-  const start = await doFetch(url, {
-    method: "POST",
-    headers: {
-      ...authHeaders(B2_AUTH),
-      "Content-Type":
-        encoding === "form" ? "application/x-www-form-urlencoded" : "application/json",
-    },
-    body: encoding === "form" ? encodeForm(body) : JSON.stringify(body),
-  });
+  return loomioWrite<T>("POST", path, body, opts);
+}
+
+/**
+ * PATCH a JSON body to a b2 member route (`/b2/discussions/{id}`,
+ * `/b2/polls/{id}`, `/b2/comments/{id}` — routes.rb `only: [… :update]`).
+ * Same nested-vs-flat rules as POST: the controllers run the same
+ * `permitted_params`.
+ */
+export async function loomioPatch<T>(
+  path: string,
+  body: JsonBody,
+  opts: WriteOptions = {},
+): Promise<T> {
+  return loomioWrite<T>("PATCH", path, body, opts);
+}
+
+/**
+ * DELETE a b2 record. Loomio's b2 `destroy` actions are SOFT: they call
+ * `<Service>.discard` (sets `discarded_at` / `discarded_by`, nulls the
+ * content via `hide_when_discarded`) and answer 200 with the discarded
+ * record — the row stays, the thread keeps its place, and an admin can
+ * undiscard in the UI. Nothing here is a hard delete.
+ */
+export async function loomioDelete<T>(path: string, opts: WriteOptions = {}): Promise<T> {
+  return loomioWrite<T>("DELETE", path, undefined, opts);
+}
+
+/**
+ * GET a `/b3/...` admin endpoint (`GET /b3/users`, `/b3/users/:id`,
+ * `/b3/users/identity/:type/:uid` — Loomio 3.8.1 routes.rb, `namespace
+ * :b3`). Same bearer scheme and same server-instance secret as
+ * `loomioPostB3`, never the per-user key. A read, so `isReadOnly()` is
+ * not consulted here: the gate for these calls is at registration
+ * (src/server.ts registers the b3 tools only when `LOOMIO_B3_API_KEY`
+ * is set AND the server is not read-only), because every b3 user
+ * record carries the account's email — see src/tools/admin.ts.
+ */
+export async function loomioGetB3<T>(path: string, params?: QueryParams): Promise<T> {
+  const url = buildUrl(path, params);
+  const start = await doFetch(url, { headers: authHeaders(B3_AUTH) });
   try {
     return await consumeBody(start, () => handleResponse<T>(start.res, start.url, start.method));
   } finally {

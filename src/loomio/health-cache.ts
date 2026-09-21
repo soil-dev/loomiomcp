@@ -14,6 +14,8 @@
  * the TTL and `getCachedHealth` so callers only ever import from there.
  */
 
+import type { GroupsIndexResponse } from "./types.js";
+
 /**
  * How long a probe result is trusted. Two consumers share the number:
  * `checkLoomioHealth` serves the cached verdict without a network call
@@ -80,10 +82,36 @@ export interface LoomioHealth {
 
 let cached: LoomioHealth | undefined;
 let cachedAtMs = 0;
+let cachedGroups: GroupsIndexResponse | undefined;
 
 /** Last probe result, if any — regardless of age. `undefined` before the first probe. */
 export function getCachedHealth(): LoomioHealth | undefined {
   return cached;
+}
+
+/**
+ * The parsed body of the probe's GET /b2/groups, from the SAME probe
+ * that produced `getCachedHealth()`, or `undefined` when that probe did
+ * not answer 200 (or its body was not JSON). Kept because the probe
+ * already paid for the request: `check_connection` forces a probe and
+ * then reads this, so "does the connector work, and what can it see"
+ * costs one request pair rather than three. Stored beside the verdict
+ * — never ON it — so `/health` (which serialises `LoomioHealth`) cannot
+ * grow a list of the user's groups.
+ */
+export function getCachedGroupsIndex(): GroupsIndexResponse | undefined {
+  return cachedGroups;
+}
+
+/**
+ * The cached groups body only while the verdict it came with is fresh
+ * (`HEALTH_CACHE_TTL_MS`). A tool that can tolerate a minute-old view of
+ * the user's groups uses this to avoid a network call; anything that
+ * needs the current state calls `checkLoomioHealth({ force: true })`
+ * first and then reads `getCachedGroupsIndex()`.
+ */
+export function getFreshGroupsIndex(now: number = Date.now()): GroupsIndexResponse | undefined {
+  return cachedGroups && cachedHealthAgeMs(now) < HEALTH_CACHE_TTL_MS ? cachedGroups : undefined;
 }
 
 /** Milliseconds since the cached result was stored; `Infinity` when there is none. */
@@ -104,13 +132,24 @@ export function getFreshKeyStatus(
   return cached && cachedHealthAgeMs(now) < HEALTH_CACHE_TTL_MS ? cached.key_status : undefined;
 }
 
-export function setCachedHealth(health: LoomioHealth, now: number = Date.now()): void {
+/**
+ * Store a probe's verdict and, when it had one, the parsed groups body
+ * it came with. Both share one timestamp: a caller can never see a
+ * `valid` verdict from one probe next to the groups of another.
+ */
+export function setCachedHealth(
+  health: LoomioHealth,
+  now: number = Date.now(),
+  groups?: GroupsIndexResponse,
+): void {
   cached = health;
   cachedAtMs = now;
+  cachedGroups = groups;
 }
 
 /** Test hook: forget the cached result so the next probe hits the network. */
 export function resetCachedHealth(): void {
   cached = undefined;
   cachedAtMs = 0;
+  cachedGroups = undefined;
 }

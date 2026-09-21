@@ -1,5 +1,7 @@
 import { z } from "zod";
-import { loomioGet, loomioPost } from "../loomio/client.js";
+import { loomioGet, loomioPost, readParams } from "../loomio/client.js";
+import { pick, type SlimUser, slimUsers } from "../loomio/shape.js";
+import type { LoomioMembership, MembershipsResponse } from "../loomio/types.js";
 import { positiveId } from "./_common.js";
 
 // ── list_memberships ────────────────────────────────────────────────────────
@@ -14,7 +16,17 @@ import { positiveId } from "./_common.js";
 //   - `user_email` is serialized only for groups in the connector user's
 //     `adminable_group_ids`, plus memberships that user invited itself
 //     (`include_user_email?`). A plain member gets the roster WITHOUT
-//     email addresses — silently, no error.
+//     email addresses — silently, no error. That flag lives on the
+//     MEMBERSHIP row; the `users[]` root never carries a member's
+//     email (Loomio's own test "group admin can list member email
+//     addresses" asserts `refute serialized_user.key?("email")`).
+//   - The ONE `users[].email` this endpoint does emit is the API user's
+//     OWN: `AuthorSerializer#include_email?` is true when
+//     `scope[:current_user_id] == object.id`, and every b2 index sets
+//     `current_user_id`. It is not roster data — it is the connector
+//     account's mailbox, which on a shared deployment every caller
+//     would otherwise learn from any member group — so the tool drops
+//     `users[].email` entirely (there is nothing else it could be).
 //   - A NON-member is not refused: `accessible_records` is scoped to the
 //     user's own groups, so the controller finds nothing and answers 200
 //     with `memberships: []`. Instance `is_admin` does not widen this
@@ -27,52 +39,88 @@ import { positiveId } from "./_common.js";
 // other signal. Without the note an agent reads `memberships: []` as
 // "this group is empty" and reports that as fact.
 //
+// Wire: `compact=1`. The roster needs no topics join and no group
+// record (the caller passed the id), and `compact` drops the group,
+// parent, membership-of-group, reaction, tag and translation side-loads
+// while `users` — never droppable — still arrives (verified on a live
+// 3.8.1 capture: roots `memberships`, `users`, `meta`). `user_email` is
+// unaffected: it is a serializer scope decision, not a side-load. Each
+// row is then reduced to its meaningful fields (`volume_*` and
+// `experiences` are the API user's own notification settings and
+// onboarding flags) and users are slimmed to id / name / username —
+// `user_email` on the membership row is the only email that flows.
+//
 // 403s (rotated key, WAF) are classified by the HTTP client
 // (`classifyForbidden` in src/loomio/client.ts); nothing here needs to
-// probe or re-explain them. The connector's earlier "access fence" —
-// a follow-up request to b2/polls to tell a bad key from a missing
-// admin role — predates Loomio's distinguishable 403 bodies and is gone.
+// probe or re-explain them.
 
 export const listMembershipsSchema = z.object({
-  group_id: positiveId.describe(
-    "ID of the Loomio group whose memberships to list (required). Any member of the group can list " +
-      "its roster (ids, names, usernames, roles, join state); `user_email` is included only for groups " +
-      "where the connector's user is an admin (coordinator), or for members it invited. If the " +
-      "connector's user is not a member (or the group is hidden from it), Loomio answers 200 with an " +
-      "EMPTY list — not 403 — and the connector adds `scope.note` saying so.",
-  ),
-  limit: z.number().int().min(1).max(200).optional().describe("Page size. Loomio defaults to 50."),
-  offset: z.number().int().min(0).optional().describe("Page offset. Defaults to 0."),
+  group_id: positiveId.describe("Group id (a non-member gets an empty list, not 403)."),
+  limit: z.number().int().min(1).max(200).optional().describe("Page size, 1-200. Default 50."),
+  offset: z.number().int().min(0).optional().describe("Page offset. Default 0."),
 });
 
-/**
- * Loomio's collection response: the `memberships` root is always present
- * (Snorlax renders `[]` for an empty collection), with side-loaded
- * `users` / `groups` and a `meta` block alongside. Passed through as-is.
- */
-interface MembershipsResponse {
-  memberships?: unknown[];
-  [key: string]: unknown;
+const MEMBERSHIP_FIELDS = [
+  "id",
+  "user_id",
+  "group_id",
+  "admin",
+  "delegate",
+  "title",
+  "inviter_id",
+  "created_at",
+  "accepted_at",
+  "user_email",
+] as const;
+
+export type ShapedMembership = Pick<LoomioMembership, (typeof MEMBERSHIP_FIELDS)[number]>;
+
+export interface ListMembershipsResult {
+  memberships: ShapedMembership[];
+  /**
+   * Members and inviters referenced by the rows: id, name, username —
+   * never `email`. Member emails Loomio entitles the user to arrive as
+   * `user_email` on the membership row; the only `users[].email` this
+   * endpoint emits is the connector account's own, which is dropped.
+   */
+  users: SlimUser[];
+  /** Loomio's `meta.total`: the whole roster, before pagination. */
+  total: number;
+  returned: number;
+  scope?: { note: string };
 }
 
 export const EMPTY_ROSTER_NOTE =
   "Empty list: the connector's user is not a member of this group (or the group is hidden from it). " +
   "Loomio returns an empty list, not 403, in that case.";
 
-export async function listMemberships(input: z.infer<typeof listMembershipsSchema>) {
-  const resp = await loomioGet<MembershipsResponse>("/b2/memberships", {
+export async function listMemberships(
+  input: z.infer<typeof listMembershipsSchema>,
+): Promise<ListMembershipsResult> {
+  const body = await loomioGet<MembershipsResponse>("/b2/memberships", {
     group_id: input.group_id,
     ...(input.limit !== undefined ? { limit: input.limit } : {}),
     ...(input.offset !== undefined ? { offset: input.offset } : {}),
+    ...readParams("compact"),
   });
-  const memberships = Array.isArray(resp.memberships) ? resp.memberships : [];
-  if (memberships.length > 0) return resp;
+  const memberships = (Array.isArray(body.memberships) ? body.memberships : []).map((m) =>
+    pick(m, MEMBERSHIP_FIELDS),
+  );
+  const out: ListMembershipsResult = {
+    memberships,
+    // No `includeEmail`: see the module note — the only users[].email
+    // here is the API user's own.
+    users: slimUsers(body.users),
+    total: typeof body.meta?.total === "number" ? body.meta.total : memberships.length,
+    returned: memberships.length,
+  };
+  if (memberships.length > 0) return out;
   // An empty page past the end of a real roster is the one benign
   // reading; only possible when the caller paginated.
   const offsetNote = input.offset
     ? ` (With offset=${input.offset} it can also simply be a page past the end of the roster.)`
     : "";
-  return { ...resp, scope: { note: `${EMPTY_ROSTER_NOTE}${offsetNote}` } };
+  return { ...out, scope: { note: `${EMPTY_ROSTER_NOTE}${offsetNote}` } };
 }
 
 // ── manage_memberships ──────────────────────────────────────────────────────
@@ -112,25 +160,16 @@ export async function listMemberships(input: z.infer<typeof listMembershipsSchem
 // controller test posts `remove_absent: 1`).
 
 export const manageMembershipsSchema = z.object({
-  group_id: positiveId.describe(
-    "ID of the Loomio group to modify (required). The connector's user must be an admin (coordinator) " +
-      'of this group; Loomio answers 403 "User is not an admin" otherwise.',
-  ),
+  group_id: positiveId.describe("Group id; the connector's user must be its admin."),
   emails: z
     .array(z.string().email())
     .min(1)
-    .describe(
-      "Email addresses to ensure are members. Each address that isn't already a member is invited / added.",
-    ),
+    .describe("Addresses to ensure are members; new ones are invited."),
   remove_absent: z
     .boolean()
     .optional()
     .describe(
-      "DANGEROUS. When true, Loomio REMOVES every existing member whose email is NOT in `emails` — " +
-        "including pending invitees, the connector's own user if its email is absent, and the same " +
-        "users' memberships in every subgroup. Empty-emails (after dedupe) effectively removes the " +
-        "entire group. Default false. Only set true after reading list_memberships and confirming " +
-        "the diff with a human.",
+      "DANGEROUS: also revokes every member absent from `emails`, own user included. Default false.",
     ),
 });
 
