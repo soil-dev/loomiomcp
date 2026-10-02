@@ -1,9 +1,10 @@
 /**
  * The HTTP client's 0.0.12 surface (src/loomio/client.ts): the write
  * verbs and their read-only guard, the nested-vs-flat body helpers,
- * array / csv query encoding, the per-tool read profiles, and the
+ * array / csv query encoding, the per-tool read profiles, the
  * success-path body handling (empty body → `{}`, non-JSON 2xx → a
- * named error).
+ * named error), and the request deadline (60 s for tool calls, a
+ * per-call `timeoutMs` for the raw probe primitives).
  *
  * Why these matter: Loomio 3.8.1's `permitted_params` takes the WRAPPED
  * resource hash when present and Rails' `wrap_parameters` only wraps
@@ -264,6 +265,102 @@ describe("success-path bodies", () => {
     expect(err).toBeInstanceOf(LoomioApiError);
     expect(err.status).toBe(404);
     expect(err.message).toContain("404");
+  });
+});
+
+describe("request deadline", () => {
+  afterEach(() => vi.useRealTimers());
+
+  /** Loomio accepts the connection and never answers; only the client's abort signal can end the wait. */
+  function hangUntilAborted(): AbortSignal[] {
+    const signals: AbortSignal[] = [];
+    vi.mocked(fetch).mockImplementation(
+      (_url, opts) =>
+        new Promise((_resolve, reject) => {
+          const signal = (opts as { signal?: AbortSignal } | undefined)?.signal;
+          if (!signal) {
+            reject(new Error("expected the client to attach an abort signal"));
+            return;
+          }
+          signals.push(signal);
+          signal.addEventListener("abort", () =>
+            reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })),
+          );
+        }),
+    );
+    return signals;
+  }
+
+  /** Resolve to the rejection (or the string "resolved") and expose whether it has happened yet. */
+  function observe(p: Promise<unknown>) {
+    const state = { settled: false, outcome: undefined as unknown };
+    const done = p.then(
+      () => "resolved" as const,
+      (e: unknown) => e,
+    );
+    void done.then((o) => {
+      state.settled = true;
+      state.outcome = o;
+    });
+    return { state, done };
+  }
+
+  it("fetchWithTimeout honours a per-call timeoutMs: loomioGetRaw aborts at 8 s, not 60 s, and the 504 names 8s", async () => {
+    vi.useFakeTimers();
+    const signals = hangUntilAborted();
+    const { loomioGetRaw, LoomioApiError } = await import("../src/loomio/client.js");
+    const { state, done } = observe(loomioGetRaw("/b2/groups", undefined, { timeoutMs: 8_000 }));
+
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(signals).toHaveLength(1);
+    expect(signals[0]?.aborted).toBe(false);
+    expect(state.settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    const err = await done;
+    expect(signals[0]?.aborted).toBe(true);
+    expect(err).toBeInstanceOf(LoomioApiError);
+    expect((err as InstanceType<typeof LoomioApiError>).status).toBe(504);
+    expect((err as Error).message).toMatch(/timed out after 8s/);
+    expect((err as Error).message).not.toMatch(/60s/);
+    expectBearerAuth(0, "test-key");
+  });
+
+  it("loomioGetPublic takes the same opts, still without a credential", async () => {
+    vi.useFakeTimers();
+    const signals = hangUntilAborted();
+    const { loomioGetPublic } = await import("../src/loomio/client.js");
+    const { state, done } = observe(
+      loomioGetPublic("/v1/boot/version", undefined, { timeoutMs: 8_000 }),
+    );
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(state.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const err = await done;
+    expect(signals[0]?.aborted).toBe(true);
+    expect((err as Error).message).toMatch(/timed out after 8s/);
+    expect(requestOf().headers["Authorization"]).toBeUndefined();
+  });
+
+  it("tool calls keep the 60 s deadline by default, and the message says 60s", async () => {
+    // A slow but working Loomio should finish a big read: only the
+    // probe, whose consumer gives up at ~10 s, asks for less.
+    vi.useFakeTimers();
+    const signals = hangUntilAborted();
+    const { loomioGet, loomioGetRaw } = await import("../src/loomio/client.js");
+    const get = observe(loomioGet("/b2/threads"));
+    const raw = observe(loomioGetRaw("/b2/groups"));
+
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(signals).toHaveLength(2);
+    expect(get.state.settled).toBe(false);
+    expect(raw.state.settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    for (const err of [await get.done, await raw.done]) {
+      expect((err as Error).message).toMatch(/timed out after 60s/);
+    }
+    expect(signals.map((s) => s.aborted)).toEqual([true, true]);
   });
 });
 

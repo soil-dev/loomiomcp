@@ -20,7 +20,11 @@
  * The probe itself is cached 60 s (src/loomio/health.ts), so a checker
  * polling every 5 minutes costs Loomio one request pair per poll and a
  * flood of unauthenticated hits costs it at most one pair per minute;
- * the per-IP limiter shared with /mcp bounds the CPU spend on top.
+ * the per-IP limiter shared with /mcp bounds the CPU spend on top. Its
+ * two requests run under an 8 s deadline (`HEALTH_PROBE_TIMEOUT_MS`),
+ * so a hung Loomio becomes a 503 from THIS handler before the checker
+ * (~10 s) or the hosting platform's own request timeout gives up and
+ * turns the page into a 504 that looks like a connector fault.
  *
  * Path. `/health` by default — deliberately NOT `/healthz`: Cloud Run's
  * frontend reserves `/healthz` and answers it with its own 404 before

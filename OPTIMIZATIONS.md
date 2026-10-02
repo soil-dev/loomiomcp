@@ -12,7 +12,8 @@ The rule: one Loomio request when one suffices, never a fan-out where
 Loomio offers an aggregate, and bytes trimmed upstream (`exclude_types`
 / `compact=1`) before they are trimmed here (slimming, truncation).
 Every collection surfaces Loomio's exact `meta.total` so "how many"
-never needs a second page. Verified against Loomio 3.8.1.
+never needs a second page. Verified against Loomio 3.8.1; the read tools
+re-verified live on 3.9.0 (same request counts, same shapes).
 
 | Tool | Loomio requests | Read profile sent | Bytes controls |
 |---|---|---|---|

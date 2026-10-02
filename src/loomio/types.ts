@@ -1,6 +1,7 @@
 /**
- * Wire shapes of Loomio 3.8.1's b2 API, as its serializers emit them
- * (app/serializers/*.rb) and as captured from a live instance. These
+ * Wire shapes of Loomio 3.8.1's b2 API (unchanged in 3.9.0), as its
+ * serializers emit them (app/serializers/*.rb) and as captured from a
+ * live instance. These
  * are the INPUT side of the connector: what `loomioGet` hands back
  * before `shape.ts` slims and joins it. The tool layer decides what an
  * AI caller sees; nothing here is returned verbatim.
@@ -193,6 +194,12 @@ export interface LoomioPoll {
   topic_id?: number | null;
   author_id?: number | null;
   anonymous?: boolean;
+  /**
+   * Dropped by PollSerializer on Loomio master (unreleased as of
+   * 2026-10-02, which also adds `result_heading_keys`, `weighted_voting`
+   * and a stance `weight`). Read nowhere in the connector; optional so
+   * either shape type-checks, and new fields ride the index signature.
+   */
   voting_system?: "stance" | "anonymous_ballot" | string;
   hide_results?: LoomioHideResults | string;
   closing_at?: string | null;

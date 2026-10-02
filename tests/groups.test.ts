@@ -33,7 +33,7 @@ vi.mock("undici", () => ({ fetch: vi.fn() }));
 setupLoomioTest();
 
 const GENERIC_403 = { error: "You are not authorized to access this page." };
-const VERSION_OK = { status: 200, body: { version: "3.8.1" } };
+const VERSION_OK = { status: 200, body: { version: "3.9.0" } };
 
 // check_connection forces the key-health probe, which emits a FORCED
 // `loomio.auth` event on its first result. Keep stderr quiet and reset
@@ -395,7 +395,7 @@ describe("checkConnection", () => {
 
     expect(r.connector_version).toBe(VERSION);
     expect(r.tested_loomio_version).toBe(TESTED_LOOMIO_VERSION);
-    expect(r.loomio_version).toBe("3.8.1");
+    expect(r.loomio_version).toBe("3.9.0");
     expect(r.key_status).toBe("valid");
     expect(r.checked_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(r.readonly).toBe(false);
@@ -531,7 +531,7 @@ describe("checkConnection", () => {
     process.env["LOOMIO_B3_API_KEY"] = "b3-secret-that-is-long-enough";
     mockFetchRoutes({
       "/b2/groups": { status: 200, body: groupsIndexBody() },
-      "/v1/boot/version": { status: 200, body: { version: "3.9.0" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.10.0" } },
     });
     const { checkConnection } = await import("../src/tools/groups.js");
     const r = await checkConnection({});
@@ -539,14 +539,14 @@ describe("checkConnection", () => {
     // tests/readonly.test.ts pins that this configuration advertises
     // exactly the reads; the discovery tool must agree with tools/list.
     expect(r.b3_enabled).toBe(false);
-    expect(r.loomio_version).toBe("3.9.0");
+    expect(r.loomio_version).toBe("3.10.0");
     const notes = r.notes.join(" ");
     expect(notes).toMatch(/LOOMIO_MCP_READONLY is set/);
     expect(notes).toMatch(
       /LOOMIO_B3_API_KEY is set but LOOMIO_MCP_READONLY is also set: NO b3 tools/,
     );
     expect(notes).not.toMatch(/are registered\./);
-    expect(notes).toMatch(/reports version 3\.9\.0; this connector was verified against 3\.8\.1/);
+    expect(notes).toMatch(/reports version 3\.10\.0; this connector was verified against 3\.9\.0/);
     expect(notes).not.toContain("b3-secret");
   });
 

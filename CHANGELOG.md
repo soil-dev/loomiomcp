@@ -1,5 +1,109 @@
 # Changelog
 
+## 0.0.14 — 2026-10-02
+
+Maintenance release: verified against Loomio 3.9.0, a fast deadline for
+the key-health probe, dependency updates. No tool text changes; the
+tools/list catalogue is byte-identical to 0.0.12 / 0.0.13 (35 631 B for
+the 24 full-mode tools, re-measured with `scripts/catalog-size.mjs`).
+
+Changed:
+
+- **Tested against Loomio 3.9.0** (`TESTED_LOOMIO_VERSION` 3.8.1 →
+  3.9.0; the reference instance upgraded on 2026-09-23). From Loomio's
+  source at tags `v3.8.1`, `v3.8.2`, `v3.9.0` and master (e96b61311,
+  2026-10-02): the `namespace :b2` and `namespace :b3` blocks of
+  `config/routes.rb` are byte-identical at all four, so is the OpenAPI
+  document (it moved from `docs/user_manual/integrations/api/openapi.yaml`
+  to `docs/en/user_manual/integrations/api/openapi.yaml` on master,
+  c47d783cf), and `permitted_params.rb` is unchanged through 3.9.0.
+  The 3.8.1 → 3.9.0 diff (206 files) is dominated by sign-in / passkey
+  / session code and touches no b2 / b3 controller, no permitted
+  parameter (`app/models/permitted_params.rb`), no ability and no
+  serializer the b2 API emits (the only serializers in it are
+  `current_user` and `pending`). The one change under a connector write
+  path is `GroupService.invite`, which b2 `memberships#create`
+  (`manage_memberships`) calls: it now also resolves an optional
+  `recipient_audience` the connector never sends, and a nil kind
+  resolves to `User.none`, so the call is unchanged in effect. The
+  remaining backend changes — `Stance.redeemable`, `TopicItemService.move`,
+  `Membership#remove_admin!` removed, passkey rate limits — alter no b2
+  request or response. A live read regression of all 14 read tools against the
+  3.9.0 instance passed 27/27 with response shapes identical to the
+  3.8.1 captures. The 10 write tools and the 4 b3 tools are unchanged
+  and were **not** re-run live on 3.9.0 (their request bodies target
+  controllers and permitted parameters that did not change between the
+  tags). `loomio.version_drift` and `check_connection`'s drift note now
+  key off 3.9.
+- **Key-health probe: 8 s deadline** (`HEALTH_PROBE_TIMEOUT_MS` in
+  `src/loomio/health.ts`), down from the 60 s every request shared.
+  Incident 2026-10-01 20:03–20:05 UTC: Loomio hung for ~2 minutes; the
+  probe's 60 s deadline equalled the hosting platform's request
+  timeout, so `GET /health` hung for 60 s and the platform answered
+  **504** instead of the connector answering **503** — the uptime
+  checker (which gives up after ~10 s) never saw a verdict, and the
+  forced `loomio.auth` "unreachable / timeout" event fired a minute
+  late. Now both probe requests run under 8 s: an upstream hang becomes
+  a prompt 503 `unreachable` (reason `timeout`) plus the forced event,
+  from the connector itself. Plumbing: `fetchWithTimeout` takes a
+  per-call `timeoutMs` (default: the unchanged 60 s `REQUEST_TIMEOUT_MS`),
+  `loomioGetRaw` / `loomioGetPublic` accept `{ timeoutMs }`, and the
+  504 message names the deadline that actually applied ("8s" for the
+  probe, "60s" for a tool call) instead of a fixed figure. **Tool calls
+  keep the 60 s deadline**: a slow but working Loomio should finish a
+  big read.
+- Dependencies updated within their declared ranges:
+  `@modelcontextprotocol/sdk` 1.30.0 → 1.31.0, `undici` 8.10.2 →
+  8.11.2, `@types/node` 25.9.8 → 25.9.9. `npm audit`: 0 vulnerabilities.
+  Majors deliberately not taken (biome 2.5, typescript 7, vitest 5,
+  `@types/node` 26).
+
+Upcoming in Loomio master (not yet released as of e96b61311,
+2026-10-02; nothing deployed runs it). Listed so the next re-verify
+knows where to look — the connector is already tolerant of all of it:
+
+- `PollSerializer` drops `voting_system` and adds `result_heading_keys`
+  and `weighted_voting`; `StanceSerializer` adds `weight`; the
+  permitted poll attributes gain `weighted_voting`. The connector reads
+  `voting_system` nowhere — it is an optional passthrough in
+  `src/loomio/types.ts`, one name in `list_thread_items`' poll slim
+  list (`ITEM_POLL_FIELDS`, `src/tools/threads.ts`) and comments in
+  `src/loomio/visibility.ts`, `src/tools/polls.ts` and
+  `src/loomio/client.ts` — so its absence changes nothing. New poll
+  fields pass through on `get_poll`, `list_polls` rows and the
+  create / update echoes (`shapePoll` removes a fixed deny-list) and
+  are dropped on `list_thread_items` polls (`ITEM_POLL_FIELDS` is an
+  allow-list); a stance `weight` is dropped everywhere (`STANCE_FIELDS`,
+  `OWN_STANCE_FIELDS`). No tool sends `weighted_voting`.
+- User-scoped fields (`my_stance`, `current_user_followed`, …) are
+  emitted only when a current user is present. An API-key request
+  always has one, so b2 responses to the connector are unaffected.
+- `GET /b2/threads/{id}/markdown` now calls `authorize!(:export, thread)`,
+  where Topic `:export` = `can?(:show, topic)` — no practical change
+  for a thread the user can see (an invisible one was already 404).
+  `ThreadMarkdownService` itself does change (df28cf845): it now applies
+  only the until-closed rule (`poll.results_available?`), so an open
+  `until_vote` poll's results are exported to every reader with `:show`
+  on the thread — `get_thread_markdown` will disclose them to
+  non-voters —, comments under votes of an open `until_closed` poll are
+  omitted from the export and from the search index `/b2/search` reads,
+  and replies to stances are no longer rejected
+  (`Comment#parent_vote_results_visible_to_all` removed). The service's
+  layout also changes on master (front matter gains `key`, `·`-joined
+  title, nested blockquotes); the connector passes the string through
+  verbatim today and `markdownHeading` still finds the first H1. Decide
+  whether `get_thread_markdown` should warn about or strip until_vote
+  results when a tag ships this.
+- b2 `memberships#create` no longer calls `PollService.group_members_added`:
+  members added through `manage_memberships` are no longer auto-enrolled
+  in the group's open polls. A Loomio-side behaviour change, not a
+  connector one; noted here because a caller may expect the old effect.
+
+Verified: biome, tsc, the test suite (adds: per-call `timeoutMs` on
+`fetchWithTimeout`, both probe requests under `HEALTH_PROBE_TIMEOUT_MS`,
+`/health` answering 503 `unreachable` when the probe times out) and
+the build are green; the catalogue re-measured as above.
+
 ## 0.0.13 — 2026-09-21
 
 Dependency security release. No behaviour change; tool catalogue,

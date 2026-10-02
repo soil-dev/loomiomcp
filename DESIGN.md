@@ -1,7 +1,9 @@
 # Design
 
 Short notes on the load-bearing choices. Loomio facts are stated
-against Loomio 3.8.1 (`TESTED_LOOMIO_VERSION` in `src/version.ts`);
+against Loomio 3.9.0 (`TESTED_LOOMIO_VERSION` in `src/version.ts`;
+its b2 / b3 routes, OpenAPI document and permitted parameters are
+byte-identical to 3.8.1, where the source citations were made);
 NOTES-ON-LOOMIO-API.md has the line-by-line evidence.
 
 ## Surface area
@@ -11,7 +13,7 @@ via `Authorization: Bearer <api_key>`. This is the namespace where
 Loomio's controllers live in the open-source repo (the `b1` namespace
 was removed in Loomio 3.1.0) and the one Loomio's OpenAPI document
 describes. The canonical b2 docs are at https://www.loomio.com/help/api2.
-As of 3.8.1 the connector wraps every b2 resource except `/b2/chatbots`
+As of 3.9.0 the connector wraps every b2 resource except `/b2/chatbots`
 (group-admin webhook configuration whose serializer returns the webhook
 URL — nothing an AI caller needs, and a leak surface), `GET
 /b2/threads/{id}` alone (its row is what `list_threads` returns and the
@@ -54,7 +56,7 @@ access on the loomio.com SaaS:
   memberships.
 
 The connector now makes exactly one v1 request: the unauthenticated
-`GET /api/v1/boot/version` (`{ "version": "3.8.1", … }`), which the
+`GET /api/v1/boot/version` (`{ "version": "3.9.0", … }`), which the
 key-health probe reads for the instance's Loomio version with no
 credential sent. The two v1 reads earlier releases relied on —
 `GET /api/v1/events?discussion_id=` (removed by Loomio 3.4.0 when the
@@ -327,6 +329,13 @@ So the connector probes actively (`src/loomio/health.ts`):
   `unreachable`, never a false "rejected". Plus the public
   `GET /api/v1/boot/version` for `loomio_version`, whose failure never
   affects `key_status`.
+- Each probe request has its own 8 s deadline (`HEALTH_PROBE_TIMEOUT_MS`)
+  instead of the client's 60 s. The probe serves an uptime checker that
+  gives up at ~10 s, and the hosting platform's request timeout is often
+  60 s as well, so a 60 s probe could never say "unreachable" in time:
+  the platform would answer 504 first and the forced `loomio.auth`
+  event would come a minute late (2026-10-01, Loomio hung ~2 min). Tool
+  calls keep 60 s — a slow but working Loomio should finish a big read.
 - Cached 60 s with a shared in-flight promise: `/health`, startup and
   the tools that consult it cost Loomio at most one request pair per
   minute in aggregate. The parsed groups body is kept beside the verdict

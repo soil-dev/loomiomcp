@@ -8,10 +8,12 @@ instance-admin tools — that calls Loomio's b2 API on behalf of
 authenticated MCP clients, plus the optional b3 admin endpoints (gated
 by a separate, server-instance secret) when explicitly enabled.
 
-Everything below is stated against Loomio 3.8.1 (`TESTED_LOOMIO_VERSION`
-in `src/version.ts`). Loomio publishes no API compatibility policy and
-changed its User API permission model between 3.0 and 3.8; re-check this
-file when the health probe reports version drift.
+Everything below is stated against Loomio 3.9.0 (`TESTED_LOOMIO_VERSION`
+in `src/version.ts`; 3.8.1 → 3.9.0 changed no b2 / b3 route, permitted
+parameter or authorization check the connector relies on). Loomio
+publishes no API compatibility policy and changed its User API
+permission model between 3.0 and 3.8; re-check this file when the health
+probe reports version drift.
 
 ## HTTP / multi-user posture (public deployments)
 
