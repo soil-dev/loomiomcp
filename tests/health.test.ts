@@ -6,8 +6,10 @@
  * process looks healthy. These tests pin: the three verdicts and what
  * produces each; that a CDN/WAF 403 is NOT reported as a rejected key;
  * that the public version probe never touches the verdict and never
- * carries the credential; the 60 s cache and its `force` bypass; and
- * the forced `loomio.auth` / `loomio.version_drift` events.
+ * carries the credential; the 60 s cache and its `force` bypass; the
+ * 8 s per-request deadline (a hung Loomio must become `unreachable`
+ * before an uptime checker gives up, not after the platform's 60 s);
+ * and the forced `loomio.auth` / `loomio.version_drift` events.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,8 +17,10 @@ import { fetch } from "undici";
 import { setupLoomioTest } from "./test-helpers.js";
 import {
   HEALTH_CACHE_TTL_MS,
+  HEALTH_PROBE_TIMEOUT_MS,
   checkLoomioHealth,
   getCachedHealth,
+  type LoomioHealth,
   resetHealthForTests,
 } from "../src/loomio/health.js";
 import { USER_AGENT } from "../src/loomio/client.js";
@@ -27,7 +31,7 @@ setupLoomioTest();
 type Route = { status: number; body: unknown; headers?: Record<string, string> } | Error;
 
 const GENERIC_403 = { status: 403, body: { error: "You are not authorized to access this page." } };
-const VERSION_OK = { status: 200, body: { version: "3.8.1", release: "abc", reload: false } };
+const VERSION_OK = { status: 200, body: { version: "3.9.0", release: "abc", reload: false } };
 
 /**
  * Route mock responses by path suffix. The probe issues its two GETs in
@@ -96,7 +100,7 @@ describe("checkLoomioHealth verdicts", () => {
     });
     const h = await checkLoomioHealth();
     expect(h.key_status).toBe("valid");
-    expect(h.loomio_version).toBe("3.8.1");
+    expect(h.loomio_version).toBe("3.9.0");
     expect(h.detail).toBeUndefined();
     expect(Date.parse(h.checked_at)).not.toBeNaN();
   });
@@ -117,7 +121,7 @@ describe("checkLoomioHealth verdicts", () => {
     expect(h.detail).toMatch(/no active user owns this API key/i);
     expect(h.detail).toContain("/profile/api_access");
     // The version probe is independent of the key.
-    expect(h.loomio_version).toBe("3.8.1");
+    expect(h.loomio_version).toBe("3.9.0");
   });
 
   it("unreachable: 403 with an uncatalogued body → reason unrecognised_403; the body stays in detail only", async () => {
@@ -297,6 +301,68 @@ describe("checkLoomioHealth cache", () => {
   });
 });
 
+describe("probe deadline", () => {
+  // Loomio hangs: neither request ever answers. The mock honours only
+  // the abort signal the client attaches, so the probe can settle
+  // exactly one way — by its own deadline firing.
+  function hangUntilAborted(): AbortSignal[] {
+    const signals: AbortSignal[] = [];
+    vi.mocked(fetch).mockImplementation(
+      (_url, opts) =>
+        new Promise((_resolve, reject) => {
+          const signal = (opts as { signal?: AbortSignal } | undefined)?.signal;
+          if (!signal) {
+            reject(new Error("expected an abort signal on every probe request"));
+            return;
+          }
+          signals.push(signal);
+          signal.addEventListener("abort", () =>
+            reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })),
+          );
+        }),
+    );
+    return signals;
+  }
+
+  it("runs BOTH probe requests under HEALTH_PROBE_TIMEOUT_MS (8 s), not the tool calls' 60 s, and reports the hang as unreachable/timeout", async () => {
+    // 2026-10-01: Loomio hung ~2 min; with the 60 s deadline /health
+    // itself hung until the platform answered 504 and the uptime check
+    // had long given up. The probe must settle on its own, early.
+    vi.useFakeTimers();
+    const signals = hangUntilAborted();
+    let settled: LoomioHealth | undefined;
+    const probe = checkLoomioHealth().then((h) => {
+      settled = h;
+      return h;
+    });
+
+    await vi.advanceTimersByTimeAsync(HEALTH_PROBE_TIMEOUT_MS - 1);
+    expect(signals).toHaveLength(2);
+    expect(signals.map((s) => s.aborted)).toEqual([false, false]);
+    expect(settled).toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(1);
+    const h = await probe;
+    // Both signals fired at 8 s: had the version probe kept the 60 s
+    // deadline, Promise.all would still be waiting on it here.
+    expect(signals.map((s) => s.aborted)).toEqual([true, true]);
+    expect(h.key_status).toBe("unreachable");
+    expect(h.reason).toBe("timeout");
+    expect(h.detail).toMatch(/GET \/b2\/groups failed: Loomio API request timed out after 8s/);
+    expect(h.detail).not.toMatch(/60s/);
+    expect(h.loomio_version).toBeNull();
+
+    const auth = stderrEvents().filter((e) => e["event"] === "loomio.auth");
+    expect(auth).toHaveLength(1);
+    expect(auth[0]).toMatchObject({ key_status: "unreachable", reason: "timeout" });
+    expect(auth[0]).not.toHaveProperty("detail");
+  });
+
+  it("HEALTH_PROBE_TIMEOUT_MS is 8 s: under an uptime checker's ~10 s patience, above two quick GETs", () => {
+    expect(HEALTH_PROBE_TIMEOUT_MS).toBe(8_000);
+  });
+});
+
 describe("forced events", () => {
   it("emits loomio.auth on the first result and on every key_status change, without verbose logging", async () => {
     mockRoutes({ "/b2/groups": { status: 200, body: {} }, "/v1/boot/version": VERSION_OK });
@@ -309,7 +375,7 @@ describe("forced events", () => {
 
     const auth = stderrEvents().filter((e) => e["event"] === "loomio.auth");
     expect(auth.map((e) => e["key_status"])).toEqual(["valid", "rejected"]);
-    expect(auth[0]).toMatchObject({ loomio_version: "3.8.1" });
+    expect(auth[0]).toMatchObject({ loomio_version: "3.9.0" });
     expect(auth[0]).not.toHaveProperty("reason");
     // A closed-vocabulary reason, never the free-text detail: the event
     // is forced (cannot be switched off) and detail may quote upstream text.
@@ -325,19 +391,19 @@ describe("forced events", () => {
   it("emits loomio.version_drift once when major.minor differs from the tested version", async () => {
     mockRoutes({
       "/b2/groups": { status: 200, body: {} },
-      "/v1/boot/version": { status: 200, body: { version: "3.9.0" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.10.0" } },
     });
     await checkLoomioHealth();
     await checkLoomioHealth({ force: true });
     const drift = stderrEvents().filter((e) => e["event"] === "loomio.version_drift");
     expect(drift).toHaveLength(1);
-    expect(drift[0]).toMatchObject({ loomio_version: "3.9.0", tested_loomio_version: "3.8.1" });
+    expect(drift[0]).toMatchObject({ loomio_version: "3.10.0", tested_loomio_version: "3.9.0" });
   });
 
   it("stays quiet on a patch-level difference or an unknown version", async () => {
     mockRoutes({
       "/b2/groups": { status: 200, body: {} },
-      "/v1/boot/version": { status: 200, body: { version: "3.8.7" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.9.7" } },
     });
     await checkLoomioHealth();
     resetHealthForTests();

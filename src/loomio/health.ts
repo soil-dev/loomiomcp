@@ -14,7 +14,8 @@
  * forced `loomio.auth` log event) so an external uptime check notices
  * in minutes.
  *
- * What it does. Two GETs, in parallel:
+ * What it does. Two GETs, in parallel, each under the probe's own 8 s
+ * deadline (`HEALTH_PROBE_TIMEOUT_MS`, not the tool calls' 60 s):
  *
  *   GET /b2/groups (authenticated)  — Loomio's `GroupsController#index`
  *     returns `current_user.groups` for any active key holder, even one
@@ -30,7 +31,7 @@
  *     `exclude_types=tag translation` (the groups read profile) so the
  *     once-a-minute probe does not haul tag and translation side-loads
  *     it never reads.
- *   GET /v1/boot/version (public, no credential) — `{ "version": "3.8.1" }`.
+ *   GET /v1/boot/version (public, no credential) — `{ "version": "3.9.0" }`.
  *     Failure here never affects `key_status`; it only leaves
  *     `loomio_version` null.
  *
@@ -86,6 +87,27 @@ export { getCachedGroupsIndex, getCachedHealth, getFreshGroupsIndex, HEALTH_CACH
 export const HEALTH_PROBE_PATH = "/b2/groups";
 /** Public endpoint reporting the instance's Loomio version. */
 export const VERSION_PROBE_PATH = "/v1/boot/version";
+
+/**
+ * Deadline for each of the probe's two requests — 8 s, not the
+ * client's 60 s `REQUEST_TIMEOUT_MS`, which tool calls keep.
+ *
+ * Why. The probe exists to answer an external uptime check, and those
+ * checkers give up after ~10 s. The hosting platform in front of the
+ * connector has a request timeout of its own, often of the same order
+ * as the client deadline (60 s in the reference deployment). With a
+ * 60 s probe `/health` can therefore never report "unreachable" in
+ * time: Loomio hangs, the probe waits, the platform answers the
+ * checker 504 at its own limit — long after the checker stopped
+ * listening — and the forced `loomio.auth` "unreachable / timeout"
+ * event fires a minute late (2026-10-01: Loomio hung for ~2 min and
+ * /health went 504 instead of 503). 8 s turns an upstream hang into a
+ * prompt 503 plus the forced event, while still leaving a slow but
+ * working Loomio room to answer two small GETs. The 504 the client
+ * raises at this deadline maps to `reason: "timeout"` in
+ * `reasonForThrow` exactly as the 60 s one did.
+ */
+export const HEALTH_PROBE_TIMEOUT_MS = 8_000;
 
 let inflight: Promise<LoomioHealth> | undefined;
 let driftWarned = false;
@@ -182,7 +204,9 @@ async function probeKey(): Promise<KeyVerdict> {
   let status: number;
   let text: string;
   try {
-    ({ status, text } = await loomioGetRaw(HEALTH_PROBE_PATH, readParams("groups")));
+    ({ status, text } = await loomioGetRaw(HEALTH_PROBE_PATH, readParams("groups"), {
+      timeoutMs: HEALTH_PROBE_TIMEOUT_MS,
+    }));
   } catch (err) {
     // Network error, timeout, missing LOOMIO_API_KEY, invalid base URL —
     // none of these say anything about the key itself.
@@ -232,7 +256,9 @@ async function probeKey(): Promise<KeyVerdict> {
 
 async function probeVersion(): Promise<string | null> {
   try {
-    const { status, text } = await loomioGetPublic(VERSION_PROBE_PATH);
+    const { status, text } = await loomioGetPublic(VERSION_PROBE_PATH, undefined, {
+      timeoutMs: HEALTH_PROBE_TIMEOUT_MS,
+    });
     if (status !== 200) return null;
     const parsed: unknown = JSON.parse(text);
     const version =

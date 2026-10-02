@@ -169,7 +169,9 @@ accepts the connector's API key — `200 {"status":"ok","key_status":"valid",…
 or `503` with `key_status` `rejected` / `unreachable`. Point an uptime
 check at it with content match `"key_status":"valid"` (DEPLOY.md has the
 recommended setup); a rotated key is otherwise invisible until someone
-notices every call failing. The `check_connection` tool reports the
+notices every call failing. The probe behind the page runs under an
+8 s deadline, so a hung Loomio becomes a `503` from the connector
+before the checker gives up. The `check_connection` tool reports the
 same verdict to the AI caller.
 
 ## Auth
@@ -220,8 +222,10 @@ what.
 
 ## Loomio compatibility
 
-Tested against **Loomio 3.8.1** (`TESTED_LOOMIO_VERSION` in
-`src/version.ts`). Loomio publishes no API compatibility or deprecation
+Tested against **Loomio 3.9.0** (`TESTED_LOOMIO_VERSION` in
+`src/version.ts`; the b2 / b3 routes, the OpenAPI document and the
+permitted parameters are byte-identical to 3.8.1, against which every
+request shape was first verified). Loomio publishes no API compatibility or deprecation
 policy and ships tags often, so the connector reads the instance's
 version from the public `GET /api/v1/boot/version` at startup and logs a
 one-time `loomio.version_drift` warning when the `major.minor` differs;

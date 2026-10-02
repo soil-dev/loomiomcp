@@ -316,7 +316,7 @@ reads `get_user({id})` or `get_user({identity_type: "saml", uid: "…"})`
 and `list_users({is_admin: true})`. The reads return **email addresses**
 for any account on the instance, which is why they exist only on
 deployments where one organisation owns the whole Loomio instance. A
-`uid` containing a dot cannot be resolved on Loomio 3.8.1 — use the
+`uid` containing a dot cannot be resolved on Loomio 3.8.1 / 3.9.0 — use the
 numeric id.
 
 ## Drive the connector against a real Loomio from a shell
@@ -1032,7 +1032,7 @@ whole Loomio instance.
   is_admin, active, deactivated_at, identities[{identity_type, uid,
   email, name}]} for ANY account on the instance, member of the
   connector's groups or not, plus `resolved_by`. A `uid` containing a
-  dot (most emails) cannot be resolved on Loomio 3.8.1 — Rails reads the
+  dot (most emails) cannot be resolved on Loomio 3.8.1 / 3.9.0 — Rails reads the
   suffix as a format — so use the numeric id for those. 404 when nothing
   matches.
 - **`list_users({is_admin?})`** — 1 call (`GET /b3/users`, unpaginated,

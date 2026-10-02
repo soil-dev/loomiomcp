@@ -3,25 +3,37 @@
 Empirical / source-verified behaviour that informs the tool schemas.
 Update as we learn more.
 
-Unless a section says otherwise, "current" means **Loomio 3.8.1** (tag
-`v3.8.1`, 2026-09-18) — the release this connector is verified against
-(`TESTED_LOOMIO_VERSION` in `src/version.ts`). Facts are taken from
-Loomio's source at that tag: `config/routes.rb`,
+Unless a section says otherwise, "current" means **Loomio 3.9.0** (tag
+`v3.9.0`, 2026-09-23) — the release this connector is verified against
+(`TESTED_LOOMIO_VERSION` in `src/version.ts`). Facts were taken from
+Loomio's source at tag `v3.8.1` (2026-09-18) and re-checked at `v3.9.0`
+and master on 2026-10-02: the `namespace :b2` / `:b3` route blocks, the
+OpenAPI document and `permitted_params.rb` are byte-identical between
+the two tags, and the 3.8.1 → 3.9.0 diff touches no b2 / b3
+controller, `app/models/permitted_params.rb`, ability or b2-emitted
+serializer (its only serializers are `current_user` and `pending`;
+`GroupService.invite`, under `manage_memberships`, gains an optional
+`recipient_audience` that resolves to `User.none` when absent) — so
+every 3.8.1 citation below holds for 3.9.0
+(see the 3.9.0 row of the changes table). Files cited: `config/routes.rb`,
 `app/controllers/api/b2/*.rb` (`base_controller.rb`,
 `response_options.rb`, `threads_controller.rb`, `search_controller.rb`,
 `reports_controller.rb`, `groups_controller.rb`, the discussions / polls
-/ comments / memberships controllers), `app/controllers/permitted_params.rb`,
+/ comments / memberships controllers), `app/models/permitted_params.rb`,
 `app/controllers/api/b3/users_controller.rb`,
 `app/controllers/api/v1/snorlax_base.rb`, `app/serializers/*.rb`,
 `app/queries/topic_query.rb`, `app/services/participation_report_service.rb`,
 `app/services/thread_markdown_service.rb`, `app/services/poll_service.rb`,
 `app/models/ability/*.rb`, `app/models/poll.rb`, `config/poll_types.yml`,
 `test/controllers/api/b2/*_test.rb`, and the OpenAPI document at
-`docs/user_manual/integrations/api/openapi.yaml`. Where code and docs
+`docs/user_manual/integrations/api/openapi.yaml` (on master since
+c47d783cf, 2026-09-30: `docs/en/user_manual/integrations/api/openapi.yaml`,
+same bytes). Where code and docs
 disagree, code and tests win. Response **shapes** were additionally
 checked against sanitised live captures of every read endpoint from a
-3.8.1 instance (2026-09-20) and the write path against a sandbox group
-of the same instance (see "Verified live"). Sections marked
+3.8.1 instance (2026-09-20), re-run against the same instance on 3.9.0
+(2026-10-02, identical), and the write path against a sandbox group
+of the same instance while on 3.8.1 (see "Verified live"). Sections marked
 **historical** describe older Loomio behaviour and are kept so the
 connector's own history stays legible; they are not current guidance.
 
@@ -854,7 +866,7 @@ Loomio's error bodies since 3.1.1 also increment a Sentry
 `http.forbidden` metric with the CanCan action, which is why they carry
 the message.
 
-## Loomio 3.1 → 3.8 changes that matter (written 2026-09-20)
+## Loomio 3.1 → 3.9 changes that matter (written 2026-09-20, extended 2026-10-02)
 
 Dates are commit dates from Loomio's repository; "release" is the
 first tag containing the commit. Loomio publishes **no** API
@@ -885,13 +897,23 @@ deprecation or compatibility policy — its product changelog
 | 2026-09-17 | 3.8.0 | **Memberships**: any member lists the roster; emails admin/inviter only; **non-member → 200 empty**; `create` gated by `authorize_manage_group!` → `"User is not an admin"`. | `list_memberships` no longer 403s for role reasons; empty means "not a member". | **Done 0.0.11**: `scope.note`, descriptions |
 | 2026-09-17 | 3.8.0 | **Instance `is_admin` removed from every b2 authorization check.** | The "an `is_admin` user sees every group" claim is false. | **Done 0.0.11**: claim removed |
 | 2026-09-17 | 3.8.0 | `compact=1`, documented `exclude_types`, exact `meta.total` (omitted when undefined); `GET /api/b2/search` (typo-tolerant since 3.8.1); `/api/b2/chatbots`; OpenAPI 3.1 document in the repo. | Payload trimming; search tool. | **Done 0.0.12**: read profiles, `search_content`, `total` on every collection; chatbots deliberately not wrapped |
+| 2026-09-18 → 09-23 | 3.8.2, 3.9.0 | **No b2 / b3 API change.** The `namespace :b2` and `namespace :b3` blocks of `config/routes.rb` (16 and 21 lines), the OpenAPI document and `app/models/permitted_params.rb` are byte-identical to 3.8.1; the 3.9.0 diff (206 files, mostly sign-in / passkey / session code) touches no b2 / b3 controller, `app/models/permitted_params.rb`, ability or b2-emitted serializer (only `current_user` and `pending`); `GroupService.invite` (under `manage_memberships`, via b2 `memberships#create`) gains an optional `recipient_audience` that resolves to `User.none` when absent, so the call is unchanged in effect; `Stance.redeemable`, `TopicItemService.move`, `Membership#remove_admin!` (removed) and the passkey rate limits alter no b2 request or response. | None. `TESTED_LOOMIO_VERSION` → 3.9.0 so the drift warning stays quiet on 3.9.x. | **Done 0.0.14**: the 14 read tools re-run live on the 3.9.0 instance (27/27, shapes identical to the 3.8.1 captures); writes and b3 not re-run (unchanged controllers and permitted parameters) |
+| 2026-09-24 → 10-02 | master, **unreleased** (e96b61311) | **Vote weights and serializer trims.** `PollSerializer` drops `voting_system`, adds `result_heading_keys` and `weighted_voting` (917b2c2e4, c631bd475); `StanceSerializer` adds `weight`; poll `permitted_params` gain `weighted_voting`; user-scoped fields (`my_stance`, `current_user_followed`, …) are emitted only with a current user (7b6b52fdb); `threads#markdown` calls `authorize!(:export, thread)` with Topic `:export` = `can?(:show, topic)` (a117c62fa); `ThreadMarkdownService` (df28cf845) applies only the until-closed rule (`poll.results_available?`): an open `until_vote` poll's results are exported to every reader with `:show` on the thread, comments under votes of an open `until_closed` poll are omitted from the export and from the search index `/b2/search` reads, and replies to stances are no longer rejected (`Comment#parent_vote_results_visible_to_all` removed); its layout changes too (front matter gains `key`, `·`-joined H1, nested blockquotes, username fallback for nameless users); b2 `memberships#create` no longer calls `PollService.group_members_added`; OpenAPI moved to `docs/en/…` (c47d783cf, same bytes). | Already tolerant: `voting_system` is an optional passthrough read nowhere; new poll fields pass through on `get_poll`, `list_polls` rows and the write echoes (`shapePoll` removes a fixed deny-list) and are dropped on `list_thread_items` polls (`ITEM_POLL_FIELDS` allow-list); a stance `weight` is dropped everywhere (`STANCE_FIELDS`, `OWN_STANCE_FIELDS`); API-key requests always have a current user; a visible thread's markdown is still served (the new `authorize!(:export)` is `can?(:show)`) and passed through verbatim — `markdownHeading` still finds the first H1 — but `get_thread_markdown` will disclose an open `until_vote` poll's results to non-voters; newly added members are no longer auto-enrolled in open polls (Loomio-side). | **Watch**: re-verify when a tag ships it; decide whether `get_thread_markdown` should warn about or strip until_vote results; refresh the `get_thread_markdown` scope note (`MARKDOWN_SCOPE_NOTE`, `src/tools/threads.ts`) and HOWTO's front-matter list; consider exposing `weighted_voting` / `weight` then |
 
-## Verified live (2026-09-20, Loomio 3.8.1)
+## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0)
 
 Reads were captured with a non-admin key (roots and `meta.total`
 presence are what `tests/fixtures.ts` follows, anonymised); writes ran
 in a private sandbox group where the key's user is a plain member and
 every record was discarded afterwards.
+
+**2026-10-02, Loomio 3.9.0.** After the reference instance's 3.8.1 →
+3.9.0 upgrade (2026-09-23) the 14 read tools were re-run against it:
+27/27 checks passed with response shapes identical to the 3.8.1
+captures below. The write tools were **not** re-run; their request
+bodies target controllers and `permitted_params.rb` that are
+byte-identical between the two tags, and the sandbox results below
+stand as the write-path evidence.
 
 | Call | Result |
 |---|---|

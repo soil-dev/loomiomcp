@@ -113,10 +113,10 @@ Loomio still accept the connector's API key?
 ```json
 {
   "status": "ok",
-  "connector_version": "0.0.12",
+  "connector_version": "0.0.14",
   "key_status": "valid",
-  "loomio_version": "3.8.1",
-  "checked_at": "2026-09-20T10:00:00.000Z"
+  "loomio_version": "3.9.0",
+  "checked_at": "2026-10-02T10:00:00.000Z"
 }
 ```
 
@@ -135,6 +135,16 @@ Loomio still accept the connector's API key?
   per-IP rate limiter (same `MCP_HTTP_RATE_LIMIT_*` config as `/mcp`,
   separate bucket). The `check_connection` tool forces the same probe
   and reuses its groups body, so it costs the same request pair.
+- Each probe request runs under an **8 s deadline**
+  (`HEALTH_PROBE_TIMEOUT_MS`), not the 60 s every tool call keeps.
+  Uptime checkers give up after ~10 s, and a hosting platform's own
+  request timeout is often 60 s too, so a 60 s probe could never report
+  `unreachable` in time: on 2026-10-01 Loomio hung for ~2 minutes,
+  `/health` hung with it, the platform answered the checker **504** at
+  its own limit and the forced `loomio.auth` event fired a minute late.
+  With 8 s the page itself answers **503** `unreachable` (reason
+  `timeout`) promptly. Give the checker a request timeout of at least
+  10 s so it sees that 503 rather than its own timeout.
 - It exposes exactly the five fields above: no key material, no error
   detail (which could quote the base URL), no Loomio hostname, none of
   the groups the probe learned.
@@ -158,9 +168,10 @@ Loomio still accept the connector's API key?
 
 **Recommended monitoring.** Create an uptime check (Cloud Monitoring, or
 any external checker) against `https://<PUBLIC_BASE_URL>/health` every
-**5 minutes**, protocol HTTPS, expecting **HTTP 200** *and* a content
-match on `"key_status":"valid"`, with an alert policy that notifies a
-channel someone reads. Connector traffic is often too sparse for a
+**5 minutes**, protocol HTTPS, a request timeout of **10 s** (the probe
+answers within 8 s even when Loomio hangs), expecting **HTTP 200** *and*
+a content match on `"key_status":"valid"`, with an alert policy that
+notifies a channel someone reads. Connector traffic is often too sparse for a
 log-based error-rate alert to ever have enough samples; the active probe
 is what turns a silent 403 outage into an alert within minutes. As a
 second signal, alert on the forced log event `loomio.auth` with

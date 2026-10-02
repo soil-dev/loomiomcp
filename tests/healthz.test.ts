@@ -8,6 +8,8 @@
  * prove the route, headers and rate limiter are actually wired, and the
  * fully assembled `createApp` to prove the page survives its neighbours
  * (the OAuth router's unscoped `app.use`, the bearer-guarded /mcp).
+ * Plus the one timing contract the page has: a hung Loomio becomes a
+ * 503 within the probe's 8 s deadline, not the platform's 60 s 504.
  */
 
 import type { AddressInfo } from "node:net";
@@ -25,7 +27,7 @@ import {
   mountHealth,
   resolveHealthPath,
 } from "../src/http/health.js";
-import { resetHealthForTests } from "../src/loomio/health.js";
+import { HEALTH_PROBE_TIMEOUT_MS, resetHealthForTests } from "../src/loomio/health.js";
 import type { LoomioHealth } from "../src/loomio/health.js";
 import { VERSION } from "../src/version.js";
 
@@ -35,7 +37,7 @@ setupLoomioTest();
 function mockUpstream(
   groupsStatus: number,
   groupsBody: unknown,
-  version: unknown = { version: "3.8.1" },
+  version: unknown = { version: "3.9.0" },
 ) {
   vi.mocked(fetch).mockImplementation(async (input) => {
     const path = new URL(String(input)).pathname;
@@ -86,7 +88,7 @@ beforeEach(() => {
 afterEach(() => stderrSpy?.mockRestore());
 
 describe("healthzBody / healthzStatusCode", () => {
-  const base = { loomio_version: "3.8.1", checked_at: "2026-09-20T10:00:00.000Z" };
+  const base = { loomio_version: "3.9.0", checked_at: "2026-09-20T10:00:00.000Z" };
 
   it("valid → 200 ok", () => {
     const h: LoomioHealth = { key_status: "valid", ...base };
@@ -95,7 +97,7 @@ describe("healthzBody / healthzStatusCode", () => {
       status: "ok",
       connector_version: VERSION,
       key_status: "valid",
-      loomio_version: "3.8.1",
+      loomio_version: "3.9.0",
       checked_at: base.checked_at,
     });
   });
@@ -129,7 +131,7 @@ describe("healthzHandler", () => {
     await healthzHandler({} as express.Request, res as unknown as express.Response, () => {});
     expect(res.statusCode).toBe(200);
     expect(res.headers["Cache-Control"]).toBe("no-store");
-    expect(res.body).toMatchObject({ status: "ok", key_status: "valid", loomio_version: "3.8.1" });
+    expect(res.body).toMatchObject({ status: "ok", key_status: "valid", loomio_version: "3.9.0" });
   });
 
   it("answers 503 when the key is rejected, with the body an uptime check can match on", async () => {
@@ -154,6 +156,46 @@ describe("healthzHandler", () => {
       loomio_version: null,
     });
     expect(res.body).not.toHaveProperty("detail");
+  });
+
+  it("answers 503 unreachable within HEALTH_PROBE_TIMEOUT_MS when Loomio hangs — before a ~10 s uptime checker or the platform's 60 s request timeout gives up", async () => {
+    // The 2026-10-01 shape: Loomio accepts the connection and never
+    // answers. The page must settle by the probe's own 8 s deadline;
+    // with the 60 s tool deadline the platform answered 504 first and
+    // the checker never saw a 503.
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetch).mockImplementation(
+        (_url, opts) =>
+          new Promise((_resolve, reject) => {
+            (opts as { signal?: AbortSignal } | undefined)?.signal?.addEventListener("abort", () =>
+              reject(
+                Object.assign(new Error("This operation was aborted"), { name: "AbortError" }),
+              ),
+            );
+          }),
+      );
+      const res = fakeRes();
+      const handled = healthzHandler(
+        {} as express.Request,
+        res as unknown as express.Response,
+        () => {},
+      );
+      await vi.advanceTimersByTimeAsync(HEALTH_PROBE_TIMEOUT_MS - 1);
+      expect(res.statusCode).toBe(0); // still waiting on Loomio, nothing sent yet
+      await vi.advanceTimersByTimeAsync(1);
+      await handled;
+      expect(res.statusCode).toBe(503);
+      expect(res.headers["Cache-Control"]).toBe("no-store");
+      expect(res.body).toMatchObject({
+        status: "degraded",
+        key_status: "unreachable",
+        loomio_version: null,
+      });
+      expect(res.body).not.toHaveProperty("detail");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -188,7 +230,7 @@ describe("GET /health mounted on Express", () => {
       status: "ok",
       connector_version: VERSION,
       key_status: "valid",
-      loomio_version: "3.8.1",
+      loomio_version: "3.9.0",
       checked_at: expect.any(String),
     });
   });

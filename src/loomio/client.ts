@@ -190,11 +190,11 @@ interface LoomioErrorBody {
  * text and lets each classifier decide how to parse it. Returns "" when
  * the body is unreadable (already consumed, aborted, …).
  */
-async function readErrorText(res: Response): Promise<string> {
+async function readErrorText(res: Response, timeoutMs: number): Promise<string> {
   try {
     return (await res.text()).trim();
   } catch (err) {
-    if (isAbortError(err)) timeoutError();
+    if (isAbortError(err)) timeoutError(timeoutMs);
     return "";
   }
 }
@@ -239,38 +239,58 @@ function formatErrorBody(text: string, statusText: string): string {
   return text ? clip(text) : statusText;
 }
 
+/**
+ * Deadline for a tool call's upstream request. Generous on purpose: a
+ * slow but working Loomio should finish a 50-row list or a thread
+ * export rather than be cut off, and the caller is an agent that can
+ * wait. A request that must answer FASTER than Loomio can fail passes
+ * its own `timeoutMs` — the key-health probe does (`HEALTH_PROBE_TIMEOUT_MS`
+ * in health.ts), because the uptime checker it serves gives up long
+ * before 60 s.
+ */
 const REQUEST_TIMEOUT_MS = 60_000;
 
 function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === "AbortError" || /aborted/i.test(err.message));
 }
 
-function timeoutError(): never {
+/**
+ * The 504 for a request that hit its deadline. Takes the deadline that
+ * actually applied: the probe's 8 s and a tool call's 60 s share this
+ * path, and a message claiming "60s" for a probe that gave up at 8 s
+ * would send an operator looking for the wrong hang.
+ */
+function timeoutError(timeoutMs: number): never {
   throw new LoomioApiError(
     504,
-    `Loomio API request timed out after ${REQUEST_TIMEOUT_MS / 1000}s. The Loomio API may be slow or hung; retry after a short wait.`,
+    `Loomio API request timed out after ${timeoutMs / 1000}s. The Loomio API may be slow or hung; retry after a short wait.`,
   );
 }
 
 interface FetchResult {
   res: Response;
   cleanup: () => void;
+  /** The deadline this request runs under, so a body-read abort reports the same figure as a connect abort. */
+  timeoutMs: number;
 }
 
 /**
- * Run `fetch` with a hard timeout. Any AbortError surfaced from
- * either the request itself or the subsequent body read maps to a
- * single 504 `LoomioApiError`. Caller owns calling `cleanup()` after
- * the response is consumed so a long-running body read can keep
- * holding the timer; if the timer fires, the body read also aborts.
+ * Run `fetch` with a hard timeout (`timeoutMs`, default
+ * `REQUEST_TIMEOUT_MS`). Any AbortError surfaced from either the
+ * request itself or the subsequent body read maps to a single 504
+ * `LoomioApiError` naming that deadline. Caller owns calling
+ * `cleanup()` after the response is consumed so a long-running body
+ * read can keep holding the timer; if the timer fires, the body read
+ * also aborts.
  */
 async function fetchWithTimeout(
   url: string,
   options: Parameters<typeof fetch>[1],
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<FetchResult> {
   const hasCallerSignal = !!options && (options as { signal?: AbortSignal }).signal !== undefined;
   const controller = hasCallerSignal ? undefined : new AbortController();
-  const timer = controller && setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = controller && setTimeout(() => controller.abort(), timeoutMs);
   timer?.unref();
   const cleanup = () => {
     if (timer) clearTimeout(timer);
@@ -278,10 +298,10 @@ async function fetchWithTimeout(
   const opts = controller ? { ...(options ?? {}), signal: controller.signal } : (options ?? {});
   try {
     const res = await fetch(url, opts);
-    return { res, cleanup };
+    return { res, cleanup, timeoutMs };
   } catch (err) {
     cleanup();
-    if (isAbortError(err)) timeoutError();
+    if (isAbortError(err)) timeoutError(timeoutMs);
     throw err;
   }
 }
@@ -353,7 +373,8 @@ async function fetchWithTimeout(
 //       HTML page from any reverse proxy lands here too.
 //
 // The catalogue is exact as of Loomio 3.8.1 (snorlax_base.rb,
-// authenticates_api_key.rb, b2/base_controller.rb, b2/memberships_controller.rb).
+// authenticates_api_key.rb, b2/base_controller.rb, b2/memberships_controller.rb)
+// and unchanged in 3.9.0 (none of those files is in the 3.8.1 → 3.9.0 diff).
 
 export interface ForbiddenContext {
   /** Redacted path of the failing request, for the message and to decide which raisers apply. */
@@ -749,9 +770,14 @@ function pathHintFor(url: string): string {
   }
 }
 
-async function throwForStatus(res: Response, url: string, method?: string): Promise<void> {
+async function throwForStatus(
+  res: Response,
+  url: string,
+  method: string | undefined,
+  timeoutMs: number,
+): Promise<void> {
   if (res.ok) return;
-  const text = await readErrorText(res);
+  const text = await readErrorText(res, timeoutMs);
   const where = pathHintFor(url);
 
   if (res.status === 403) {
@@ -799,13 +825,14 @@ async function throwForStatus(res: Response, url: string, method?: string): Prom
  *     HTML 200 for every path) all land here. The message says what was
  *     received (clipped) instead of a bare parse error.
  */
-async function handleResponse<T>(res: Response, url: string, method?: string): Promise<T> {
-  await throwForStatus(res, url, method);
+async function handleResponse<T>(start: RequestStart): Promise<T> {
+  const { res, url, method, timeoutMs } = start;
+  await throwForStatus(res, url, method, timeoutMs);
   let text: string;
   try {
     text = await res.text();
   } catch (err) {
-    if (isAbortError(err)) timeoutError();
+    if (isAbortError(err)) timeoutError(timeoutMs);
     throw err;
   }
   if (text.trim() === "") return {} as T;
@@ -969,18 +996,20 @@ function authHeaders(auth: Auth): Record<string, string> {
   };
 }
 
-interface RequestStart {
-  res: Response;
-  cleanup: () => void;
+interface RequestStart extends FetchResult {
   startedAt: number;
   method: string;
   url: string;
 }
 
-async function doFetch(url: string, options: Parameters<typeof fetch>[1]): Promise<RequestStart> {
+async function doFetch(
+  url: string,
+  options: Parameters<typeof fetch>[1],
+  timeoutMs?: number,
+): Promise<RequestStart> {
   const startedAt = Date.now();
   const method = (options?.method as string | undefined) ?? "GET";
-  const first = await fetchWithTimeout(url, options);
+  const first = await fetchWithTimeout(url, options, timeoutMs);
   return { ...first, startedAt, method, url };
 }
 
@@ -1022,7 +1051,7 @@ export async function loomioGet<T>(path: string, params?: QueryParams): Promise<
   const url = buildUrl(path, params);
   const start = await doFetch(url, { headers: authHeaders(B2_AUTH) });
   try {
-    return await consumeBody(start, () => handleResponse<T>(start.res, start.url, start.method));
+    return await consumeBody(start, () => handleResponse<T>(start));
   } finally {
     start.cleanup();
   }
@@ -1032,6 +1061,17 @@ export interface RawResponse {
   status: number;
   /** Body as text, "" when unreadable. */
   text: string;
+}
+
+/**
+ * Per-call knobs for the raw GET primitives. `timeoutMs` replaces the
+ * 60 s tool-call deadline for callers whose consumer gives up sooner
+ * than Loomio can fail — the key-health probe behind `/health`, which
+ * an uptime checker abandons after ~10 s. Only the raw primitives take
+ * it: a tool call that wants to wait out a slow Loomio should.
+ */
+export interface RawGetOptions {
+  timeoutMs?: number;
 }
 
 async function drainText(res: Response): Promise<string> {
@@ -1053,11 +1093,17 @@ async function drainText(res: Response): Promise<string> {
  * it needs the status to decide valid/rejected AND the body to tell a
  * Loomio 403 from a CDN/WAF 403 that never reached Loomio. The body is
  * always drained so the socket frees and the standard `loomio.request`
- * observability event still fires.
+ * observability event still fires. `opts.timeoutMs` bounds the request
+ * (default: the 60 s tool-call deadline); a hit surfaces as the usual
+ * 504 `LoomioApiError`, naming the deadline that applied.
  */
-export async function loomioGetRaw(path: string, params?: QueryParams): Promise<RawResponse> {
+export async function loomioGetRaw(
+  path: string,
+  params?: QueryParams,
+  opts: RawGetOptions = {},
+): Promise<RawResponse> {
   const url = buildUrl(path, params);
-  const start = await doFetch(url, { headers: authHeaders(B2_AUTH) });
+  const start = await doFetch(url, { headers: authHeaders(B2_AUTH) }, opts.timeoutMs);
   try {
     return await consumeBody(start, async () => ({
       status: start.res.status,
@@ -1084,11 +1130,16 @@ export async function loomioGetStatus(path: string, params?: QueryParams): Promi
  * instance's version). Deliberately not sending the key means a probe
  * of a public endpoint can never leak the credential to an endpoint
  * that does not need it, and the result says nothing about the key.
- * Same timeout, User-Agent and `loomio.request` event as every other call.
+ * Same User-Agent and `loomio.request` event as every other call; same
+ * `opts.timeoutMs` as `loomioGetRaw` (default: the 60 s tool-call deadline).
  */
-export async function loomioGetPublic(path: string, params?: QueryParams): Promise<RawResponse> {
+export async function loomioGetPublic(
+  path: string,
+  params?: QueryParams,
+  opts: RawGetOptions = {},
+): Promise<RawResponse> {
   const url = buildUrl(path, params);
-  const start = await doFetch(url, { headers: baseHeaders() });
+  const start = await doFetch(url, { headers: baseHeaders() }, opts.timeoutMs);
   try {
     return await consumeBody(start, async () => ({
       status: start.res.status,
@@ -1191,7 +1242,7 @@ async function loomioWrite<T>(
     body: JSON.stringify(body ?? {}),
   });
   try {
-    return await consumeBody(start, () => handleResponse<T>(start.res, start.url, start.method));
+    return await consumeBody(start, () => handleResponse<T>(start));
   } finally {
     start.cleanup();
   }
@@ -1245,7 +1296,7 @@ export async function loomioGetB3<T>(path: string, params?: QueryParams): Promis
   const url = buildUrl(path, params);
   const start = await doFetch(url, { headers: authHeaders(B3_AUTH) });
   try {
-    return await consumeBody(start, () => handleResponse<T>(start.res, start.url, start.method));
+    return await consumeBody(start, () => handleResponse<T>(start));
   } finally {
     start.cleanup();
   }
@@ -1266,7 +1317,7 @@ export async function loomioPostB3<T>(path: string, params?: QueryParams): Promi
     body: "{}",
   });
   try {
-    return await consumeBody(start, () => handleResponse<T>(start.res, start.url, start.method));
+    return await consumeBody(start, () => handleResponse<T>(start));
   } finally {
     start.cleanup();
   }
