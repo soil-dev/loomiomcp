@@ -317,8 +317,8 @@ describe("createLoomioMcpServer — instructions and discovery order", () => {
     expect(tools.get("delete_poll")!.description).toMatch(/next full hour with update_poll/);
     expect(tools.get("delete_poll")!.description).toMatch(/no immediate close exists/);
     const field = (name: string, prop: string): string =>
-      (tools.get(name)!.inputSchema.properties?.[prop] as { description?: string }).description ??
-      "";
+      (tools.get(name)!.inputSchema.properties?.[prop] as { description?: string } | undefined)
+        ?.description ?? "";
     // The shared poll fields are described per tool where the rule differs.
     expect(field("create_poll", "closing_at")).toMatch(/Effectively REQUIRED/);
     expect(field("update_poll", "closing_at")).not.toMatch(/REQUIRED|draft/);
@@ -423,23 +423,24 @@ describe("createLoomioMcpServer — schema refinements run on tools/call", () =>
     ["update_poll", { id_or_key: 1, options: [] }, /options/],
   ];
 
-  it.each(
-    cases,
-  )("%s %j is refused with isError before any upstream request", async (name, args, message) => {
-    process.env["LOOMIO_API_KEY"] = "test-key";
-    try {
-      const { fetch } = await import("undici");
-      vi.mocked(fetch).mockReset();
-      const result = await callToolRaw(name, args);
-      expect(result.isError).toBe(true);
-      const text = result.content.map((c) => c.text ?? "").join("\n");
-      expect(text).toMatch(/Input validation error/);
-      expect(text).toMatch(message);
-      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
-    } finally {
-      delete process.env["LOOMIO_API_KEY"];
-    }
-  });
+  it.each(cases)(
+    "%s %j is refused with isError before any upstream request",
+    async (name, args, message) => {
+      process.env["LOOMIO_API_KEY"] = "test-key";
+      try {
+        const { fetch } = await import("undici");
+        vi.mocked(fetch).mockReset();
+        const result = await callToolRaw(name, args);
+        expect(result.isError).toBe(true);
+        const text = result.content.map((c) => c.text ?? "").join("\n");
+        expect(text).toMatch(/Input validation error/);
+        expect(text).toMatch(message);
+        expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+      } finally {
+        delete process.env["LOOMIO_API_KEY"];
+      }
+    },
+  );
 
   it("a valid input reaches the handler (positive control: the mocked fetch is called)", async () => {
     process.env["LOOMIO_API_KEY"] = "test-key";
