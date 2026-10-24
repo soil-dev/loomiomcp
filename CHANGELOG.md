@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.0.15 — 2026-10-24
+
+Dependency release: every dependency moved to its latest version,
+majors included. No behaviour change; the tools/list catalogue is
+byte-identical to 0.0.14 (35 631 B for the 24 full-mode tools).
+
+Security (runtime, all fixed by the updates below; `npm audit` and
+Dependabot are clean again):
+
+- `@modelcontextprotocol/sdk` ≤ 1.31.0 — GHSA-46jr-4wx8-v453 (high: one
+  request within the default size limit could exhaust memory during
+  validation), GHSA-22jm-h49p-29qw (high: experimental tasks not tied
+  to their session), GHSA-6prh-2h8m-c8cw (client transports followed
+  cross-origin redirects with headers), GHSA-rvq5-wwqv-78pq (server
+  bearer auth accepted tokens issued for another service). The last one
+  never applied here: the connector's own OAuth provider already binds
+  each access token to this server's resource (`assertClaimsResource`)
+  and signs it with a key no other service holds, so the SDK's new
+  opt-in `expectedResource` check is redundant and left unset.
+- Transitive: `body-parser` (high, compressed-body DoS), `hono`
+  (`serveStatic` double decoding), `fast-uri` (four URI parsing
+  issues), `ip-address` (quadratic zone-id matching); dev-only
+  `source-map-js`, `vite`, `@vitest/mocker`.
+
+Changed:
+
+- Runtime: `@modelcontextprotocol/sdk` 1.31.0 → 1.32.2, `express`
+  5.2.1 → 5.3.0, `express-rate-limit` 8.7.0 → 8.7.1, `undici` 8.11.2 →
+  8.12.3, `zod` 4.6.5 → 4.6.7.
+- Development (majors): `typescript` 6.0.3 → 7.0.2, `vitest` 4.1.11 →
+  5.0.5, `tsup` 8.5.1 → 9.0.0, `@types/node` 25.9.9 → 26.6.5,
+  `@biomejs/biome` 2.4.15 → 2.6.3 (`biome migrate`: config schema 2.6.3,
+  `recommended: true` → `preset: "recommended"`; one test fixed for the
+  new `noUnsafeOptionalChaining` finding). No source change was needed
+  for TypeScript 7, vitest 5 or tsup 9; the build output is the same
+  two ESM entries with the shebang on the stdio entry only.
+- `engines.node` `>=22` → `>=22.19.0`, the floor `undici` (a runtime
+  dependency) has required since 8.9; the container image builds on
+  `node:22-slim`.
+
+Verified: biome, tsc 7, 578 tests (vitest 5), tsup 9 build, `npm
+audit` 0. The built HTTP server passed the full 13-check production
+smoke test locally (open-DCR OAuth dance, forged-token and
+missing-bearer rejection, `tools/list` read-only, a real
+`list_discussions` round-trip, `/health`), and the read-only live
+harness passed 27/27 against the reference instance — which now runs
+Loomio **3.13.1**. Loomio 3.10–3.13 add b3 endpoints and page the b2
+groups and thread-items collections (50 per page by default); adapting
+to that is a separate release, so the tested version stays 3.9.0.
+
 ## 0.0.14 — 2026-10-02
 
 Maintenance release: verified against Loomio 3.9.0, a fast deadline for

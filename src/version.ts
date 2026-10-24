@@ -16,6 +16,6 @@
  * `major.minor` to this and logs a one-time `loomio.version_drift`
  * warning when they differ — a prompt to re-verify, not an error.
  */
-export const VERSION = "0.0.14";
+export const VERSION = "0.0.15";
 
 export const TESTED_LOOMIO_VERSION = "3.9.0";
