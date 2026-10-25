@@ -1,9 +1,11 @@
 /**
  * Group tools on Loomio 3.8's native GET /b2/groups (src/tools/groups.ts):
- * list_groups (one call, member groups ∪ their parents), get_group
- * (id / key / handle, hidden → 403 explained, unknown → 404 explained)
- * and check_connection (health probe + the groups body it already
- * fetched). Fixture shapes follow live 3.8.1 captures (tests/fixtures.ts).
+ * list_groups (one call per 500 groups — Loomio ≥ 3.11.1 pages the index
+ * — member groups ∪ their parents), get_group (id / key / handle,
+ * hidden → 403 explained, unknown → 404 explained) and check_connection
+ * (health probe + the groups body it already fetched, completed past
+ * the first page). Fixture shapes follow live 3.8.1 captures
+ * (tests/fixtures.ts) and the 3.13.1 paged-index shapes.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,17 +16,22 @@ import { resetHealthForTests } from "../src/loomio/health.js";
 import {
   ADA,
   EXAMPLE_ORG,
+  EXAMPLE_ORG_NON_MEMBER,
   FINANCE,
   groupRow,
   groupShowBody,
   groupsIndexBody,
+  manyGroups,
+  manyGroupsSideLoads,
   membershipRow,
+  OWN_MEMBERSHIPS,
   VOLUNTEERS,
 } from "./fixtures.js";
 import {
   expectBearerAuth,
   fetchCallsTo,
   mockFetch,
+  mockFetchPaged,
   mockFetchRoutes,
   setupLoomioTest,
 } from "./test-helpers.js";
@@ -33,7 +40,7 @@ vi.mock("undici", () => ({ fetch: vi.fn() }));
 setupLoomioTest();
 
 const GENERIC_403 = { error: "You are not authorized to access this page." };
-const VERSION_OK = { status: 200, body: { version: "3.9.0" } };
+const VERSION_OK = { status: 200, body: { version: "3.13.1" } };
 
 // check_connection forces the key-health probe, which emits a FORCED
 // `loomio.auth` event on its first result. Keep stderr quiet and reset
@@ -77,10 +84,10 @@ describe("input descriptions stay within the catalogue budget", () => {
 });
 
 describe("listGroups", () => {
-  it("issues ONE GET /b2/groups with the groups read profile (no compact, no probing)", async () => {
+  it("issues ONE GET /b2/groups with the groups read profile and Loomio's largest page (no compact, no probing)", async () => {
     mockFetch(200, groupsIndexBody());
     const { listGroups } = await import("../src/tools/groups.js");
-    await listGroups({});
+    const r = await listGroups({});
 
     expect(vi.mocked(fetch).mock.calls.length).toBe(1);
     const url = requestUrl();
@@ -90,6 +97,12 @@ describe("listGroups", () => {
     expect(url.searchParams.get("exclude_types")).toBe("tag translation");
     expect(url.searchParams.has("compact")).toBe(false);
     expect(url.searchParams.has("group_id")).toBe(false);
+    // Loomio ≥ 3.11.1 pages the index (default 50); the connector asks
+    // for the B2 maximum, explicitly from offset 0.
+    expect(url.searchParams.get("limit")).toBe("500");
+    expect(url.searchParams.get("offset")).toBe("0");
+    expect(r.scope.upstream_calls).toBe(1);
+    expect(r.scope).not.toHaveProperty("partial");
     expectBearerAuth(0, "test-key");
     for (const [u] of vi.mocked(fetch).mock.calls) expect(String(u)).not.toContain("/b2/polls");
   });
@@ -153,7 +166,7 @@ describe("listGroups", () => {
       200,
       groupsIndexBody({
         groups: [FINANCE],
-        parent_groups: [EXAMPLE_ORG],
+        parent_groups: [EXAMPLE_ORG_NON_MEMBER],
         memberships: [membershipRow({ id: 9012, group_id: 12, admin: true })],
         meta: { root: "groups", total: 1 },
       }),
@@ -253,6 +266,115 @@ describe("listGroups", () => {
     mockFetch(401, { error: "proxy auth required" });
     const { listGroups } = await import("../src/tools/groups.js");
     await expect(listGroups({})).rejects.toThrow(/401/);
+  });
+});
+
+// Loomio 3.11.1 (bc1a6cc02) pages the groups index: ordered by id, 50
+// per page by default, `limit` clamped to 500, `meta.total` the whole
+// count on every page. Before 3.11.1 one request returned every group.
+describe("listGroups on Loomio's paged groups index", () => {
+  it("walks 1 100 groups in three requests of limit=500 (offsets 0, 500, 1000) and returns them all", async () => {
+    const calls = mockFetchPaged({
+      "/b2/groups": {
+        root: "groups",
+        rows: manyGroups(1100),
+        sideLoads: manyGroupsSideLoads,
+        mode: "bounded",
+      },
+    });
+    const { listGroups } = await import("../src/tools/groups.js");
+    const r = await listGroups({});
+    expect(calls.map((c) => [c.limit, c.offset])).toEqual([
+      ["500", "0"],
+      ["500", "500"],
+      ["500", "1000"],
+    ]);
+    expect(r.total).toBe(1100);
+    expect(r.scope.member_groups).toBe(1100);
+    expect(r.returned).toBe(1100);
+    expect(r.scope.upstream_calls).toBe(3);
+    expect(r.scope).not.toHaveProperty("partial");
+    expect(r.scope.non_member_parents).toBe(0);
+    // Every group's own membership row arrived on its page and was merged.
+    expect(r.groups.every((g) => g.member && g.membership?.accepted === true)).toBe(true);
+    expect(new Set(r.groups.map((g) => g.id)).size).toBe(1100);
+  });
+
+  it("a server that ignores limit / offset (Loomio < 3.11.1) costs exactly one request", async () => {
+    const calls = mockFetchPaged({
+      "/b2/groups": {
+        root: "groups",
+        rows: manyGroups(620),
+        sideLoads: manyGroupsSideLoads,
+        mode: "legacy",
+      },
+    });
+    const { listGroups } = await import("../src/tools/groups.js");
+    const r = await listGroups({});
+    expect(calls).toHaveLength(1);
+    expect(r.scope.member_groups).toBe(620);
+    expect(r.total).toBe(620);
+    expect(r.scope.upstream_calls).toBe(1);
+  });
+
+  it("stops at MAX_GROUP_PAGES and says so: scope.partial plus a note, member_groups < total", async () => {
+    // A Loomio clamping pages to 50 would need 22 requests for 1 100 groups.
+    const calls = mockFetchPaged({
+      "/b2/groups": {
+        root: "groups",
+        rows: manyGroups(1100),
+        sideLoads: manyGroupsSideLoads,
+        mode: "bounded",
+        limitMax: 50,
+      },
+    });
+    const { listGroups, MAX_GROUP_PAGES } = await import("../src/tools/groups.js");
+    expect(MAX_GROUP_PAGES).toBe(20);
+    const r = await listGroups({});
+    expect(calls).toHaveLength(20);
+    expect(r.scope.partial).toBe(true);
+    expect(r.scope.member_groups).toBe(1000);
+    expect(r.total).toBe(1100);
+    expect(r.scope.note).toMatch(/PARTIAL \(scope\.partial\)/);
+  });
+
+  it("a member parent that a later page lists only under parent_groups (with its own membership row) is a member, not a non-member parent", async () => {
+    // The 3.13.1 shape of `?limit=2&offset=2`: two subgroups on the page,
+    // their parent — a member group on page 1 — only in parent_groups,
+    // its own membership row still side-loaded.
+    const { shapeGroupsIndex } = await import("../src/tools/groups.js");
+    const r = shapeGroupsIndex(
+      groupsIndexBody({
+        groups: [FINANCE, VOLUNTEERS],
+        parent_groups: [EXAMPLE_ORG],
+        memberships: OWN_MEMBERSHIPS,
+        meta: { root: "groups", total: 3 },
+      }),
+    );
+    const parent = r.groups.find((g) => g.id === 7)!;
+    expect(parent.member).toBe(true);
+    expect(parent.membership).toEqual({
+      accepted: true,
+      admin: false,
+      delegate: false,
+      title: null,
+    });
+    expect(r.scope.non_member_parents).toBe(0);
+    expect(r.scope).not.toHaveProperty("upstream_calls");
+
+    // No membership row on the page, but the serializer's own-membership
+    // id says member: still a member (summary unknown, so omitted).
+    const idOnly = shapeGroupsIndex(
+      groupsIndexBody({
+        groups: [FINANCE],
+        parent_groups: [EXAMPLE_ORG],
+        memberships: [membershipRow({ id: 9012, group_id: 12 })],
+        meta: { root: "groups", total: 2 },
+      }),
+    );
+    expect(idOnly.groups.find((g) => g.id === 7)).toMatchObject({ member: true });
+    expect(idOnly.groups.find((g) => g.id === 7)).not.toHaveProperty("membership");
+    expect(idOnly.scope.non_member_parents).toBe(0);
   });
 });
 
@@ -395,7 +517,7 @@ describe("checkConnection", () => {
 
     expect(r.connector_version).toBe(VERSION);
     expect(r.tested_loomio_version).toBe(TESTED_LOOMIO_VERSION);
-    expect(r.loomio_version).toBe("3.9.0");
+    expect(r.loomio_version).toBe("3.13.1");
     expect(r.key_status).toBe("valid");
     expect(r.checked_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(r.readonly).toBe(false);
@@ -431,7 +553,7 @@ describe("checkConnection", () => {
         status: 200,
         body: groupsIndexBody({
           groups: [FINANCE],
-          parent_groups: [EXAMPLE_ORG],
+          parent_groups: [EXAMPLE_ORG_NON_MEMBER],
           memberships: [membershipRow({ id: 9012, group_id: 12 })],
           meta: { root: "groups", total: 1 },
         }),
@@ -546,7 +668,9 @@ describe("checkConnection", () => {
       /LOOMIO_B3_API_KEY is set but LOOMIO_MCP_READONLY is also set: NO b3 tools/,
     );
     expect(notes).not.toMatch(/are registered\./);
-    expect(notes).toMatch(/reports version 3\.10\.0; this connector was verified against 3\.9\.0/);
+    expect(notes).toContain(
+      `reports version 3.10.0; this connector was verified against ${TESTED_LOOMIO_VERSION}`,
+    );
     expect(notes).not.toContain("b3-secret");
   });
 
@@ -575,6 +699,124 @@ describe("checkConnection", () => {
     const { checkConnection } = await import("../src/tools/groups.js");
     const r = await checkConnection({});
     expect(JSON.stringify(r)).not.toContain("ada@example.org");
+  });
+
+  describe("on Loomio's paged groups index (≥ 3.11.1)", () => {
+    it("completes the probe's first page of 50 with ONE continuation at offset=50&limit=500, and never writes the merged list into the health cache", async () => {
+      const calls = mockFetchPaged({
+        "/b2/groups": {
+          root: "groups",
+          rows: manyGroups(120),
+          sideLoads: manyGroupsSideLoads,
+          mode: "bounded",
+        },
+        "/v1/boot/version": VERSION_OK,
+      });
+      const { checkConnection } = await import("../src/tools/groups.js");
+      const { getCachedGroupsIndex } = await import("../src/loomio/health.js");
+      const r = await checkConnection({});
+      // The probe sends no window (Loomio's default page of 50); the
+      // continuation starts where it ended.
+      expect(calls.map((c) => [c.limit, c.offset])).toEqual([
+        [null, null],
+        ["500", "50"],
+      ]);
+      expect(r.groups).toHaveLength(120);
+      expect(r.groups_total).toBe(120);
+      expect(r).not.toHaveProperty("groups_partial");
+      expect(r.notes.join(" ")).not.toMatch(/groups_partial/);
+      expect(r.user?.id).toBe(501);
+      // The cache still holds exactly what the probe received.
+      expect(getCachedGroupsIndex()?.groups).toHaveLength(50);
+    });
+
+    it("50 groups or fewer: no continuation at all (the probe page is complete)", async () => {
+      const calls = mockFetchPaged({
+        "/b2/groups": {
+          root: "groups",
+          rows: manyGroups(50),
+          sideLoads: manyGroupsSideLoads,
+          mode: "bounded",
+        },
+        "/v1/boot/version": VERSION_OK,
+      });
+      const { checkConnection } = await import("../src/tools/groups.js");
+      const r = await checkConnection({});
+      expect(calls).toHaveLength(1);
+      expect(r.groups).toHaveLength(50);
+    });
+
+    it("older Loomio returns every group to the probe: no continuation", async () => {
+      const calls = mockFetchPaged({
+        "/b2/groups": {
+          root: "groups",
+          rows: manyGroups(120),
+          sideLoads: manyGroupsSideLoads,
+          mode: "legacy",
+        },
+        "/v1/boot/version": VERSION_OK,
+      });
+      const { checkConnection } = await import("../src/tools/groups.js");
+      const r = await checkConnection({});
+      expect(calls).toHaveLength(1);
+      expect(r.groups).toHaveLength(120);
+    });
+
+    it("a failed continuation returns the probe's page flagged groups_partial with a fixed note — never an error, never upstream text", async () => {
+      mockFetchPaged({
+        "/b2/groups": {
+          root: "groups",
+          rows: manyGroups(120),
+          sideLoads: manyGroupsSideLoads,
+          mode: "bounded",
+          override: (call) =>
+            call.offset === null
+              ? undefined
+              : { status: 500, body: { error: "upstream exploded at db-7.internal" } },
+        },
+        "/v1/boot/version": VERSION_OK,
+      });
+      const { checkConnection } = await import("../src/tools/groups.js");
+      const r = await checkConnection({});
+      expect(r.key_status).toBe("valid");
+      expect(r.groups_partial).toBe(true);
+      expect(r.groups).toHaveLength(50);
+      expect(r.groups_total).toBe(120);
+      const notes = r.notes.join(" ");
+      expect(notes).toMatch(/Only the first 50 of 120 member groups are listed \(groups_partial\)/);
+      expect(notes).not.toContain("db-7.internal");
+    });
+
+    it("a member parent that the page lists only under parent_groups is member_state 'member' (or 'pending'), not 'parent'", async () => {
+      const { shapeConnectionGroups } = await import("../src/tools/groups.js");
+      const shaped = shapeConnectionGroups(
+        groupsIndexBody({
+          groups: [FINANCE],
+          parent_groups: [EXAMPLE_ORG],
+          memberships: OWN_MEMBERSHIPS,
+          meta: { root: "groups", total: 3 },
+        }),
+      );
+      expect(shaped.groups.map((g) => [g.id, g.member_state])).toEqual([
+        [7, "member"],
+        [12, "member"],
+      ]);
+      const pending = shapeConnectionGroups(
+        groupsIndexBody({
+          groups: [FINANCE],
+          parent_groups: [EXAMPLE_ORG],
+          memberships: [
+            membershipRow({ id: 9012, group_id: 12 }),
+            membershipRow({ id: 9007, group_id: 7, accepted_at: null, admin: true }),
+          ],
+          meta: { root: "groups", total: 2 },
+        }),
+      );
+      expect(pending.groups.find((g) => g.id === 7)).toMatchObject({
+        member_state: "pending",
+        admin: true,
+      });
+    });
   });
 
   it("shapes a group with no handle to a /g/{key} url and tolerates a missing users root", async () => {

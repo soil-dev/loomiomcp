@@ -30,7 +30,15 @@
  *     exactly that list and has just paid for it. The request sends
  *     `exclude_types=tag translation` (the groups read profile) so the
  *     once-a-minute probe does not haul tag and translation side-loads
- *     it never reads.
+ *     it never reads — and deliberately NO `limit` / `offset`: since
+ *     Loomio 3.11.1 (bc1a6cc02) the index is paged, so the body is the
+ *     default first page (≤ 50 groups, ordered by id; `meta.total` still
+ *     counts them all), and that is all the probe needs. Its verdict
+ *     depends on the status alone, and `cachedOwnUserId` needs one own
+ *     membership row, which any non-empty page carries. check_connection
+ *     reads the remaining pages itself, into a copy, when it wants the
+ *     whole list; asking for 500 here would make the probe that guards
+ *     /health pay for a list it never reads.
  *   GET /v1/boot/version (public, no credential) — `{ "version": "3.9.0" }`.
  *     Failure here never affects `key_status`; it only leaves
  *     `loomio_version` null.
@@ -81,7 +89,13 @@ import {
 import type { GroupsIndexResponse } from "./types.js";
 
 export type { HealthReason, LoomioHealth };
-export { getCachedGroupsIndex, getCachedHealth, getFreshGroupsIndex, HEALTH_CACHE_TTL_MS };
+export {
+  cachedHealthAgeMs,
+  getCachedGroupsIndex,
+  getCachedHealth,
+  getFreshGroupsIndex,
+  HEALTH_CACHE_TTL_MS,
+};
 
 /** The authenticated probe target. See the module comment for why this endpoint. */
 export const HEALTH_PROBE_PATH = "/b2/groups";

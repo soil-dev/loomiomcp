@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   flatBody,
   LoomioApiError,
+  LoomioAuthError,
   loomioDelete,
   loomioPatch,
   loomioPost,
@@ -15,7 +16,7 @@ import { resolveThread, type ShapedComment, shapeComment } from "./threads.js";
 //
 // Comments are the one b2 resource whose body is FLAT
 // (`{discussion_id, body, body_format, parent_id?, parent_type?}`), not
-// wrapped. `Api::B2::CommentsController#create` (Loomio 3.8.1):
+// wrapped. `Api::B2::CommentsController#create` (unchanged 3.8.1 → 3.13.1):
 //
 //   instantiate_resource                       # Comment.new(permitted `comment` hash)
 //   if params[:discussion_id] && resource.parent_id.blank?
@@ -24,19 +25,44 @@ import { resolveThread, type ShapedComment, shapeComment } from "./threads.js";
 //   end
 //   raise CanCan::AccessDenied unless resource.parent_id.present?
 //
-// The permitted `comment` hash is the one Rails' `wrap_parameters`
-// builds from the top-level keys that are Comment COLUMNS — `body`,
-// `body_format`, `parent_id`, `parent_type` — while `discussion_id`,
-// not a column, stays at the top level where the controller reads it.
+// How the permitted `comment` hash is built depends on the version:
+//   - Loomio ≤ 3.11.x: Rails' `wrap_parameters` builds it from the
+//     top-level keys that are Comment COLUMNS — `body`, `body_format`,
+//     `parent_id`, `parent_type` — while `discussion_id`, not a column,
+//     stays at the top level where the controller reads it.
+//   - Loomio ≥ 3.12.0 (`wrap_parameters false`, e5bd13dfc): the flat
+//     top-level hash IS the permitted hash, with `discussion_id` deleted
+//     from it for comments only (b2/base_controller.rb:46-48) — so the
+//     same flat body still works, but every OTHER top-level key, and any
+//     query parameter (Rails merges the two), is permit-checked and an
+//     unknown one answers 400. The body below therefore carries exactly
+//     the schema's five keys, and no read profile is ever sent with it.
 // Wrapping the body ourselves (`{comment: {…}}`) hides `discussion_id`
-// from the controller and answers 400 (verified live); form encoding
-// (the ≤ 3.1.2 workaround, NOTES-ON-LOOMIO-API.md Gotcha 2) also 400s
-// on 3.8.1 and is gone from the client. Proof of the flat JSON shape:
+// from the controller and answered 400 on 3.8.1 (verified live); form
+// encoding (the ≤ 3.1.2 workaround, NOTES-ON-LOOMIO-API.md Gotcha 2)
+// also 400s and is gone from the client. Proof of the flat JSON shape:
 // controller tests "create happy case", "create accepts a bearer token
 // with flat parameters", "update accepts a bearer token with flat
 // parameters" and "destroy soft deletes comment"
-// (test/controllers/api/b2/comments_controller_test.rb, 3.8.1) — all
-// posted `as: :json` with exactly these keys.
+// (test/controllers/api/b2/comments_controller_test.rb) — all posted
+// `as: :json` with exactly these keys — and, from 3.12,
+// "shared JSON handling preserves comment discussion context"
+// (test/integration/b2_poll_requests_test.rb:135-148).
+//
+// Two refusals changed meaning in 3.11 – 3.13, and `createComment`
+// explains both:
+//   - 404. Since 3.11.0 (ac5c1e044) `CommentService.create` raises
+//     `ParentDeleted` (a RecordNotFound) BEFORE authorizing when the
+//     parent — discussion, comment, poll, stance or outcome — does not
+//     exist or is soft-deleted. Before that a missing parent failed in
+//     the ability check.
+//   - 403 on a reply to a VOTE. Since 3.13.0 (11e5187e6)
+//     `Comment#parent_allows_replies?` (comment.rb:124-126) is false for
+//     `parent_type: 'Stance'` while the stance's poll is open with
+//     `hide_results: until_closed` (`results_available?`), and
+//     `Ability::Comment :create` requires it (ability/comment.rb:9): the
+//     usual "Not authorized to create Comment." with nothing else to go
+//     on. Replying to the poll itself is allowed.
 //
 // Replies. A comment's parent is polymorphic (`belongs_to :parent,
 // polymorphic: true`): the discussion for a top-level comment, another
@@ -152,11 +178,58 @@ export async function createComment(
   } else {
     discussionId = input.discussion_id;
   }
-  const resp = await loomioPost<CommentsResponse>(
-    "/b2/comments",
-    flatBody({ ...input, discussion_id: discussionId }),
-  );
+  // Exactly the five schema keys (see the module note: from Loomio 3.12
+  // any other top-level key answers 400). zod has already stripped
+  // unknown input keys; `flatBody` drops the undefined ones.
+  const body = flatBody({
+    discussion_id: discussionId,
+    parent_id: input.parent_id,
+    parent_type: input.parent_type,
+    body: input.body,
+    body_format: input.body_format,
+  });
+  let resp: CommentsResponse;
+  try {
+    resp = await loomioPost<CommentsResponse>("/b2/comments", body);
+  } catch (err) {
+    explainCreateRefusal(err, input.parent_type);
+  }
   return shapeCommentWrite(resp, "POST /b2/comments");
+}
+
+/**
+ * The two create refusals whose Loomio text says nothing useful (see
+ * the module note): a 404 for a missing or soft-deleted parent, and a
+ * 403 on a reply to a vote whose poll still hides results until it
+ * closes. Everything else — including every other 403, whose cause the
+ * client already classified — passes through untouched.
+ */
+function explainCreateRefusal(err: unknown, parentType: string | undefined): never {
+  if (err instanceof LoomioApiError && err.status === 404) {
+    throw new LoomioApiError(
+      404,
+      "Loomio answered 404 for POST /b2/comments: the target discussion, comment, poll, stance or " +
+        "outcome does not exist or was soft-deleted (Loomio ≥ 3.11 refuses a reply to a deleted " +
+        "item with 404 before checking permissions). Check the id and parent_type; nothing was " +
+        "created.",
+    );
+  }
+  if (
+    err instanceof LoomioAuthError &&
+    err.status === 403 &&
+    err.kind === "not_authorized" &&
+    parentType === "Stance"
+  ) {
+    throw new LoomioAuthError(
+      `${err.message} With parent_type 'Stance' the likely cause: Loomio ≥ 3.13 refuses replies to ` +
+        "a VOTE while its poll is open and hides results until closing (hide_results " +
+        "'until_closed'). Reply to the poll instead (parent_type 'Poll', parent_id = the poll id), " +
+        "or wait for it to close.",
+      403,
+      "not_authorized",
+    );
+  }
+  throw err;
 }
 
 // ── update_comment ──────────────────────────────────────────────────────────
@@ -165,9 +238,11 @@ export async function createComment(
 // id only; comments have no short key) → `CommentService.update(comment:,
 // params: resource_params, actor:)`, which stamps `edited_at`,
 // re-validates and bumps `versions_count`. Body FLAT `{body,
-// body_format}` (wrap_parameters wraps both columns). Proof: controller
-// test "update accepts a bearer token with flat parameters" (3.8.1,
-// `as: :json`); also verified live (200, versions_count 1 → 2).
+// body_format}`: on ≤ 3.11 wrap_parameters wraps both columns, on ≥ 3.12
+// the flat hash is permitted as is (and an extra key would 400). Proof:
+// controller test "update accepts a bearer token with flat parameters"
+// (`as: :json`, 3.8.1 and 3.13.1); also verified live on 3.8.1 (200,
+// versions_count 1 → 2).
 // Authorization (`:update`, app/models/ability/comment.rb): comment
 // kept, thread not locked, and EITHER the user is the author, a thread
 // member and the group has `members_can_edit_comments`, OR the user is a

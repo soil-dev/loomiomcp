@@ -2,7 +2,7 @@
  * Poll result visibility, applied CLIENT-SIDE because Loomio's b2 API
  * does not fully apply it for an API user.
  *
- * Loomio's rule (app/models/poll.rb, 3.8.1):
+ * Loomio's rule (app/models/poll.rb, unchanged 3.8.1 → 3.13.1, :681-688):
  *
  *   results_available?          = hide_results != 'until_closed' || closed_at.present?
  *   results_visible?(voted:)    = results_available? &&
@@ -28,11 +28,24 @@
  * only so the output carries a uniform `results_visible` /
  * `results_hidden_reason` pair whichever setting hid them.
  *
- * Anonymous polls (`anonymous: true`, voting_system `anonymous_ballot`)
- * never expose voter identities on any path: stances carry
- * `participant_id: null` and `include_my_stance?` is false. Nothing
- * here needs to — or can — de-anonymise them, and callers must not try
- * to infer voters from anything else in the payload.
+ * Anonymous polls (`anonymous: true`) never expose voter identities on
+ * any path: their ballots are separate records the b2 API does not
+ * serialize, so such a poll has no stances at all, and
+ * `include_my_stance?` is false (Loomio ≤ 3.9 marked them
+ * `voting_system: anonymous_ballot`; 3.10 removed that field,
+ * 917b2c2e4). Nothing here needs to — or can — de-anonymise them, and
+ * callers must not try to infer voters from anything else in the
+ * payload.
+ *
+ * Loomio's own Markdown export is the one b2 read the connector cannot
+ * gate field by field: since 3.10 (df28cf845) ThreadMarkdownService
+ * decides with `poll.results_available?` alone
+ * (thread_markdown_service.rb:213-215, test "until vote exports include
+ * votes and replies for non-voters and voters"), so an open `until_vote`
+ * poll's every vote and results table are in the document whoever reads
+ * it. get_thread_markdown therefore REFUSES such a thread
+ * (`VisibilityRefusalError`, `hiddenUntilVote`) rather than hand out
+ * what list_thread_items and get_poll withhold.
  */
 
 import type { LoomioPoll, LoomioStance } from "./types.js";
@@ -73,6 +86,16 @@ export function pollResultsVisible(
  * Participation counts (`voters_count`, `decided_voters_count`,
  * `undecided_voters_count`, `cast_stances_pct`) are not results — Loomio
  * shows them under every setting — and stay.
+ *
+ * Re-checked at 3.13.1: PollSerializer still gates exactly these four
+ * on `results_visible?` = `results_available?`
+ * (poll_serializer.rb:112-114, 197-215). The 3.10–3.13 additions are not
+ * results: `quorum_count` / `quorum_votes_required` / `quorum_reached`
+ * and the participation counts are gated by `participation_visible?`
+ * (`!anonymous? || closed?`, :116-118) — hidden on an open anonymous
+ * poll whatever `hide_results` says — and `weighted_voting` /
+ * `result_heading_keys` describe the poll, not its votes. So the list is
+ * unchanged.
  */
 export const HIDDEN_RESULT_FIELDS = [
   "results",
@@ -132,6 +155,85 @@ export function ownStanceFor(
   if (opts.showRoot) return forPoll[0];
   if (opts.ownUserId === undefined) return undefined;
   return forPoll.find((s) => s.participant_id === opts.ownUserId);
+}
+
+/**
+ * True when Loomio's Markdown export (≥ 3.10) would print what this
+ * poll hides from the connector's user: the poll is OPEN — opened (a
+ * draft or scheduled poll, `opened_at: null`, has no votes to leak;
+ * an absent field counts as opened) and not closed — and hides its
+ * results until the user votes, and `ownStance` says the user has not
+ * voted. `until_closed` is not included: the export hides those itself
+ * (`results_available?`). get_thread_markdown refuses a thread holding
+ * such a poll.
+ */
+export function hiddenUntilVote(
+  poll: Pick<LoomioPoll, "hide_results" | "closed_at" | "opened_at">,
+  ownStance?: OwnStance,
+): boolean {
+  return poll.opened_at !== null && pollResultsVisible(poll, ownStance).reason === "until_vote";
+}
+
+/** What a refusal names about each poll it was refused for. */
+export interface RefusedPoll {
+  id: number;
+  key?: string | null;
+  title?: string | null;
+}
+
+/**
+ * get_thread_markdown's refusal: the thread holds an open `until_vote`
+ * poll the connector's user has not voted in (or the connector could not
+ * check every poll), and Loomio's export would print its votes. Thrown
+ * BEFORE the `/markdown` request, so no such document is ever fetched.
+ * Not a LoomioApiError: Loomio answered fine; the connector declines.
+ */
+export class VisibilityRefusalError extends Error {
+  constructor(
+    message: string,
+    /** The polls the refusal names; empty when the check itself could not finish. */
+    public readonly polls: readonly RefusedPoll[] = [],
+  ) {
+    super(message);
+    this.name = "VisibilityRefusalError";
+  }
+
+  /** Refused for `polls`: open, results hidden until the user votes, user has not voted. */
+  static untilVote(topicId: number, polls: readonly RefusedPoll[]): VisibilityRefusalError {
+    const named = polls
+      .map((p) => {
+        const key = p.key ? ` (key ${p.key})` : "";
+        const title = p.title ? ` "${p.title}"` : "";
+        return `poll ${p.id}${key}${title}`;
+      })
+      .join("; ");
+    return new VisibilityRefusalError(
+      `get_thread_markdown refused for topic_id ${topicId}: the thread holds an open poll that hides ` +
+        `its results until the connector's user votes, and that user has not voted — ${named}. ` +
+        "From Loomio 3.10 on, the Markdown export ignores 'hide results until vote' and would print " +
+        "every vote and the results table (the check is skipped only when a recent health probe " +
+        "reports Loomio 3.8 / 3.9, whose export still applies the rule). list_thread_items (same " +
+        "topic_id) and get_poll apply the rule: read the thread there. The block lifts when the " +
+        "poll closes or the connector's user votes.",
+      polls,
+    );
+  }
+
+  /** Refused because the guard's scan stopped at its page cap before reading every item. */
+  static unverified(
+    topicId: number,
+    scanned: number,
+    total: number | null,
+  ): VisibilityRefusalError {
+    const of = total !== null ? ` of ${total}` : "";
+    return new VisibilityRefusalError(
+      `get_thread_markdown refused for topic_id ${topicId}: could not verify that the thread holds no ` +
+        "open poll hiding its results until the connector's user votes — it is too long to check " +
+        `(${scanned}${of} items read). From Loomio 3.10 on, the Markdown export ignores 'hide ` +
+        "results until vote', so an unchecked thread is not exported. Read it with list_thread_items " +
+        "(same topic_id), which applies the rule to every poll.",
+    );
+  }
 }
 
 /** StanceSerializer fields gated by its `include_results?`. */

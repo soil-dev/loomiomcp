@@ -42,8 +42,11 @@ import {
 //
 // Loomio 3.8 keeps a thread's counters on the side-loaded `topics[]`
 // row (TopicSerializer), not on the discussion: items_count,
-// replies_count, last_activity_at, locked_at, pinned_at, tags,
-// members_count, seen_by_count, active/closed_polls_count. Every read
+// replies_count, last_activity_at, locked_at, pinned_at, tags (since
+// 3.13 the union over every tagged contribution, flagged by
+// has_tagged_replies), seen_by_count, active_polls_count, and on
+// Loomio ≤ 3.10 also members_count and closed_polls_count (3.11.0
+// removed both, 79280ee7a). Every read
 // here therefore keeps the `topics` root (the `list` / `show` read
 // profiles name the side-loads to drop instead of sending `compact=1`,
 // which would drop it) and folds those fields onto the discussion via
@@ -116,7 +119,7 @@ export const getDiscussionSchema = z.object({
   include_items: z
     .boolean()
     .optional()
-    .describe("Also embed the thread's items as `thread_items` (+1 call)."),
+    .describe("Also embed the thread's items as `thread_items` (+1 call per 500 items)."),
   items_limit: z
     .number()
     .int()
@@ -292,17 +295,30 @@ export async function listDiscussions(
 
 // ── create_discussion ───────────────────────────────────────────────────────
 //
-// Body: NESTED `{ discussion: {…} }`. Loomio 3.8.1's
+// Body: NESTED `{ discussion: {…} }` — the cross-version shape.
 // `Api::B2::BaseController#permitted_params` takes `params[:discussion]`
-// when present; without it Rails' `wrap_parameters` builds that hash
-// from the top-level keys that are Discussion COLUMNS — and `group_id`,
-// `private`, `recipient_*`, `tags` are not columns, so a flat JSON body
-// silently loses them (see `nestedBody` in src/loomio/client.ts).
-// `DiscussionService.create` reads `recipient_user_ids` /
-// `recipient_emails` / `recipient_audience` from the permitted hash, so
-// they belong inside the wrapper too. Every key below is in
-// `PermittedParams#discussion_attributes`; anything else would 400
-// (`action_on_unpermitted_parameters = :raise`).
+// verbatim whenever it is present. Without it, Loomio ≤ 3.11.x let
+// Rails' `wrap_parameters` build that hash from the top-level keys that
+// are Discussion COLUMNS — and `group_id`, `private`, `recipient_*`,
+// `tags` are not columns, so a flat JSON body silently lost them; Loomio
+// ≥ 3.12.0 (`wrap_parameters false`, e5bd13dfc) takes a flat body whole
+// instead, but the nested one works on both sides of that change (see
+// "Write bodies" in src/loomio/client.ts). `DiscussionService.create`
+// reads `recipient_user_ids` / `recipient_emails` / `recipient_audience`
+// from the permitted hash, so they belong inside the wrapper too. Every
+// key below is in `PermittedParams#discussion_attributes`; anything else
+// would 400 (`action_on_unpermitted_parameters = :raise`).
+//
+// `tags` the user may not CREATE (a name the group's tag list lacks,
+// from a user who is neither a group / parent admin nor in a group with
+// `members_can_create_tags`): Loomio ≥ 3.13.0 drops them SILENTLY
+// (`TagService.permitted_tag_names`, 5934ab182) and creates the thread
+// with the rest; Loomio ≤ 3.12 refused the whole create with a bare
+// CanCan::AccessDenied (`TagService.authorize_create_tag_names!`) — the
+// generic 403 body, which the client's classifier names as a possible
+// tag refusal on this POST. The connector does not compare the echo
+// with the request: no upstream test shows the create echo carrying the
+// applied tags, so a mismatch could not be told from a shape change.
 //
 // `private` is sent only when the caller sets it. Loomio's own default
 // applies otherwise (`TopicService.private_default`: false for a
@@ -426,7 +442,8 @@ export async function createDiscussion(
 //     pinned_at) reach `discussion.topic.update!`. `group_id` and
 //     `tags` are pulled out too and then DROPPED — a discussion cannot
 //     be moved through this route, and tags sent here are a silent
-//     no-op in 3.8.1, which is why neither is offered below.
+//     no-op (3.8.1 through 3.13.1: `TOPIC_ATTRS_UPDATE` still excludes
+//     both), which is why neither is offered below.
 //   - the rest goes to the discussion; `recipient_*` add readers
 //     (`TopicService.add_users`), and a present `recipient_message`
 //     creates a `discussion_edited` thread item and notifies them.

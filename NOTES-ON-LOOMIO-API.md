@@ -3,9 +3,18 @@
 Empirical / source-verified behaviour that informs the tool schemas.
 Update as we learn more.
 
-Unless a section says otherwise, "current" means **Loomio 3.9.0** (tag
-`v3.9.0`, 2026-09-23) — the release this connector is verified against
-(`TESTED_LOOMIO_VERSION` in `src/version.ts`). Facts were taken from
+Unless a section says otherwise, "current" means **Loomio 3.13.1** (tag
+`v3.13.1`) — the release this connector is verified against since
+0.0.16 (`TESTED_LOOMIO_VERSION` in `src/version.ts`). The 3.9.0 →
+3.13.1 changes were taken from Loomio's source, tests and OpenAPI
+document at the two tags on 2026-10-24 (the OpenAPI document moved to
+`docs/help/en/user_manual/integrations/api/openapi.yaml`) and, for the
+b2 reads, checked against sanitized live captures from a 3.13.1
+instance; they are collected in "Loomio 3.9 → 3.13.1 changes that
+matter" below, and the sections they touch are dated where the
+behaviour differs by version. The b3 provisioning routes (3.13.0+) are
+verified against source, tests and documentation only. Before that,
+"current" meant **Loomio 3.9.0** (tag `v3.9.0`, 2026-09-23). Facts were taken from
 Loomio's source at tag `v3.8.1` (2026-09-18) and re-checked at `v3.9.0`
 and master on 2026-10-02: the `namespace :b2` / `:b3` route blocks, the
 OpenAPI document and `permitted_params.rb` are byte-identical between
@@ -130,27 +139,27 @@ Every read below also carries the connector's read profile — an explicit
 
 | Method | Path | Tool | Notes |
 |---|---|---|---|
-| GET | `/b2/groups` | `list_groups`, `check_connection`, the key-health probe | `current_user.groups`; no pagination; `meta.total` |
+| GET | `/b2/groups` | `list_groups`, `check_connection`, the key-health probe | `current_user.groups`; paged since 3.11.1 (bc1a6cc02): limit 50/500, offset, order id, meta.total full — the connector sends `limit=500&offset=…` (the probe sends neither and gets the first 50); before 3.11.1 the whole set every call |
 | GET | `/b2/groups/{id\|key\|handle}` | `get_group` | `can?(:show, group)`; hidden → 403 "Not authorized to show Group.", unknown → 404 |
 | GET | `/b2/discussions?group_id=…&status=…&limit=…&offset=…` | `list_discussions` | always sends `status` (default `open`); keeps `topics` |
-| GET | `/b2/discussions/{id\|key}` | `get_discussion`; the `discussion_id` resolver of the thread tools and `create_poll` (`compact=1`) | |
+| GET | `/b2/discussions/{id\|key}` | `get_discussion`; the `discussion_id` resolver of the thread tools and `create_poll` (`compact=1`); `get_thread_markdown`'s guard (profile `thread_guard` = compact minus `topic`, so the topic row with `items_count` arrives) | |
 | POST | `/b2/discussions` | `create_discussion` | NESTED `{"discussion":{…}}` |
 | PATCH | `/b2/discussions/{id\|key}` | `update_discussion` | NESTED |
 | DELETE | `/b2/discussions/{id\|key}` | `delete_discussion` | soft discard |
 | GET | `/b2/polls?group_id=…&status=…&limit=…&offset=…` | `list_polls` | always sends `status` (default `active`); keeps `topics` |
-| GET | `/b2/polls/{id\|key}` | `get_poll`; the `poll_id` resolver of the thread tools (`compact=1`) | |
+| GET | `/b2/polls/{id\|key}` | `get_poll`; the `poll_id` resolver of the thread tools and `get_thread_markdown`'s guard (both `thread_guard`: the poll, its thread's topic row — so the header names the thread, a discussion for a poll inside one — and `my_stance`) | |
 | POST | `/b2/polls` | `create_poll` | NESTED `{"poll":{…}}` + top-level `recipient_*`; `topic_id`, never `discussion_id` |
 | PATCH | `/b2/polls/{id\|key}` | `update_poll` | NESTED; `recipient_*` nested only |
 | DELETE | `/b2/polls/{id\|key}` | `delete_poll` | soft discard |
 | GET | `/b2/threads?limit=…&offset=…` | `list_threads` | `TopicQuery.visible_to(user)`; no group filter; `meta.total` |
-| GET | `/b2/threads/{topic_id}` | `create_poll` only, when `topic_id` AND `group_id` are given (`compact=1`): the row's `group_id` is cross-checked before the POST | one TopicSerializer row (`threads` root) + the fronting `discussions` / `polls` record; 404 for invisible; no tool of its own |
-| GET | `/b2/threads/{topic_id}/items` | `list_thread_items`, `get_discussion` with `include_items` | UNPAGINATED; `meta.total`; 404 for invisible; `compact=1`, plus `discussion` when the thread's record is already known, minus `reaction` with `include_reactions` |
-| GET | `/b2/threads/{topic_id}/markdown` | `get_thread_markdown` | `{markdown}`; 404 for invisible |
+| GET | `/b2/threads/{topic_id}` | `get_thread_markdown`'s guard by `topic_id` (`compact=1`); `create_poll` when `topic_id` AND `group_id` are given: the row's `group_id` is cross-checked before the POST | one TopicSerializer row (`threads` root, with `topicable_type` / `topicable_id` / `items_count`) + the fronting `discussions` / `polls` record (a poll with `my_stance`); 404 for invisible; no tool of its own |
+| GET | `/b2/threads/{topic_id}/items` | `list_thread_items`, `get_discussion` with `include_items`, `get_thread_markdown`'s guard scan | paged since 3.11.1 (bc1a6cc02): limit 50/500, offset, order sequence_id,id, meta.total full — the connector sends `limit` (≤ 500) and `offset` on every request; before 3.11.1 every item, whatever was asked; 404 for invisible; `compact=1`, plus `discussion` when the thread's record is already known, minus `reaction` with `include_reactions` |
+| GET | `/b2/threads/{topic_id}/markdown` | `get_thread_markdown` | `{markdown}`; `authorize!(:export, thread)` since 3.10.0 (= `can?(:show)`); until_vote ignored since 3.10 (df28cf845) — the connector's guard refuses that case first; 404 for invisible |
 | GET | `/b2/search?query=…\|author_id=…&group_id=…&types=…&tag=…&order=…` | `search_content`; `get_user_activity` (author mode) | cap 20; no `meta.total`; `exclude_types` ignored, `compact=1` honoured |
 | GET | `/b2/reports?section=users&group_scope=…&group_ids=…&start_month=…&end_month=…[&member_type=delegate]` | `get_participation_report` (one call), `get_user_activity` (one call per group) | plain hash; effective `group_ids` echoed |
 | GET | `/b2/memberships?group_id=…&limit=…&offset=…` | `list_memberships` | `compact=1`; non-member → `200 []` |
 | POST | `/b2/memberships` | `manage_memberships` | flat `{group_id, emails, remove_absent: 1?}` |
-| POST | `/b2/comments` | `create_comment` | FLAT `{discussion_id \| parent_id + parent_type, body, body_format}` |
+| POST | `/b2/comments` | `create_comment` | FLAT `{discussion_id \| parent_id + parent_type, body, body_format}`; from 3.12.0 any other top-level key (query string included) is 400 |
 | PATCH | `/b2/comments/{id}` | `update_comment` | FLAT `{body, body_format}` |
 | DELETE | `/b2/comments/{id}` | `delete_comment` | soft discard |
 
@@ -169,26 +178,63 @@ Every read below also carries the connector's read profile — an explicit
 | GET | `/b3/users/{id}` | `get_user` (by id) |
 | GET | `/b3/users/identity/{identity_type}/{uid}` | `get_user` (by external identity) |
 | GET | `/b3/users[?is_admin=true\|false]` | `list_users` |
+| GET | `/b3/groups?limit=&offset=` | `list_instance_groups` (3.13.0+) |
+| GET | `/b3/memberships?group_id=&limit=&offset=` | `list_instance_memberships` (3.13.0+) |
+| POST | `/b3/memberships` | `add_group_members` (3.13.0+): flat `{group_id, emails}`, never `remove_absent` |
+| PATCH | `/b3/memberships/{id}` | `update_membership_roles` (3.13.0+): nested `{membership: {admin?, delegate?}}` |
+| DELETE | `/b3/memberships/{id}` | `revoke_membership` (3.13.0+) |
 
 The collection routes `POST /b3/users/deactivate?id=` /
 `…/reactivate?id=` still exist but are `deprecated: true` in Loomio's
 OpenAPI document ("legacy query-ID route"); the connector uses the
 member routes.
 
-### Available in Loomio 3.8.1, deliberately not wrapped
+### Available in Loomio 3.8.1 – 3.13.1, deliberately not wrapped
 
 | Method | Path | Why not |
 |---|---|---|
-| PATCH / DELETE | `/b3/users/{id}`, `/b3/users/identity/{type}/{uid}` | update (name, username, email, `is_admin`), hard destroy (`DestroyUserWorker`, cascades) and redact are irreversible, and Loomio records no actor identity for b3 calls — nobody could later tell which agent session did it. Deactivate / reactivate cover the operational need and are reversible. |
+| PATCH / DELETE | `/b3/users/{id}`, `/b3/users/identity/{type}/{uid}` | update (name, username, email, `is_admin` — so it can mint instance admins, and an email change hands the login to whoever owns the new address), hard destroy (`DestroyUserWorker`, cascades) and redact are irreversible, and Loomio records no actor identity for b3 calls — nobody could later tell which agent session did it. Deactivate / reactivate cover the operational need and are reversible. |
+| POST | `/b3/users` (3.13.0+) | `is_admin` is a permitted field, so it creates instance admins; with a name and `DEFAULT_ONBOARDING_GROUP_ID` set it also silently joins a group. `add_group_members` already creates the accounts it needs (`User.find_or_create_by!`). |
+| POST | `/b3/memberships` with `remove_absent: true` (3.13.0+) | A sync with an empty or wrong list revokes everyone absent from it — admins included, across every subgroup — with no admin check, in one transaction. `add_group_members` builds `{group_id, emails}` field by field under a strict schema. |
+| PUT | every b3 `PATCH` route | Rails' deprecated alias of the same action. |
 | POST | `/b3/users/{id}/redact`, `…/identity/{type}/{uid}/redact` | as above |
 | * | `/b2/chatbots`, `POST /b2/chatbots/check` | Group-admin configuration of outgoing webhooks / Matrix bots (`current_user.adminable_groups.find(group_id)` → 404 for anyone else). `ChatbotSerializer` returns `server` — the webhook URL, which for most webhook kinds IS the credential — and `channel` to admins. Nothing an AI caller needs, and a leak surface if it were readable. |
 | GET | `/b2/reports?section=base\|countries` | Per-interval instance / group-set totals with tag counts, and per-country totals. Not answerable per member the way `section=users` is, and not what a group's participation page shows members. |
-| GET | `/b2/threads/{topic_id}` | The single TopicSerializer row. `list_threads` returns the same rows; `list_thread_items` and `get_thread_markdown` fill the thread header (type, id, key, title, group) from their own responses, so a separate call buys nothing. |
 
 ## Request body shape: nested for discussions and polls, flat for comments
 
-**Verified live 2026-09-20 on a Loomio 3.8.1 sandbox, and against the
-source.** Two Rails mechanisms meet in
+**Two eras.** Loomio **3.1.3 – 3.11.x** (verified live 2026-09-20 on a
+3.8.1 sandbox, and against the source) is described first and in the
+live table below. Loomio **≥ 3.12.0** (e5bd13dfc, "Preserve virtual
+fields in User API JSON requests") puts `wrap_parameters false` on the
+B2 base controller, which changes how a FLAT body is read but not what
+the connector sends:
+
+- A **nested** `{"discussion"|"poll": {…}}` body takes the same
+  `params[resource_name].respond_to?(:permit)` branch on every version
+  (b2/base_controller.rb:34-37 at 3.13.1; upstream test "nested JSON
+  creates a group draft with every option",
+  test/integration/b2_poll_requests_test.rb). So nested stays the
+  cross-version shape for discussions and polls — on 3.9 – 3.11 a flat
+  one still loses `group_id` and `options`.
+- A **flat** body is now taken WHOLE as the resource hash (minus
+  `api_key`, `format`, `controller`, `action`, `discussion`, `poll`,
+  `id`), every top-level key permit-checked: an unknown one answers
+  `400 {"error":400}` (`:raise`; upstream test "JSON cannot assign
+  protected poll attributes"). For comments the fallback also DELETES
+  `discussion_id` (b2/base_controller.rb:46-48), which is what keeps the
+  connector's flat comment body valid (upstream "shared JSON handling
+  preserves comment discussion context", b2_poll_requests_test.rb:135-148)
+  — and makes any OTHER extra key on a comment write, a read profile's
+  `exclude_types` / `compact` in the query string included (Rails merges
+  query and body), a 400. The connector sends exactly the permitted keys
+  and never a read profile with a write.
+- b3 controllers do not opt out of ParamsWrapper; `PATCH
+  /b3/memberships/{id}` is sent explicitly nested (`{membership: {…}}`)
+  so it never depends on the wrapper, and `POST /b3/memberships` parses
+  `raw_post` itself and reads `group_id` / `emails` from the top level.
+
+On **3.1.3 – 3.11.x**, two Rails mechanisms meet in
 `Api::B2::BaseController#permitted_params`:
 
 1. `permitted_params` uses `params[resource_name]` — the WRAPPED hash
@@ -213,7 +259,7 @@ on Discussion / Poll and are **silently dropped**. Observed live:
 | poll, nested `{"poll": {group_id, …, options}}` | 200, group and options correct; standalone thread (`topicable_type: "Poll"`) |
 | poll, nested with `topic_id` of a discussion | 200, attached to that thread (`topicable_type: "Discussion"`), `group_id` derived from the thread; option names are re-labelled in the instance's locale ("agree" → "Agree") |
 | poll, nested with `discussion_id` | **400** (`PermittedParams#poll_attributes` has `topic_id`, not `discussion_id`) |
-| comment, form-encoded `body=…&body_format=md` + `?discussion_id=` | **400** |
+| comment, form-encoded `body=…&body_format=md` + `?discussion_id=` | **400** (observed on 3.8.1; a ≤ 3.11 result — the connector no longer sends forms on any version) |
 | comment, nested `{"comment": {discussion_id, …}}` | **400** — wrapping hides `discussion_id` from the controller |
 | comment, flat JSON `{discussion_id, body, body_format}` | 200, `parent_type: "Discussion"`, `parent_id` = the discussion, `topic_id` = its thread |
 | PATCH nested (discussions, polls), flat (comments) | 200 (`versions_count` increments) |
@@ -244,8 +290,19 @@ nest them.
 
 `action_on_unpermitted_parameters = :raise`: any key `PermittedParams`
 does not list answers `400 {"error":400}`. That includes `compact` /
-`exclude_types` if they ever reached a write's resource hash — the read
-profiles are never spread into a write.
+`exclude_types` if they ever reached a write's resource hash — on ≥ 3.12
+a flat comment write's whole top level IS that hash — so the read
+profiles are never spread into a write nor sent in its query string.
+
+**Tags on create (3.13.0+, 5934ab182).** `DiscussionService.create` /
+`PollService.create` keep only the tag names the actor may use
+(`TagService.permitted_tag_names`): a name the group lacks, sent by a
+user who may not create tags, is dropped SILENTLY and the record is
+created without it. On ≤ 3.12 `TagService.authorize_create_tag_names!`
+refused the whole create with the bare generic 403 instead (the
+connector's 403 classifier mentions that on the two creates). No
+upstream test proves that the create echo carries the tags, so the
+connector does not compare them.
 
 **Format fields default to `md`, not to anything of the group's.**
 `discussions.description_format`, `polls.details_format` and
@@ -344,15 +401,44 @@ was flat-bodied through 0.0.11, and why 0.0.11 misdirected writes on
 ## Pagination and response options
 
 b2 list endpoints (`discussions`, `polls`, `memberships`, `threads`)
-accept `limit` (default 50) and `offset` (default 0); SnorlaxBase also
-accepts `per` / `from` as aliases. We expose `limit` / `offset` only.
-`GET /b2/groups` and `GET /b2/threads/{id}/items` read NO paging
-parameters (the whole set, every call); `GET /b2/search` reads none and
-is capped at 20.
+accept `limit` (default 50) and `offset` (default 0) through
+`SnorlaxBase#page_collection`, which also accepts `per` / `from` as
+aliases and does not cap `limit`. We expose `limit` / `offset` only.
+`GET /b2/search` reads none and is capped at 20.
+
+**Bounded pages (Loomio ≥ 3.11.1, bc1a6cc02, "Bound User API collection
+pages").** `GET /b2/groups` (ordered by id) and
+`GET /b2/threads/{id}/items` (ordered `sequence_id, id`) call
+`page_collection_bounded` (snorlax_base.rb:217-222): `offset` negative →
+0, `limit.to_i.clamp(1, limit_max)`, no `per` / `from` aliases. The B2
+override (b2/base_controller.rb:13-16) sets `limit_max: 500` and the
+default page to 50; the b3 indexes (3.13.0+) keep the base default
+`limit_max: 50` — so `limit=0` returns one row there. `collection_count`
+is taken BEFORE the page is cut, so `meta.total` is the whole collection
+on every page; a bounded page side-loads only what its own rows
+reference (the 3.13.1 capture of items 10–19 has no `discussions` root:
+the opening post is on page 0). Live, 3.13.1: thread items default to
+50 per page, `limit` is honoured up to 500, `offset` works and
+`meta.total` stays the full count; the groups index likewise. On
+**Loomio < 3.11.1** both routes read NO paging parameters and return
+the whole set on every call.
+
+The connector's rule (DESIGN.md): follow Loomio's pages up to
+`meta.total` within a per-call page cap and say when the cap stopped
+the walk; never emulate paging Loomio lacks. `loomioPager` /
+`loomioGetAllPages` (src/loomio/client.ts) send `limit` (≤ 500) AND
+`offset` (`offset=0` included) on every request, merge side-load roots
+by id across pages, and on the FIRST reply detect a server that ignored
+them (more rows than requested, or the whole `total` at a non-zero
+offset) — Loomio < 3.11.1 — and stop there; the caller slices. Caps:
+`list_groups` / `check_connection` 20 pages, `list_thread_items` 2
+pages without `kinds`, a whole-thread read (`kinds`, the Markdown guard)
+10 pages.
 
 Collection reads that set `collection_count` carry an exact
 pre-pagination **`meta.total`**: the groups index, discussions, polls,
-memberships, threads and thread items. It is **omitted**, not null,
+memberships, threads and thread items (and the b3 groups / memberships
+indexes). It is **omitted**, not null,
 where no total is defined (`Api::B2::ResponseOptions#response_meta`):
 every show, and search. Every collection tool surfaces it as `total`.
 
@@ -411,9 +497,13 @@ Threading state lives on a `Topic` record. `DiscussionSerializer` /
 `PollSerializer` carry `topic_id`; `TopicSerializer` (root `topics` on
 discussion / poll reads, `threads` on `GET /b2/threads`) carries
 `items_count`, `replies_count` (= items_count − 1), `last_activity_at`,
-`locked_at`, `pinned_at`, `tags`, `members_count`, `seen_by_count`,
-`active_polls_count`, `closed_polls_count`, `anonymous_polls_count`,
-`topicable_type` / `topicable_id` (the Discussion or Poll it fronts),
+`locked_at`, `pinned_at`, `tags`, `seen_by_count`,
+`active_polls_count`, `topicable_type` / `topicable_id` (the Discussion
+or Poll it fronts); `members_count`, `closed_polls_count` and
+`anonymous_polls_count` on Loomio ≤ 3.10 only (3.11.0 removed them,
+79280ee7a / e3f18abfd); `has_anonymous_polls` since 3.11.0
+(e3f18abfd) and `has_tagged_replies` since 3.13.0 (5934ab182) — the
+latter says `tags` is the union over every tagged contribution;
 `group_id`, plus the API user's own reading state (`reader_*`), `ranges`
 and `max_depth`. `joinTopics` in `src/loomio/shape.ts` folds the first
 group onto the record (`TOPIC_JOIN_FIELDS`) and drops the rest. A
@@ -449,7 +539,9 @@ YAML):
 - `prevent_anonymous`: `count`, `question` and `meeting` cannot be
   anonymous.
 - **Anonymous polls** (`anonymous: true`): `PollService.build` forces
-  `voting_system: anonymous_ballot` and `hide_results: until_closed`;
+  `hide_results: until_closed` (and on ≤ 3.9 `voting_system:
+  anonymous_ballot`; 3.10 removed the field — ballots are separate
+  records with no b2 stances);
   `PollService.invite` then raises a bare `CanCan::AccessDenied` for an
   anonymous poll that is not active — no future `closing_at` — AFTER
   `create` saved it (the one bare 403 a valid key can hit on a write;
@@ -459,6 +551,11 @@ YAML):
   is frozen once a ballot exists (422).
 - `closing_at` is rounded DOWN to the hour and must be in the future;
   without it the poll never opens for voting on its own.
+- Loomio 3.10+: `stv_seats` must be fewer than the options (422
+  otherwise, 35b632cc7; the schema refuses it first), and
+  `maximum_stance_choices` is the option count for `dot_vote`, `score`,
+  `ranked_choice`, `stv` and `meeting` (3d9f313d0) — a ranked-choice
+  voter ranks at least `minimum_stance_choices`, up to every option.
 - `hide_results` may be tightened on update but `until_closed` can never
   be relaxed ("cannot reveal results early").
 
@@ -484,10 +581,25 @@ ONLY `my_stance` rows; in a thread's items it holds every voter's, so
 the user is picked by the id the health probe learned), strips the four
 poll fields and the other voters' stance fields when it says no, and
 emits `results_visible` / `results_hidden_reason` (`until_closed` |
-`until_vote`) either way. `ThreadMarkdownService` applies
-`results_visible?(voted:)` itself ("_Hidden until the poll closes._" /
-"_Hidden until the viewer votes._"), so `get_thread_markdown` needs no
-client-side gate. **Search** does: `Stance.pg_search_insert_statement`
+`until_vote`) either way. At 3.13.1 PollSerializer gates exactly those
+four fields (`results`, `stance_counts`, `total_score`, `stv_results`;
+poll_serializer.rb:112-118, 197-215) on `results_available?`; quorum and
+participation fields follow `participation_visible?`, so
+`HIDDEN_RESULT_FIELDS` is unchanged. **Markdown:** through Loomio 3.9,
+`ThreadMarkdownService` applied `results_visible?(voted:)` itself
+("_Hidden until the poll closes._" / "_Hidden until the viewer
+votes._"). **Since 3.10.0 (df28cf845) it uses `poll.results_available?`
+alone** (thread_markdown_service.rb:213-215; upstream test
+thread_markdown_service_test.rb:222-250): an open `until_vote` poll's
+votes and results table are exported to a reader who has not voted.
+(a117c62fa added a `topic.polls.active.where(hide_results: :until_vote)`
+refusal on the export within 3.10 and df28cf845 reverted it.) So
+`get_thread_markdown` refuses such a thread before fetching the
+document — see "Threads" — except on Loomio 3.8 / 3.9 (v3.8.0 – v3.9.0
+thread_markdown_service.rb:144, 168-172: `voted = poll.stances.latest.
+decided.exists?(participant_id: user.id)`), where the guard is skipped
+when a health probe within the last minute reported that version (an
+older probe is re-run first; unknown or 3.10+ keeps the guard). **Search** does: `Stance.pg_search_insert_statement`
 indexes every cast, unredacted stance (reason + voter name) except those
 of an OPEN `until_closed` poll (`AND NOT (polls.hide_results = 2 AND
 polls.closed_at IS NULL)`; they are indexed once the poll closes via
@@ -499,8 +611,11 @@ there) and `my_stance`; in author-only mode it withholds the snippet
 (`snippet_hidden_reason`) — the author stays, as in Loomio's thread view
 — and in `query` mode it drops the hit altogether, because its presence
 would confirm the query term occurs in the hidden reason (see "Search").
-Anonymous polls carry `participant_id: null` on every stance and no
-`my_stance`; nothing can or should de-anonymise them.
+Anonymous polls: on Loomio ≥ 3.10 (917b2c2e4, `voting_system`
+removed) their ballots are separate records the b2 API does not
+serialize — there are no stances to show, `my_stance` included; on ≤ 3.9
+they carried `participant_id: null` on every stance. Nothing can or
+should de-anonymise them.
 
 ## Groups
 
@@ -523,7 +638,17 @@ groups the key's user holds an un-revoked membership in — **including
 invitations not yet accepted** (`accepted_at: null`) — and nothing else:
 a publicly visible group the user has not joined is NOT listed (although
 readable by id), instance `is_admin` widens nothing, there is no
-pagination or filter, `meta.total` is the count. `authenticate_api_key!`
+filter, `meta.total` is the count. Paged since 3.11.1 (see "Pagination
+and response options"): on a page, a parent the user IS a member of sits
+in `groups` on its own page and in `parent_groups` on every page holding
+one of its subgroups (with its own membership row), so the connector
+decides membership from the own row or `current_user_membership_id`,
+never from which root a group came in. `group_privacy` gains
+`parent_members` in 3.11.0 (ec3d359ac; such subgroups were reported as
+`closed` before). 3.11.0 also removed `closed_polls_count`,
+`delegates_count`, `discussion_templates_count` and
+`org_discussions_count` from GroupSerializer (79280ee7a / e3f18abfd),
+and `subgroups_count` is counted on every read since. `authenticate_api_key!`
 is the only guard: a 403 here means the key. Side-loads
 (`GroupSerializer`): `parent_groups` (each subgroup's parent, serialised
 WITHOUT a visibility check on it), `memberships` (the user's OWN rows via
@@ -552,7 +677,8 @@ GET /b2/threads                        TopicQuery.visible_to(user), order last_a
                                        client-side cutoff over the page (undated rows dropped + counted,
                                        `exhausted` when the last dated row predates the cutoff).
 GET /b2/threads/{topic_id}             one TopicSerializer row (root `threads`)
-GET /b2/threads/{topic_id}/items       thread.items.order(:sequence_id) — EVERY item, no paging; meta.total
+GET /b2/threads/{topic_id}/items       thread.items.order(:sequence_id, :id); ≥ 3.11.1 page_collection_bounded
+                                       (limit 50/500, offset); < 3.11.1 EVERY item, no paging; meta.total full
 GET /b2/threads/{topic_id}/markdown    {markdown: ThreadMarkdownService.render(topic:, user:)}
 ```
 
@@ -596,14 +722,64 @@ GET /b2/threads/{topic_id}/markdown    {markdown: ThreadMarkdownService.render(t
   `discussion_reopened`, `discussion_moved`. Rows migrated from the old
   Event model may carry other strings; the connector's `kinds` filter
   passes them under `other`.
-- Markdown (`ThreadMarkdownService`): YAML front matter (group, created,
-  last_activity, tags), `# Discussion|Poll: <title> · <author> <date>`,
-  the body, then `## Comment · <author> <ts>` / `## Reply to <name> · …`,
-  polls with `- **Status:**`, `- **Options:**`, a `### Current results`
-  table or a hidden-until line, `## Vote:` and `## Outcome` sections,
-  reaction lines. Labels are in the API user's locale; discarded items
-  and blank comments are omitted; the document is unbounded (the
-  connector caps it at `max_chars`, default 60000, from the END).
+- Markdown (`ThreadMarkdownService`), Loomio ≥ 3.10 layout: YAML front
+  matter (`key`, `url`, group, created, last_activity, `tags` — the union
+  over every tagged contribution — and on 3.13+ `root_tags`, the opening
+  post's own), `# <Type>: <title> · <author> · <UTC time>`, the opening
+  body, then the activity as a reply tree of nested blockquotes: each
+  poll a `##` section (status, options, a results table or a
+  hidden-until line) with its votes and their replies beneath; each item
+  headed `**Author** · <UTC time> · #<seq>` (`seq` = the item's
+  `sequence_id`); reactions inline; `Tags:` lines on tagged
+  contributions. Removed items stay as `_Removed_` placeholders that
+  keep their replies; superseded, removed and undecided votes are
+  listed; an open `until_closed` poll shows `voted` without the choice,
+  and comments under its votes are omitted. Labels are in the API
+  user's locale; the document is unbounded (the connector caps it at
+  `max_chars`, default 60000, from the END). Through 3.9 the layout was
+  flat `## Comment · <author> <ts>` / `## Vote:` / `## Outcome` sections
+  without the `·` before the date.
+- **Vote visibility (3.10+).** `markdown` calls
+  `authorize!(:export, thread)` (Topic `:export` = `can?(:show)`,
+  ability/topic.rb:9-11) and renders every poll by
+  `results_available?` alone (see "Poll result visibility"). The
+  connector's guard (`get_thread_markdown`, src/tools/threads.ts) reads
+  the thread first — `GET /b2/threads/{id}?compact=1` by `topic_id`, or
+  the discussion / poll show with the `thread_guard` profile — and
+  decides from what the export actually prints — the thread's ITEMS
+  (`activity_items`, thread_markdown_service.rb:81-92, keeps every
+  poll whose `created_topic_item` is in `topic.items`; that association
+  is not scoped to the topic, has_topic_items.rb:7-17): a poll the read
+  side-loaded (a Poll topic's fronting poll, the poll a `poll_id`
+  named) that hides its results from the user refuses at once; a thread
+  whose `items_count` is ≤ 1 (the opening item only) is served; every
+  other thread's items are scanned (≤ 10 pages of 500, stopping at the
+  first page that shows a hidden poll) and it refuses on any open
+  until_vote poll the user has not voted in, failing closed when
+  capped. **`active_polls_count` does not say which polls the export
+  prints:** it counts polls by `polls.topic_id`, and b2 `PATCH
+  /b2/polls/{id}` permits `topic_id` (permitted_params.rb:39) —
+  `Poll#with_topic_lock` keeps that destination (poll.rb:338-357) and
+  `update_poll_counts` moves the count (poll.rb:272, 312-331) while
+  PollService.update moves no item (poll_service.rb:75-140), so the old
+  thread reads 0 and its export still prints the poll and every vote
+  (Loomio's own client includes `topic_id` in its poll saves, so a
+  stale tab after a move does the same). **A Poll topic can hold more
+  than one poll:** `Ability::Poll :create` refuses a second
+  (ability/poll.rb:40-49), but v1 `topics#move_comments` (routes.rb:341,
+  topics_controller.rb:124-128 → `TopicItemService.move_comments`,
+  topic_item_service.rb:10-24 → `MoveCommentsWorker`) moves any
+  selected items — `poll_created` included — into any topic the actor
+  administers (ability/topic.rb:13-15) without checking its type: the
+  worker repoints the polls (`all_polls.update_all(topic_id:)`),
+  recounts `active_polls_count` on both topics
+  (move_comments_worker.rb:22-25) and moves the items (:38), raising the
+  target's `items_count`. `TopicSerializer has_one :poll` is the
+  topicable only (topic_serializer.rb:37, 48-54), so the thread show
+  never side-loads the moved-in poll, while the export renders its
+  votes — the scan finds it. The b2 polls index lists standalone polls
+  only (`records_visible_in_group`), so a thread's polls can only be
+  found through its items.
 
 ## Search (`Api::B2::SearchController` < `Api::V1::SearchController`)
 
@@ -624,7 +800,11 @@ as good as that table's last rebuild), `author_id` (alone: the author's
 `highlight` is then a plain html-escaped 240-character excerpt),
 `group_id`, `org_id` (a group and its subgroups; not exposed), `type` or
 `types` (comma-separated `SEARCHABLE_TYPES`: Discussion, Comment, Poll,
-Stance, Outcome; unknown names dropped), `tag`, `order`
+Stance, Outcome; unknown names dropped), `tag` (3.13.0+, 5934ab182:
+`pg_search_documents.tags @> [tag]` — only contributions explicitly
+tagged with that name, a vote never; ≤ 3.12: every document in a topic
+of the user's groups whose tags contain it — same parameter, a
+different answer), `order`
 (`authored_at_desc` / `authored_at_asc` reorder exact AND fuzzy matches
 by date; anything else = relevance). **Hard limits**:
 `SearchQuery::RESULT_LIMIT = 20`, no offset, no `meta.total` (test
@@ -640,7 +820,15 @@ pg_search ROW id (unstable across reindex — the connector returns
 (the controller fills it from `group.full_name` — "Parent - Subgroup"
 for a subgroup, so the connector calls it `group.full_name`; join on
 `group_id`), `author_id` / `author_name`, `authored_at`, `sequence_id`
-(items inside a thread; comments get none), `tags` (declared, but gated
+(3.13.1 search_controller.rb:93-110: 0 on a Discussion hit; the item's
+own sequence on a comment or outcome — in a standalone poll's thread
+too, where the hit has a `poll_key` and no `discussion_key` — and on a
+poll or vote inside a discussion; null on a standalone poll's own hit
+and on a vote in a standalone poll's thread: the first lookup,
+`TopicItem.tags_visible`, is built on `taggable`, whose kinds exclude
+`stance_created` (has_item_tags.rb:4-24), and the stance lookup runs only
+`elsif discussion`, nil there because stance.rb:34 indexes such a vote
+with `discussion_id` NULL), `tags` (declared, but gated
 on `include_type?('tag')` and therefore ABSENT under `compact=1`, which
 is sent), `highlight` (HTML with `<b>…</b>` around matches: `ts_headline`
 with `StartSel = "<b>", StopSel = "</b>"`). Side-loads: `users`
@@ -745,8 +933,12 @@ Loomio 3.8.1, `Api::B2::MembershipsController`, `MembershipQuery`,
   `RecordNotFound` for a nil id as well; Loomio's own test "missing group
   id" asserts 404). There is no 400 path: the route is flat, nothing
   `require`s `group_id`.
-- No `ORDER BY`, so paging with `offset` is not guaranteed stable across
-  calls.
+- No `ORDER BY` (still so at 3.13.1 — this route did not get
+  `page_collection_bounded`), so paging with `offset` is not guaranteed
+  stable across calls: pages can repeat or skip rows.
+- `weight` (3.10.0+, 14c07ef6c): the member's vote weight as a decimal
+  string, on the API user's own rows and on rows of groups it
+  administers.
 - `compact=1` drops the group, parent, reaction, tag and translation
   side-loads; `users` still arrives (verified on a live capture: roots
   `memberships`, `users`, `meta`). `user_email` is a serializer scope
@@ -770,7 +962,19 @@ Loomio 3.8.1, `Api::B2::MembershipsController`, `MembershipQuery`,
   admin and instance admin do **not** count (tests: "instance admin not
   in group cannot add members" / "… remove members").
 - Always additive for `emails` not already present
-  (`GroupService.invite`).
+  (`GroupService.invite` → `invite_users`). Invitees get ballots in the
+  group's polls ASYNCHRONOUSLY: `invite_users` enqueues
+  `PollGroupMembersAddedWorker`, and `PollService.group_members_added`
+  covers every kept, unclosed poll of the group that is not
+  specified-voters-only — scheduled and draft polls too. (Through 3.9
+  the controller ALSO ran `PollService.group_members_added`
+  synchronously; 3.10 dropped that call, the worker remained — the
+  0.0.14 note that invitees are "no longer auto-enrolled" was wrong.) A
+  re-invite of a previously revoked member restores the row
+  (`admin: false`, pending), their thread access and their open-poll
+  votes in that group (`MembershipService.restore_topic_access`). A
+  group whose subscription is inactive answers HTTP 500, not a readable
+  403.
 - `remove_absent` is read as **`params[:remove_absent].to_i == 1`**
   (since Loomio 2.24.0; the OpenAPI document says "Pass `1`"). A JSON
   `true` has no `#to_i` in Ruby → `NoMethodError` → HTTP 500, **after**
@@ -782,15 +986,23 @@ Loomio 3.8.1, `Api::B2::MembershipsController`, `MembershipQuery`,
   `MembershipService.revoke`, which cascades to the same user's
   memberships in subgroups. The caller's own membership is revoked if
   its email is absent. Empty `emails` → empty group. No server-side
-  dry-run.
+  dry-run. The comparison is `current_emails - params_emails` on the
+  STORED addresses, case-sensitively and without normalising the list:
+  a member stored as `alice@example.org` and listed as
+  `Alice@example.org` is revoked (the invite half resolves the same
+  account and changes nothing).
 - Response: `{added_emails: [...], removed_emails: [...]}`.
 
 ## b3 admin (opt-in)
 
-`Api::B3::UsersController` — bearer token `secure_compare`d against
-`ENV['B3_API_KEY']` (must be >16 chars); a wrong or missing secret, *or
-a server with no `B3_API_KEY` set*, answers the generic 403 body. No
-per-user authorization is applied — the secret authenticates the server.
+`Api::B3::UsersController` (and, since 3.13.0, the groups and
+memberships controllers) — bearer token `secure_compare`d against
+`ENV['B3_API_KEY']` (must be >16 chars) by `authenticate_api_key!`,
+which lives in `Api::B3::BaseController` since 3.13.0 (ee6befeb7; a
+`prepend_before_action`, same rule as UsersController's own before); a
+wrong or missing secret, *or a server with no `B3_API_KEY` set*,
+answers the generic 403 body. No per-user authorization is applied —
+the secret authenticates the server.
 The connector's 403 classifier therefore names `LOOMIO_B3_API_KEY` on
 `/b3/` paths — never the per-user key, `/profile/api_access` or the
 `/health` verdict, which probes the b2 key.
@@ -798,14 +1010,20 @@ The connector's 403 classifier therefore names `LOOMIO_B3_API_KEY` on
 - `POST /b3/users/{id}/deactivate`: finds the user in `User.active`
   (else 404), enqueues `DeactivateUserWorker` and answers
   `{ success: true, user: {…} }` **at once**; the echoed user can still
-  show `active: true` / `deactivated_at: null`. The worker stamps
+  show `active: true` / `deactivated_at: null`. The worker
+  (`perform_later(user.id, user.id)`: the user is recorded as its OWN
+  deactivator and revoker, deactivate_user_worker.rb:9,11) stamps
   `deactivated_at`, revokes active memberships (with that timestamp),
-  revokes mobile devices and drops pending membership requests.
+  revokes mobile devices and drops pending membership requests; since
+  3.11.0 (6ba2253c4) votes already cast in open polls are preserved and
+  only undecided ballots are revoked.
 - `POST /b3/users/{id}/reactivate`: finds the user in `User.deactivated`
   (else 404), runs `UserService.reactivate` synchronously — clears
   `deactivated_at` and **restores the memberships whose `revoked_at`
-  equals the deactivation timestamp** — and answers the same shape with
-  `active: true`.
+  equals the deactivation timestamp** — and, since 3.10.0 (12c02dcd3),
+  the open-poll ballots revoked at that timestamp, then enqueues
+  `PollGroupMembersAddedWorker` per restored group — and answers the
+  same shape with `active: true`.
 - `GET /b3/users/{id}` and `GET /b3/users/identity/{identity_type}/{uid}`
   (`Identity.with_user.find_by!(identity_type:, uid:)`) answer
   `{ user }`; `GET /b3/users[?is_admin=true|false]` answers `{ users }`
@@ -819,7 +1037,76 @@ The connector's 403 classifier therefore names `LOOMIO_B3_API_KEY` on
   two reads are gated like the writes and documented single-tenant only.
 - Identity route caveat: Rails' default segment pattern excludes `.`, so
   a `uid` containing a dot (most email addresses) is split into uid +
-  format and answers 404 in 3.8.1. Address such users by numeric id.
+  format and answers 404 — in 3.8.1 and still in 3.13.1 (no
+  `constraints:` on the identity routes). Address such users by numeric
+  id.
+
+**Provisioning (Loomio ≥ 3.13.0, ee6befeb7).** Routes
+(routes.rb@v3.13.1:113-115): `resources :groups, only: [:index]`,
+`resources :memberships, only: [:index, :create, :update, :destroy]`,
+and `users` gains `:create`. Controllers b3/groups_controller.rb:1-11
+and b3/memberships_controller.rb:1-57 over
+`ServerMembershipService`; behaviour pinned by
+test/integration/b3_provisioning_test.rb and documented in
+docs/help/en/user_manual/integrations/api/server-api.md. **No actor**:
+the service passes `actor: nil` everywhere (no inviter, no revoker, no
+notification actor; the PATCH's PaperTrail `whodunnit` is nil).
+
+- `GET /b3/groups?limit&offset` → `Group.kept.order(:id)`: every
+  non-deleted group — secret, subgroups, expired subscriptions — as
+  `{id, key, name, handle, parent_id, group_privacy}`, `meta.total`.
+  `page_collection_bounded` with the base `limit_max: 50` (the b3 base
+  controller does not raise it), so `limit` is clamped to 1..50.
+- `GET /b3/memberships?group_id&limit&offset` → the kept group's ACTIVE
+  memberships (pending included, revoked excluded), direct members
+  only, ordered by id: `{id, group_id, user_id, user_email, user_name,
+  admin, delegate, accepted_at, pending}` (`membership_json`, no tokens
+  or votes). Unknown / deleted group → 404.
+- `POST /b3/memberships` `{group_id, emails, remove_absent?}` →
+  `ServerMembershipService.sync`, one transaction: validates the list
+  (array of strings ≤ 200 chars matching `EmailValidator::EMAIL_REGEXP`,
+  else 400 — `raw_post` is parsed as JSON when the Content-Type says so,
+  so `[null]` stays a 400), `Subscription::NotActive` unless
+  `group.enabled?` (403 `{error:403}`), `strip.downcase` + `uniq`,
+  `User.find_or_create_by!(email:)` (new accounts unverified; a NEW
+  address matching the instance's `SPAM_REGEX` fails the User model's
+  `no_spam_for :email` validation → `RecordInvalid` → 422
+  `{errors:{email:["no spam"]}}`, whole call rolled back), 422
+  `{errors:{email:["belongs to a deactivated account"]}}` if any is
+  deactivated, `added = emails - current_emails` (stored addresses,
+  case-sensitive), `UserInviter.check_members_limit!` (403),
+  `GroupService.invite_users(actor: nil)` (pending rows + invitation
+  emails; verified members of another enabled group of the organisation
+  accepted at once; revoked rows restored). Skips the per-actor
+  `ThrottleService` limit. The spam filter applies differently: b2's
+  `UserInviter.safe_emails` (user_inviter.rb:181-188) silently drops a
+  matching address, b3 fails the whole call with the 422 above (an
+  existing account is found, not validated); the mailer's delivery-time
+  spam / suppression filtering (notification_mailer.rb:154) still
+  applies. `remove_absent: true`
+  revokes everyone absent — admins too, across subgroups, no admin
+  check (upstream "explicit sync revokes absent members" ends with
+  `assert_empty @group.memberships`); the connector never sends it.
+  Returns `{added_emails, removed_emails}`.
+- `PATCH /b3/memberships/{id}` `{membership: {admin?, delegate?}}` →
+  `params.require(:membership).permit(:admin, :delegate)` (any other key,
+  a non-boolean or an empty hash → 400); `Membership.active.find` (a
+  revoked row → 404); `NotActive` → 403; a role turned ON notifies once
+  (`new_coordinator` / `new_delegate`); nothing stops demoting the last
+  admin. Returns `{membership}`.
+- `DELETE /b3/memberships/{id}` → `MembershipService.revoke_by_id(
+  group.id_and_subgroup_ids, user_id, nil)` with `preserve_cast_votes:
+  false`: the group AND its subgroups, thread access (guest flags too)
+  and open-poll stances — cast votes included — revoked; no
+  notification. `Membership.find` (revoked rows included), so a repeat
+  succeeds (b3_provisioning_test.rb:156-157). Undo: a re-invite restores
+  the target group's row, thread access and open-poll votes only;
+  `invite_users` resets `admin`, `accepted_at`, `inviter_id` and the
+  revocation stamps (group_service.rb:72-80), so `delegate` survives and
+  the row comes back pending with a fresh invitation unless the person
+  is a verified member of the organisation.
+- `POST /b3/users` (not wrapped): `is_admin` permitted; with a name and
+  `DEFAULT_ONBOARDING_GROUP_ID` set it joins that group.
 
 ## Canonical URLs
 
@@ -848,17 +1135,18 @@ All Loomio API errors are JSON (`render json:` in `Api::V1::SnorlaxBase`).
 | Status | Body | Source | Connector |
 |---|---|---|---|
 | 400 | `{"error":400}` | `ActionController::UnpermittedParameters` / `ParameterMissing` — a key `PermittedParams` does not list (`discussion_id` on a poll, a nested `comment` hash, `compact` on a write) | `LoomioApiError` |
-| 403 | `{"error":"You are not authorized to access this page."}` | CanCan's default message for a bare `raise CanCan::AccessDenied` (Loomio's `server.en.yml` defines no `unauthorized.default`). Raised by `authenticate_api_key!` (no active user owns the key) on every b2 path; by `records_visible_in_group` — called **only** from `DiscussionsController#index` and `PollsController#index` (the GET index, not `#create` on the same paths) — when the group is not visible to the caller; by `PollService.invite` on `POST /b2/polls` for an anonymous poll that is not active (no future `closing_at`), **after** the poll was saved; and by `Api::B3::UsersController#authenticate_api_key!` on every b3 path when the bearer does not `secure_compare` to the server's `ENV['B3_API_KEY']` or that variable is unset / ≤ 16 chars. **Never** for visibility on `/b2/groups` (index), `/b2/threads…`, `/b2/search` or `/b2/reports` — those filter or 404 instead — so there the body means the key and nothing else. `MembershipsController#index` never raises it (a non-member gets `200 []`), `show` actions use `load_and_authorize` (the message-bearing body below). | `LoomioAuthError` kind `unauthenticated`; the message hedges towards visibility only on the two gated lists **and only on GET**, names the poll exception on `POST /b2/polls`, says "key, nothing else" on the filter-only paths, is definitive ("key rejected") when a **fresh** (< 60 s) health verdict says so, and on `/b3/` paths names the b3 secret and ignores the health verdict |
+| 403 | `{"error":"You are not authorized to access this page."}` | CanCan's default message for a bare `raise CanCan::AccessDenied` (Loomio's `server.en.yml` defines no `unauthorized.default`). Raised by `authenticate_api_key!` (no active user owns the key) on every b2 path; by `records_visible_in_group` — called **only** from `DiscussionsController#index` and `PollsController#index` (the GET index, not `#create` on the same paths) — when the group is not visible to the caller; by `PollService.invite` on `POST /b2/polls` for an anonymous poll that is not active (no future `closing_at`), **after** the poll was saved; by `TagService.authorize_create_tag_names!` on a discussion / poll create carrying a tag name the user may not create (Loomio ≤ 3.12 only; 3.13 drops such tags silently); and by `authenticate_api_key!` (`Api::B3::BaseController` since 3.13.0, `Api::B3::UsersController` before) on every b3 path when the bearer does not `secure_compare` to the server's `ENV['B3_API_KEY']` or that variable is unset / ≤ 16 chars. **Never** for visibility on `/b2/groups` (index), `/b2/threads…`, `/b2/search` or `/b2/reports` — those filter or 404 instead — so there the body means the key and nothing else. `MembershipsController#index` never raises it (a non-member gets `200 []`), `show` actions use `load_and_authorize` (the message-bearing body below). | `LoomioAuthError` kind `unauthenticated`; the message hedges towards visibility only on the two gated lists **and only on GET**, names the poll exception on `POST /b2/polls`, says "key, nothing else" on the filter-only paths, is definitive ("key rejected") when a **fresh** (< 60 s) health verdict says so, and on `/b3/` paths names the b3 secret and ignores the health verdict |
 | 403 | `{"error":"Not authorized to <action> <Model>."}` | CanCan `authorize!` with a message (`unauthorized.manage.all`) — per-record permission. `Not authorized to show Group.` on `GET /b2/groups/:id` = the group exists and is hidden from the user | kind `not_authorized`, message verbatim; the group-show case is explained as *hidden group, remedy is membership* |
 | 403 | `{"error":"User is not an admin"}` | `memberships#create` `authorize_manage_group!` | kind `not_admin` |
-| 403 | `{"error":403}` | `respond_with_standard_error` for `Subscription::MaxMembersExceeded` | kind `plan_limit` |
+| 403 | `{"error":403}` | `respond_with_standard_error` for `Subscription::MaxMembersExceeded`; on the b3 membership routes (3.13.0+) also `Subscription::NotActive` (b3/base_controller.rb:6: the target group's subscription is inactive or expired) | kind `plan_limit`; the message names the inactive-subscription cause, and on `/b3/memberships` says the b3 secret was accepted |
 | 403 | `{"error":"…thread limit…","action":"upgrade"}` | `respond_with_thread_limit_reached` (`Subscription::MaxThreadsExceeded`) | kind `plan_limit` |
 | 403 | non-JSON, or JSON whose `type` URL names cloudflare (e.g. title "Error 1010: Access denied") | **not Loomio** — a CDN/WAF in front | kind `waf` |
-| 404 | `{"error":404}` | `ActiveRecord::RecordNotFound` — an unknown id, **or** on `/b2/threads/{id}…` a thread the user may not see (`TopicQuery.visible_to(user).find`); also a plain routing miss for a removed route | `LoomioApiError`; the thread tools say both readings, `get_group` says "wrong identifier, not restricted" |
-| 422 | `{"errors":{"field":["message", …]}}` | `ActiveRecord::RecordInvalid` (a discussion's `private` against the group's policy, a poll's `closing_at` in the past, a frozen anonymous poll) | `LoomioApiError` with fields joined |
+| 400 | `{"error":400}` on `/b3/memberships` (3.13.0+) | `ServerMembershipService::InvalidParameters` (an address failing the email check or over 200 chars, a non-boolean role, no role given), `ParameterMissing`, `UnpermittedParameters` — nothing changed | `LoomioApiError`, explained per tool |
+| 404 | `{"error":404}` | `ActiveRecord::RecordNotFound` — an unknown id, **or** on `/b2/threads/{id}…` a thread the user may not see (`TopicQuery.visible_to(user).find`); on `POST /b2/comments` since 3.11.0 (ac5c1e044) also `ParentDeleted` — the target discussion / comment / poll / stance / outcome is missing or soft-deleted, raised before authorization; on `/b3/memberships…` an unknown or deleted group, an unknown (or, for PATCH, revoked) membership; also a plain routing miss for a removed route — or, on `/b3/groups` / `/b3/memberships`, a Loomio older than 3.13 | `LoomioApiError`; the thread tools say both readings, `get_group` says "wrong identifier, not restricted", `create_comment` and the b3 provisioning tools explain per operation |
+| 422 | `{"errors":{"field":["message", …]}}` | `ActiveRecord::RecordInvalid` (a discussion's `private` against the group's policy, a poll's `closing_at` in the past, a frozen anonymous poll, STV `stv_seats` ≥ the option count on 3.10+); `{"errors":{"email":["belongs to a deactivated account"]}}` from `POST /b3/memberships` | `LoomioApiError` with fields joined; the STV case is refused client-side first; the b3 case adds "reactivate_user first, nothing changed" |
 | 429 | `text/plain` "Retry later" (+ `Retry-After` only if the instance enables it) | Rack::Attack `throttle('req/ip', limit: 900 * RATE_MULTIPLIER, period: 5.minutes)`, keyed on client IP (`CF-Connecting-IP` when behind Cloudflare) | `LoomioApiError` with a retry message naming the remaining fan-out (`get_user_activity`, one report per group) |
 | 429 | `{"flash":{"error":"Daily invitation limit reached…"}}` | `ThrottleService::LimitReached` (invitations) | `LoomioApiError` with Loomio's message |
-| 500 | HTML / empty | `ParticipationReportService` on a malformed `start_month` / `end_month`, an unknown `interval` or `member_type`; `CommentsController#create` with a `parent_id` that does not exist | `LoomioApiError`; the connector validates months / member_type client-side so it never sends the malformed forms |
+| 500 | HTML / empty | `ParticipationReportService` on a malformed `start_month` / `end_month`, an unknown `interval` or `member_type`; `CommentsController#create` with a `parent_id` that does not exist (≤ 3.10; 3.11+ answers 404); b2 `memberships#create` on a group whose subscription is inactive | `LoomioApiError`; the connector validates months / member_type client-side so it never sends the malformed forms |
 | 401 | anything, on a `/b2/` or `/b3/` path | **not Loomio's b2/b3** — both raise `CanCan::AccessDenied` for every authentication failure, rendered 403 by `SnorlaxBase`; a 401 here is a proxy / CDN / basic-auth gate in front | `LoomioAuthError` (status 401, no `kind`), explained as such |
 | 401 | `{"error":"you gotta be signed in"}`, on a `/v1/` path | **Loomio itself**: `Api::V1::RestfulController#require_current_user` renders 401; v1 resolves its user from the session cookie only, so the API key is not a v1 credential. The connector's one v1 call (`boot#version`) carries no such guard | `LoomioAuthError` (status 401), message names both Loomio's session 401 and a possible proxy |
 
@@ -898,14 +1186,82 @@ deprecation or compatibility policy — its product changelog
 | 2026-09-17 | 3.8.0 | **Instance `is_admin` removed from every b2 authorization check.** | The "an `is_admin` user sees every group" claim is false. | **Done 0.0.11**: claim removed |
 | 2026-09-17 | 3.8.0 | `compact=1`, documented `exclude_types`, exact `meta.total` (omitted when undefined); `GET /api/b2/search` (typo-tolerant since 3.8.1); `/api/b2/chatbots`; OpenAPI 3.1 document in the repo. | Payload trimming; search tool. | **Done 0.0.12**: read profiles, `search_content`, `total` on every collection; chatbots deliberately not wrapped |
 | 2026-09-18 → 09-23 | 3.8.2, 3.9.0 | **No b2 / b3 API change.** The `namespace :b2` and `namespace :b3` blocks of `config/routes.rb` (16 and 21 lines), the OpenAPI document and `app/models/permitted_params.rb` are byte-identical to 3.8.1; the 3.9.0 diff (206 files, mostly sign-in / passkey / session code) touches no b2 / b3 controller, `app/models/permitted_params.rb`, ability or b2-emitted serializer (only `current_user` and `pending`); `GroupService.invite` (under `manage_memberships`, via b2 `memberships#create`) gains an optional `recipient_audience` that resolves to `User.none` when absent, so the call is unchanged in effect; `Stance.redeemable`, `TopicItemService.move`, `Membership#remove_admin!` (removed) and the passkey rate limits alter no b2 request or response. | None. `TESTED_LOOMIO_VERSION` → 3.9.0 so the drift warning stays quiet on 3.9.x. | **Done 0.0.14**: the 14 read tools re-run live on the 3.9.0 instance (27/27, shapes identical to the 3.8.1 captures); writes and b3 not re-run (unchanged controllers and permitted parameters) |
-| 2026-09-24 → 10-02 | master, **unreleased** (e96b61311) | **Vote weights and serializer trims.** `PollSerializer` drops `voting_system`, adds `result_heading_keys` and `weighted_voting` (917b2c2e4, c631bd475); `StanceSerializer` adds `weight`; poll `permitted_params` gain `weighted_voting`; user-scoped fields (`my_stance`, `current_user_followed`, …) are emitted only with a current user (7b6b52fdb); `threads#markdown` calls `authorize!(:export, thread)` with Topic `:export` = `can?(:show, topic)` (a117c62fa); `ThreadMarkdownService` (df28cf845) applies only the until-closed rule (`poll.results_available?`): an open `until_vote` poll's results are exported to every reader with `:show` on the thread, comments under votes of an open `until_closed` poll are omitted from the export and from the search index `/b2/search` reads, and replies to stances are no longer rejected (`Comment#parent_vote_results_visible_to_all` removed); its layout changes too (front matter gains `key`, `·`-joined H1, nested blockquotes, username fallback for nameless users); b2 `memberships#create` no longer calls `PollService.group_members_added`; OpenAPI moved to `docs/en/…` (c47d783cf, same bytes). | Already tolerant: `voting_system` is an optional passthrough read nowhere; new poll fields pass through on `get_poll`, `list_polls` rows and the write echoes (`shapePoll` removes a fixed deny-list) and are dropped on `list_thread_items` polls (`ITEM_POLL_FIELDS` allow-list); a stance `weight` is dropped everywhere (`STANCE_FIELDS`, `OWN_STANCE_FIELDS`); API-key requests always have a current user; a visible thread's markdown is still served (the new `authorize!(:export)` is `can?(:show)`) and passed through verbatim — `markdownHeading` still finds the first H1 — but `get_thread_markdown` will disclose an open `until_vote` poll's results to non-voters; newly added members are no longer auto-enrolled in open polls (Loomio-side). | **Watch**: re-verify when a tag ships it; decide whether `get_thread_markdown` should warn about or strip until_vote results; refresh the `get_thread_markdown` scope note (`MARKDOWN_SCOPE_NOTE`, `src/tools/threads.ts`) and HOWTO's front-matter list; consider exposing `weighted_voting` / `weight` then |
+| 2026-09-24 → 10-02 | master, **unreleased** (e96b61311) | **Vote weights and serializer trims.** `PollSerializer` drops `voting_system`, adds `result_heading_keys` and `weighted_voting` (917b2c2e4, c631bd475); `StanceSerializer` adds `weight`; poll `permitted_params` gain `weighted_voting`; user-scoped fields (`my_stance`, `current_user_followed`, …) are emitted only with a current user (7b6b52fdb); `threads#markdown` calls `authorize!(:export, thread)` with Topic `:export` = `can?(:show, topic)` (a117c62fa); `ThreadMarkdownService` (df28cf845) applies only the until-closed rule (`poll.results_available?`): an open `until_vote` poll's results are exported to every reader with `:show` on the thread, comments under votes of an open `until_closed` poll are omitted from the export and from the search index `/b2/search` reads, and replies to stances are no longer rejected (`Comment#parent_vote_results_visible_to_all` removed); its layout changes too (front matter gains `key`, `·`-joined H1, nested blockquotes, username fallback for nameless users); b2 `memberships#create` no longer calls `PollService.group_members_added`; OpenAPI moved to `docs/en/…` (c47d783cf, same bytes). | Already tolerant: `voting_system` is an optional passthrough read nowhere; new poll fields pass through on `get_poll`, `list_polls` rows and the write echoes (`shapePoll` removes a fixed deny-list) and are dropped on `list_thread_items` polls (`ITEM_POLL_FIELDS` allow-list); a stance `weight` is dropped everywhere (`STANCE_FIELDS`, `OWN_STANCE_FIELDS`); API-key requests always have a current user; a visible thread's markdown is still served (the new `authorize!(:export)` is `can?(:show)`) and passed through verbatim — `markdownHeading` still finds the first H1 — but `get_thread_markdown` will disclose an open `until_vote` poll's results to non-voters; newly added members are no longer auto-enrolled in open polls (Loomio-side). | **Superseded**: shipped in 3.10.0 – 3.13.x and handled in 0.0.16 — see the next section (one correction: invitees are still enrolled in open polls, asynchronously) |
 
-## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0)
+## Loomio 3.9 → 3.13.1 changes that matter (written 2026-10-24)
+
+From Loomio's source, tests and OpenAPI document at `v3.9.0` and
+`v3.13.1` (`git diff v3.9.0..v3.13.1`), plus sanitized live captures of
+the b2 reads from a 3.13.1 instance (2026-10-24, a non-admin key).
+"Release" is the first tag containing the commit. The b2 route block is
+byte-identical between the two tags; b3 gained the provisioning routes.
+Everything here is handled in **0.0.16** unless the last column says
+otherwise.
+
+| Release | Commit | Change | Effect on the connector |
+|---|---|---|---|
+| 3.10.0 | df28cf845 (a117c62fa added, then reverted, an until_vote refusal) | **Markdown export ignores `until_vote`.** `ThreadMarkdownService` renders polls by `results_available?` alone (thread_markdown_service.rb:213-215; test :222-250): an open until_vote poll's votes and results table go to every reader with `:show`. `threads#markdown` calls `authorize!(:export)` = `can?(:show)`. New layout (front matter `key` / `url`, `·`-joined title, nested-blockquote reply tree, `#<seq>` item headers, `_Removed_` placeholders); comments under votes of an open until_closed poll are omitted. | **P0, live since 3.10**: `get_thread_markdown` disclosed what the JSON tools withhold. Now a guard reads the thread first and refuses (`VisibilityRefusalError`) when an open until_vote poll the user has not voted in is present — including a poll moved into a Poll topic and a poll whose `topic_id` was PATCHed away from its items (both below). Scope note and `heading` doc follow the new layout. |
+| 3.10.0 | 917b2c2e4 | `voting_system` removed: anonymous polls always use ballots, which b2 does not serialize (no stances). | `ITEM_POLL_FIELDS` drops it; docs no longer claim anonymous stances carry `participant_id: null`. |
+| 3.10.0 | 14c07ef6c, 42f7199e7, a3736458b, 159a9c7a9 | **Vote weights**: `weighted_voting` poll setting, `Stance#weight`, `Membership#weight` (decimal strings); weighted tallies; `result_heading_keys`; `total_score` a BigDecimal (JSON string `"3.0"`, integer 0 when empty); `results[]` adds `unweighted_score`; `voter_scores` is `{}` except on meeting polls. | Pass-through, no arithmetic. `result_heading_keys` kept on weighted polls only; stance / own-stance / membership `weight` surfaced (stances only on weighted polls); list rows drop `weighted_voting: false`; types widened. |
+| 3.10.0 | 35b632cc7 | STV `stv_seats` must be fewer than the options (`Poll#stv_settings_are_valid`, poll.rb:870-896) — else 422. | `create_poll` refuses it before sending. |
+| 3.10.0 | 3d9f313d0 | `maximum_stance_choices` = the option count for `dot_vote`, `score`, `ranked_choice`, `stv` (and `meeting`): no stored setting; ranked choice is "at least `minimum_stance_choices`". | Documented (HOWTO create_poll). |
+| 3.10.0 | 12c02dcd3 | Reactivation restores the open-poll ballots revoked with the deactivation and enqueues `PollGroupMembersAddedWorker` per restored group. | `reactivate_user` text and docs. |
+| 3.10.0 | 12c02dcd3 | b2 `memberships#create` no longer runs `PollService.group_members_added` synchronously; `GroupService.invite_users` still enqueues `PollGroupMembersAddedWorker` (every unclosed, non-specified-voters poll, drafts and scheduled ones included). | Invitees get ballots asynchronously — corrects the 0.0.14 "no longer auto-enrolled" note. |
+| 3.11.0 | 79280ee7a, e3f18abfd | Counters retired: TopicSerializer drops `members_count`, `closed_polls_count`, `anonymous_polls_count` (adds `has_anonymous_polls`); GroupSerializer drops `closed_polls_count`, `delegates_count`, `discussion_templates_count`, `org_discussions_count`; `subgroups_count` counted per read; `active_polls_count` maintained transactionally (`Poll#update_poll_counts`, poll.rb:272-276, 312-331). | Kept in the join lists for ≤ 3.10 servers (`pick` skips absent keys). The Markdown guard does NOT rely on `active_polls_count`: it follows `polls.topic_id`, which a poll PATCH can change without moving the poll's items (see `/markdown` above). |
+| 3.11.0 | 8eb9236a4 | `PollSerializer#voter_has_access` (the web client's vote-button state). | Dropped (`POLL_DROP`). |
+| 3.11.0 | 56ca88d8e | `change_note` on `discussion_edited` / `poll_edited` items. | Surfaced on `list_thread_items` items when non-empty, capped by `body_max_chars`. |
+| 3.11.0 | 70c5a5a93 | `TopicItemSerializer has_one :reply_parent` into `parent_topic_items`, gated by the cache scope, not `exclude_types`; `reply_parent_id` is a TopicItem id. | A few `parent_topic_items` rows arrive even under `compact`; ignored (not suppressible client-side). `reply_parent_id` not surfaced: a comment's `parent_id` / `parent_type` name the real parent. |
+| 3.11.0 | ec3d359ac | `group_privacy` `parent_members` (subgroup visibility separated from joining rules; such subgroups were `closed` before). | Type widened; documented. |
+| 3.11.0 | 6ba2253c4 | Deactivation (and deletion) preserves votes already cast in open polls. | `deactivate_user` text and docs. |
+| 3.11.0 | ac5c1e044 | `CommentService.create` raises `ParentDeleted` (404) before authorizing when the parent is missing or soft-deleted. | `create_comment` explains the 404. |
+| 3.11.1 | bc1a6cc02 | **Bounded pages**: `GET /b2/groups` and `GET /b2/threads/{id}/items` use `page_collection_bounded` — default 50, `limit` clamped to 1..500, `offset`, `meta.total` full; OpenAPI gains `LimitBounded` / `Offset` there and on chatbots. | **P0 / P1 silent truncation**: `list_thread_items` / `get_discussion(include_items)` returned at most 50 items with `next_offset: null`; `list_groups` / `check_connection` at most 50 groups (a member parent could be labelled a non-member). Now the pager (`loomioPager`) follows pages with caps and flags; the probe keeps its unbounded request (first page). |
+| 3.12.0 | e5bd13dfc | `wrap_parameters false` on the B2 base controller: flat or nested bodies; flat top-level keys permit-checked (unknown → 400); `discussion_id` deleted for comments. | No write breaks: nested stays for discussions / polls, flat for comments; comment bodies carry exactly the five permitted keys and no read profile. |
+| 3.13.0 | ee6befeb7 | **b3 provisioning**: `GET /b3/groups`, `GET/POST/PATCH/DELETE /b3/memberships`, `POST /b3/users`; auth moves to `Api::B3::BaseController#authenticate_api_key!`; `Subscription::NotActive` → `{error:403}`. | Five opt-in tools (`list_instance_groups`, `list_instance_memberships`, `add_group_members`, `update_membership_roles`, `revoke_membership`); `remove_absent`, `POST /b3/users` and the user update / destroy / redact routes deliberately not wrapped; `plan_limit` wording extended. Verified from source, tests and docs only. |
+| 3.13.0 | 5934ab182 (6a4827de2, 7320f0cae) | **Contribution tags**: comments, polls and outcomes carry tags; a thread's `tags` is the union (`has_tagged_replies`); Markdown front matter adds `root_tags`; **search `tag` matches only contributions tagged with that name** (`pg_search_documents.tags`), no longer every item of a tagged thread; stances never carry tags; creates drop tags the actor may not create (`TagService.permitted_tag_names`) instead of 403. | `has_tagged_replies` joined; `search_content` `tag` describe and scope note say what changed (a silent behaviour change for the same parameter); create docs say tags may be dropped silently. |
+| 3.13.0 | ad60e7728 | Vote weights apply to quorum; `quorum_reached` added — `false` even on polls with no quorum. | `quorum_count` / `quorum_votes_required` / `quorum_reached` dropped when `quorum_pct` is null. |
+| 3.13.0 | c42eff3af | The id −1 results row is named `poll_receipts_page.not_voted` (was `poll_common_votes_panel.undecided` in 3.10–3.12); `results[]` adds `test_requirement_key`. | Pass-through; documented. |
+| 3.13.0 | 11e5187e6 | Replies to a vote are refused while its poll is open with `hide_results: until_closed` (`Comment#parent_allows_replies?`, comment.rb:124-126; ability/comment.rb:9). | `create_comment` explains the 403 for `parent_type: 'Stance'`. |
+| present at 3.13.1 | — | **A Poll topic can hold more than one poll**: v1 `topics#move_comments` → `MoveCommentsWorker` moves `poll_created` items and their polls into any topic the actor administers, Poll topics included (move_comments_worker.rb:22-25, 38); the thread show never side-loads a moved-in poll. | The Markdown guard scans the items of every thread holding more than its opening item (`items_count` > 1), which a move raises. |
+| present at 3.13.1 | — | **`active_polls_count` is not where the export's polls are**: b2 `PATCH /b2/polls/{id}` permits `topic_id` (permitted_params.rb:39); the count moves with it (poll.rb:272, 312-331, 338-357) but PollService.update moves no item (poll_service.rb:75-140), and the export renders a poll through its `created_topic_item`, not scoped to the topic (has_topic_items.rb:7-17; thread_markdown_service.rb:81-92). The old thread reads 0 and still prints the poll's votes. | The Markdown guard never trusts the count: it scans the items unless `items_count` ≤ 1. |
+
+**OpenAPI mismatches at 3.13.1** (code and tests win):
+
+- `GET /b2/discussions` `status` is documented `default: open`; the
+  controller's fall-through when absent is `kept` — locked threads
+  included. The connector always sends `status`.
+- `PollInput` lists `discussion_id`; `PermittedParams#poll_attributes`
+  has `topic_id` only, so a `discussion_id` answers 400.
+- b2 `POST /b2/memberships` documents `remove_absent` as `oneOf` boolean
+  | integer; the controller reads `params[:remove_absent].to_i == 1`, and
+  a JSON `true` has no `#to_i` → HTTP 500 after the invitations were
+  sent. The connector sends the integer `1`. (b3's sync does take a
+  boolean.)
+- `GET /b2/search` documents `order` as `enum: [authored_at_desc]`; the
+  controller also honours `authored_at_asc`, and anything else means
+  relevance.
+- The b3 indexes reference the shared `Limit` parameter (minimum 1,
+  default 50, no maximum); the server clamps to 50 (the responses say
+  "default and maximum page size 50"). The connector's schema stops at
+  50.
+
+## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0 and captured 2026-10-24 on 3.13.1)
 
 Reads were captured with a non-admin key (roots and `meta.total`
 presence are what `tests/fixtures.ts` follows, anonymised); writes ran
 in a private sandbox group where the key's user is a plain member and
 every record was discarded afterwards.
+
+**2026-10-24, Loomio 3.13.1.** Sanitized captures of the b2 reads with
+the connector's non-admin key: thread items default to a page of 50,
+`limit` is honoured (a larger value is clamped to 500 by the code;
+the captured thread had only 33 items, so the clamp itself is proven
+by `base_controller.rb:13-16` and Loomio's
+`groups_controller_test.rb:54-68`, not by the capture), `offset` works
+and `meta.total` is the full count; the groups index pages the same way
+(a `limit=2&offset=2` capture shows two subgroups in `groups` and their
+member parent only under `parent_groups`, with its own membership
+row); poll, search and report shapes match the 3.10–3.13 serializer
+changes above. No write and no b3 route was run live on 3.13.1.
 
 **2026-10-02, Loomio 3.9.0.** After the reference instance's 3.8.1 →
 3.9.0 upgrade (2026-09-23) the 14 read tools were re-run against it:
@@ -1031,5 +1387,9 @@ resolver), `create_comment` (form-encoded) and `manage_memberships`
   connector includes it when present and says so when not.
 - How `pg_search_words` (the "did you mean" vocabulary) is refreshed on a
   given instance — typo tolerance in `search_content` depends on it.
-- Whether `GET /b2/threads/{id}/items` will grow pagination; until it
-  does, a huge thread costs one full fetch per call.
+- The b3 provisioning routes (3.13.0+) have not been exercised live:
+  everything the five tools assume comes from Loomio's source,
+  `test/integration/b3_provisioning_test.rb` and server-api.md.
+- Whether a discussion / poll create echo carries the `tags` that
+  survived `TagService.permitted_tag_names` (3.13+); no upstream test
+  asserts it, so the connector does not compare request and echo.

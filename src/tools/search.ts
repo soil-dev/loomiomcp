@@ -39,7 +39,16 @@ import { positiveId } from "./_common.js";
 //              subgroups) exists too; the tool exposes group_id.
 //   type / types   one `SEARCHABLE_TYPES` value, or a comma-separated
 //              list (`types=Poll,Outcome`; unknown names are dropped).
-//   tag        a topic tag; Loomio intersects with `group_ids`.
+//   tag        Loomio ≥ 3.13.0 (5934ab182) matches
+//              `pg_search_documents.tags @> [tag]` (v1
+//              search_controller.rb:21-23): only CONTRIBUTIONS explicitly
+//              tagged with that name — the opening post, a comment, a
+//              poll, an outcome. It no longer selects every item of a
+//              tagged thread, and a vote (Stance) never carries tags.
+//              Before 3.13 it selected whole threads: every document in
+//              a topic of the user's groups whose tags contain it. Same
+//              parameter, different answer — a silent behaviour change
+//              the scope note states when `tag` is used.
 //   order      `authored_at_desc` / `authored_at_asc` reorder the exact
 //              AND the fuzzy matches by date (SearchQuery#sort_by_
 //              authored_at, so a recent fuzzy match can outrank an older
@@ -64,7 +73,8 @@ import { positiveId } from "./_common.js";
 // voter name — app/models/stance.rb `pg_search_insert_statement`)
 // EXCEPT those of an open `until_closed` poll, which are indexed only
 // once the poll closes (`ReindexPollWorker`). Open `until_vote` polls
-// ARE indexed, so `search_content({types: ['Stance']})` would hand a
+// ARE indexed (re-checked at 3.13.1: stance.rb:47-50 excludes only
+// `hide_results = 2`, until_closed, while open), so `search_content({types: ['Stance']})` would hand a
 // caller whose user has not voted exactly the reasons the poll's author
 // said nobody sees before voting — the same content list_thread_items
 // strips (src/loomio/visibility.ts). Loomio's own web search shows a
@@ -120,7 +130,13 @@ export const searchContentSchema = z
       .min(1)
       .optional()
       .describe("Record types to include; default all (e.g. ['Outcome'])."),
-    tag: z.string().min(1).optional().describe("Only threads carrying this tag (exact name)."),
+    tag: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Only items tagged with this exact name (Loomio < 3.13: every item of a tagged thread).",
+      ),
     order: z
       .enum(SEARCH_ORDERS)
       .optional()
@@ -155,7 +171,20 @@ export interface SearchHit {
   discussion_key: string | null;
   poll_key: string | null;
   poll_id: number | null;
-  /** Position of the item in its thread, when the hit is an item inside a discussion. */
+  /**
+   * The hit's position in its thread (list_thread_items' `sequence_id`;
+   * Loomio 3.13.1 search_controller.rb:93-110): 0 on a Discussion hit;
+   * the item's own sequence on a comment or outcome (also in a
+   * standalone poll's thread, where the hit has a `poll_key` and no
+   * `discussion_key`) and on a poll or vote inside a discussion; null
+   * on a standalone poll's own hit and on a vote in a standalone poll's
+   * thread. WHY the vote gap: the first lookup is `TopicItem.tags_visible`,
+   * built on `taggable` — the new_discussion / poll_created /
+   * outcome_created / new_comment kinds only (has_item_tags.rb:4-24), so
+   * never a `stance_created` item — and the stance lookup runs only
+   * `elsif discussion`, which is nil for a standalone poll's vote
+   * (stance.rb:34 indexes `discussion_id` NULL there).
+   */
   sequence_id: number | null;
   url?: string;
 }
@@ -194,12 +223,17 @@ const SEARCH_SCOPE_NOTE =
   "`snippet_hidden_reason`. Never use search to probe hidden vote reasons. `group." +
   "full_name` is Loomio's 'Parent - Subgroup' form; join on `group.id`, not on the name.";
 
+/** Appended when `tag` was given: Loomio 3.13 changed what it matches (see the module note). */
+const SEARCH_TAG_NOTE =
+  " tag: on Loomio 3.13+ only contributions explicitly tagged with that name match (votes never do); " +
+  "older Loomio matched every item of a thread carrying the tag.";
+
 /**
  * Where the hit lives on the web: an item inside a discussion opens the
- * thread scrolled to it (`?sequence_id=`, or `?comment_id=` for a
- * comment — the controller gives comments no sequence_id), a discussion
- * opens itself, a standalone poll (or its votes / outcomes) opens the
- * poll page. `undefined` when the row names no key.
+ * thread scrolled to it (`?comment_id=` for a comment, which Loomio's
+ * thread page resolves; `?sequence_id=` for a vote or outcome), a
+ * discussion opens itself, a standalone poll (or its comments, votes,
+ * outcomes) opens the poll page. `undefined` when the row names no key.
  */
 export function searchHitUrl(row: LoomioSearchResult): string | undefined {
   if (row.discussion_key) {
@@ -307,7 +341,7 @@ export async function searchContent(input: SearchContentInput): Promise<SearchCo
       types: input.types ?? null,
       tag: input.tag ?? null,
       order,
-      note: SEARCH_SCOPE_NOTE,
+      note: input.tag !== undefined ? SEARCH_SCOPE_NOTE + SEARCH_TAG_NOTE : SEARCH_SCOPE_NOTE,
     },
   };
 }

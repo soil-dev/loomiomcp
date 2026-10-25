@@ -15,21 +15,35 @@ import { positiveId } from "./_common.js";
 // Auth: `Authorization: Bearer <B3_API_KEY>` — the server-instance secret
 // (`ENV['B3_API_KEY']`, >16 chars), NOT a per-user API key. These tools
 // are registered only when LOOMIO_B3_API_KEY is set, and skipped in
-// read-only mode.
+// read-only mode. Since Loomio 3.13.0 (ee6befeb7) the check lives in
+// `Api::B3::BaseController#authenticate_api_key!` (shared with the
+// provisioning controllers, src/tools/server-admin.ts) instead of
+// UsersController's own — same rule, and the routes and payloads below
+// are unchanged through 3.13.1.
 //
 // Response (`Api::B3::UsersController#user_json`): `{ success: true,
 // user: {…} }` for both. The two calls differ in timing:
-//   - deactivate enqueues `DeactivateUserWorker` and returns at once. The
-//     echoed `user` is re-read BEFORE the job runs, so it can still show
-//     `active: true` / `deactivated_at: null`; the worker then stamps
-//     `deactivated_at`, revokes every active membership with that
-//     timestamp, revokes mobile devices and drops pending membership
-//     requests. Re-read later to confirm.
+//   - deactivate enqueues `DeactivateUserWorker.perform_later(user.id,
+//     user.id)` and returns at once — the USER is recorded as its own
+//     actor (`deactivator_id`, and `revoker_id` on what it revokes;
+//     deactivate_user_worker.rb:9,11), so Loomio's records read as a
+//     self-deactivation; nothing names the operator. The echoed `user` is
+//     re-read BEFORE the job runs, so it can still show `active: true` /
+//     `deactivated_at: null`; the worker then stamps `deactivated_at`,
+//     revokes every active membership with that timestamp, revokes mobile
+//     devices and drops pending membership requests. Votes already CAST
+//     in open polls are kept since Loomio 3.11.0 (6ba2253c4,
+//     `preserve_cast_votes: true`); only undecided ballots are revoked.
+//     Re-read later to confirm.
 //   - reactivate is synchronous (`UserService.reactivate`): it clears
 //     `deactivated_at` AND restores the memberships whose `revoked_at`
 //     equals the deactivation timestamp — i.e. exactly the memberships
-//     the deactivation revoked come back. The echoed `user` is already
-//     `active: true`.
+//     the deactivation revoked come back — and, since Loomio 3.10.0
+//     (12c02dcd3), the open-poll ballots revoked at that same timestamp
+//     (closed polls stay as they were). It then enqueues
+//     `PollGroupMembersAddedWorker` per restored group, so polls opened
+//     while the user was away give them a ballot shortly after. The
+//     echoed `user` is already `active: true`.
 //
 // Both answer 404 (`RecordNotFound`) when the user is not in the expected
 // state: deactivate finds in `User.active`, reactivate in
@@ -108,7 +122,8 @@ export async function reactivateUser(
 //
 // Identity route caveat: Rails' default segment pattern excludes "." so
 // a uid containing a dot (most emails) is split into uid + format by the
-// router and answers 404 in 3.8.1. Address such users by numeric id.
+// router and answers 404 — in 3.8.1 and still in 3.13.1 (the identity
+// routes carry no `constraints:`). Address such users by numeric id.
 
 /** `GET /b3/users/{id}` and `…/identity/{type}/{uid}` both answer `{ user }`. */
 export interface B3UserShowResponse {

@@ -1,10 +1,18 @@
 /**
- * Anonymised Loomio 3.8.1 response fixtures for the tool tests.
+ * Anonymised Loomio response fixtures for the tool tests.
  *
  * Field names, nesting, which roots each endpoint side-loads and where
  * `meta.total` appears follow live captures from a 3.8.1 instance
  * (GET /b2/groups, /b2/groups/{id}, /b2/discussions[?exclude_types],
- * /b2/discussions/{id}, /b2/polls, /b2/memberships?compact=1). Every
+ * /b2/discussions/{id}, /b2/polls, /b2/memberships?compact=1) and,
+ * for the records Loomio 3.10–3.13 reshaped, from a 3.13.1 instance:
+ * polls (no `voting_system`; `weighted_voting`, `result_heading_keys`,
+ * `voter_has_access`, `quorum_reached`, a decimal-string
+ * `total_score`), topics (no `members_count` / `closed_polls_count` /
+ * `anonymous_polls_count`; `has_anonymous_polls`,
+ * `has_tagged_replies`), groups (no `closed_polls_count` /
+ * `delegates_count` / `discussion_templates_count` /
+ * `org_discussions_count`), memberships and stances (`weight`). Every
  * id, name, handle, title and body is illustrative. Builders take
  * overrides so a test states only what it is about.
  */
@@ -115,12 +123,10 @@ export function groupRow(overrides: Partial<LoomioGroup> = {}): LoomioGroup {
     admins_can_edit_user_content: true,
     polls_count: 2,
     poll_templates_count: 0,
-    closed_polls_count: 1,
     discussions_count: 21,
     group_privacy: "open",
     listed_in_explore: true,
     memberships_count: 12,
-    delegates_count: 0,
     pending_memberships_count: 0,
     accepted_memberships_count: 12,
     membership_granted_upon: "invitation",
@@ -143,11 +149,9 @@ export function groupRow(overrides: Partial<LoomioGroup> = {}): LoomioGroup {
     ],
     has_custom_cover_photo: true,
     cover_url: "/example.png",
-    discussion_templates_count: 1,
     is_visible_to_public: true,
     is_visible_to_parent_members: false,
     parent_members_can_see_discussions: true,
-    org_discussions_count: 436,
     org_members_count: 395,
     subscription: {
       max_members: null,
@@ -183,7 +187,6 @@ export const FINANCE = groupRow({
   description: "<p>Budget, treasury and grants.</p>",
   parent_id: 7,
   polls_count: 9,
-  closed_polls_count: 7,
   discussions_count: 32,
   memberships_count: 8,
   accepted_memberships_count: 8,
@@ -214,6 +217,29 @@ export const VOLUNTEERS = groupRow({
 
 export const EXAMPLE_ORG = groupRow();
 
+/**
+ * A subgroup visible to the parent's members only: `group_privacy:
+ * "parent_members"` (Loomio 3.11+, ec3d359ac; before 3.11 Loomio called
+ * it `closed`).
+ */
+export const BOARD = groupRow({
+  id: 16,
+  key: "grpKEY16",
+  handle: "example-org-board",
+  name: "Board",
+  full_name: "Example Org - Board",
+  description: "<p>Board minutes.</p>",
+  parent_id: 7,
+  group_privacy: "parent_members",
+  is_visible_to_public: false,
+  is_visible_to_parent_members: true,
+  discussion_privacy_options: "private_only",
+  memberships_count: 5,
+  accepted_memberships_count: 5,
+  subgroups_count: 0,
+  current_user_membership_id: 9016,
+});
+
 // ── Memberships (MembershipSerializer; own rows carry volume_* ) ────────────
 
 export function membershipRow(overrides: Partial<LoomioMembership> = {}): LoomioMembership {
@@ -226,6 +252,7 @@ export function membershipRow(overrides: Partial<LoomioMembership> = {}): Loomio
     volume_push: "normal",
     admin: false,
     delegate: false,
+    weight: "1",
     experiences: {},
     title: null,
     created_at: "2026-05-27T13:18:28.444Z",
@@ -269,6 +296,10 @@ export function groupShowBody(
 }
 
 // ── Topics (TopicSerializer) ────────────────────────────────────────────────
+//
+// The 3.13 row. Loomio ≤ 3.10 also sent `members_count`,
+// `closed_polls_count` and `anonymous_polls_count`; tests that are about
+// those pass them as overrides.
 
 export function topicRow(overrides: Partial<LoomioTopic> = {}): LoomioTopic {
   return {
@@ -290,11 +321,10 @@ export function topicRow(overrides: Partial<LoomioTopic> = {}): LoomioTopic {
     pinned_at: "2026-05-29T11:28:24.096Z",
     topicable_id: 601,
     topicable_type: "Discussion",
-    members_count: 369,
-    anonymous_polls_count: 0,
-    closed_polls_count: 0,
+    has_anonymous_polls: false,
     seen_by_count: 103,
     tags: ["guide"],
+    has_tagged_replies: false,
     reader_volume_email: "normal",
     reader_volume_push: "normal",
     last_read_at: null,
@@ -353,7 +383,6 @@ export const TOPIC_702 = topicRow({
   last_activity_at: "2026-08-03T23:53:13.598Z",
   pinned_at: null,
   topicable_id: 602,
-  members_count: 27,
   seen_by_count: 26,
   tags: [],
   discussion_id: 602,
@@ -397,7 +426,7 @@ export function pollRow(overrides: Partial<LoomioPoll> = {}): LoomioPoll {
     author_id: 502,
     anonymous: false,
     legacy_anonymous_vote_reasons_count: 0,
-    voting_system: "stance",
+    voter_has_access: true,
     can_respond_maybe: false,
     chart_type: "pie",
     chart_column: "score_percent",
@@ -423,18 +452,64 @@ export function pollRow(overrides: Partial<LoomioPoll> = {}): LoomioPoll {
     poll_option_names: ["agree", "disagree", "abstain"],
     poll_option_name_format: "plain",
     results: [
-      { id: 1, poll_id: 301, name: "agree", score: 3, voter_ids: [502, 503, 504], voter_count: 3 },
-      { id: 2, poll_id: 301, name: "disagree", score: 1, voter_ids: [505], voter_count: 1 },
-      { id: 3, poll_id: 301, name: "abstain", score: 0, voter_ids: [], voter_count: 0 },
-      { id: -1, poll_id: 301, name: "undecided", score: 0, voter_ids: [506, 507], voter_count: 2 },
+      {
+        id: 1,
+        poll_id: 301,
+        name: "agree",
+        score: 3,
+        unweighted_score: 3,
+        voter_scores: {},
+        voter_ids: [502, 503, 504],
+        voter_count: 3,
+        test_requirement_key: null,
+      },
+      {
+        id: 2,
+        poll_id: 301,
+        name: "disagree",
+        score: 1,
+        unweighted_score: 1,
+        voter_scores: {},
+        voter_ids: [505],
+        voter_count: 1,
+        test_requirement_key: null,
+      },
+      {
+        id: 3,
+        poll_id: 301,
+        name: "abstain",
+        score: 0,
+        unweighted_score: 0,
+        voter_scores: {},
+        voter_ids: [],
+        voter_count: 0,
+        test_requirement_key: null,
+      },
+      {
+        id: -1,
+        poll_id: 301,
+        name: "poll_receipts_page.not_voted",
+        name_format: "i18n",
+        score: 0,
+        unweighted_score: 0,
+        voter_scores: {},
+        voter_ids: [506, 507],
+        voter_count: 2,
+      },
     ],
     result_columns: ["chart", "name", "votes", "votes_cast_percent", "voter_percent", "voters"],
+    result_heading_keys: {
+      name: "common.option",
+      votes: "poll_common.votes",
+      votes_cast_percent: "poll_ranked_choice_form.pct_of_votes_cast",
+      voter_percent: "poll_ranked_choice_form.pct_of_voters",
+    },
     reason_prompt: null,
     shuffle_options: false,
     show_none_of_the_above: false,
     stance_counts: [3, 1, 0],
     specified_voters_only: false,
-    total_score: 4,
+    total_score: "4.0",
     title: "Adopt the 2027 budget?",
     undecided_voters_count: 2,
     voters_count: 6,
@@ -452,10 +527,12 @@ export function pollRow(overrides: Partial<LoomioPoll> = {}): LoomioPoll {
     poll_template_id: null,
     poll_template_key: null,
     quorum_pct: null,
+    quorum_reached: false,
     quorum_count: 0,
     quorum_votes_required: 0,
     topic_id: 711,
     group_id: 7,
+    weighted_voting: false,
     current_outcome_id: null,
     poll_option_ids: [1, 2, 3],
     ...overrides,
@@ -472,7 +549,6 @@ export const POLL_TOPIC = topicRow({
   pinned_at: null,
   topicable_id: 301,
   topicable_type: "Poll",
-  members_count: 12,
   seen_by_count: 9,
   tags: ["budget"],
   poll_id: 301,
@@ -548,6 +624,7 @@ export function ownStanceRow(overrides: Partial<LoomioStance> = {}): LoomioStanc
     redactor_id: null,
     order_at: "2026-09-05T10:00:00Z",
     option_scores: { "1": 1 },
+    weight: "1",
     ...overrides,
   };
 }
@@ -636,7 +713,7 @@ export const STANDALONE_POLL = pollRow({
   poll_option_ids: [11, 12],
   results: [],
   stance_counts: [0, 0],
-  total_score: 0,
+  total_score: "0.0",
   voters_count: 8,
   decided_voters_count: 0,
   undecided_voters_count: 8,
@@ -653,7 +730,6 @@ export const STANDALONE_POLL_TOPIC = topicRow({
   pinned_at: null,
   topicable_id: 302,
   topicable_type: "Poll",
-  members_count: 8,
   seen_by_count: 5,
   tags: [],
   discussion_id: undefined,
@@ -917,26 +993,77 @@ export function pollThreadItemsBody(
   };
 }
 
-/** GET /b2/threads/{topic_id}/markdown — the document Loomio renders. */
+// ── Weighted voting (Loomio 3.10+) ──────────────────────────────────────────
+
+/**
+ * A weighted proposal inside discussion 601's thread: tallies and the
+ * (decimal-string) total in vote-weight units, weighted result headings.
+ */
+export const WEIGHTED_POLL = pollRow({
+  id: 304,
+  key: "polKEY04",
+  title: "Approve the reserve?",
+  topic_id: 701,
+  weighted_voting: true,
+  stance_counts: [2.5, 1, 0],
+  total_score: "3.5",
+  result_heading_keys: {
+    name: "common.option",
+    votes: "poll_common.votes",
+    votes_cast_percent: "poll_common.pct_of_vote_weight_cast",
+    voter_percent: "poll_common.pct_of_eligible_vote_weight",
+  },
+});
+
+/** Votes on WEIGHTED_POLL: the connector user's own (weight 2.5) and Linus's (weight 1). */
+export function weightedStanceRows(): LoomioStance[] {
+  return [
+    ownStanceRow({ id: 941, poll_id: 304, weight: "2.5" }),
+    voterStanceRow({ id: 942, poll_id: 304, weight: "1" }),
+  ];
+}
+
+// ── Thread show (GET /b2/threads/{topic_id}?compact=1) ──────────────────────
+
+/**
+ * The thread's own TopicSerializer row under `threads` (no `tags` field:
+ * compact excludes `tag`), the record it fronts and its author. A poll
+ * thread also carries the user's `my_stance` under `stances` when it
+ * voted (PollSerializer), passed as an override.
+ */
+export function threadShowBody(overrides: Partial<ThreadsResponse> = {}): ThreadsResponse {
+  const { tags: _tags, ...row } = topicRow();
+  return {
+    discussions: [discussionRow()],
+    users: [GRACE],
+    threads: [row],
+    meta: { root: "threads" },
+    ...overrides,
+  };
+}
+
+/** GET /b2/threads/{topic_id}/markdown — the document Loomio ≥ 3.10 renders. */
 export const THREAD_MARKDOWN = [
   "---",
+  'key: "dscKEY01"',
+  'url: "https://www.loomio.com/d/dscKEY01/budget-planning-for-2027"',
   'group: "Example Org"',
   'created: "2026-05-29T11:25:57Z"',
   'last_activity: "2026-08-15T09:03:41Z"',
   'tags: ["guide"]',
   "---",
   "",
-  "# Discussion: Budget planning for 2027 · Grace Sample 2026-05-29 11:25",
+  "# Discussion: Budget planning for 2027 · Grace Sample · 2026-05-29 11:25",
   "",
   "Budget planning for next year.",
   "",
-  "## Comment by Linus Placeholder · 2026-06-01 08:31",
+  "> **Linus Placeholder** · 2026-06-01 08:31 · #1",
+  ">",
+  "> First reply: the draft looks reasonable.",
   "",
-  "First reply: the draft looks reasonable.",
-  "",
-  "## Comment by Grace Sample · 2026-06-16 19:15",
-  "",
-  LONG_MD,
+  "> **Grace Sample** · 2026-06-16 19:15 · #2",
+  ">",
+  `> ${LONG_MD}`,
 ].join("\n");
 
 // ── Search (GET /b2/search?compact=1) ───────────────────────────────────────
@@ -1147,5 +1274,106 @@ export function reportsUsersBody(
     tag_threads_per_user: { guide: { "502": 3, "503": 1 } },
     tag_threads_authored_per_user: { guide: { "502": 3, "503": 1 } },
     ...overrides,
+  };
+}
+
+// ── Paged collections (Loomio ≥ 3.11.1 pages the groups index and thread items) ──
+//
+// Builders for collections longer than one page, for `mockFetchPaged`
+// (tests/test-helpers.ts). Rows are deliberately minimal — a long thread
+// of full-size items would make every budget test about the budget —
+// and every id is illustrative.
+
+/** Example Org as a `parent_groups` row the connector's user is NOT a member of (Loomio sends no own membership id then). */
+export const EXAMPLE_ORG_NON_MEMBER = groupRow({ current_user_membership_id: null });
+
+/** Item id of sequence `seq` in `longThreadItems`; comment ids are `LONG_COMMENT_BASE + seq`. */
+export const LONG_ITEM_BASE = 50_000;
+export const LONG_COMMENT_BASE = 60_000;
+
+/**
+ * A discussion thread (topic 701, discussion 601) of `count` items: the
+ * opening item at sequence 0, then `count - 1` one-line comments by
+ * Linus, in thread order.
+ */
+export function longThreadItems(count: number): LoomioTopicItem[] {
+  const items: LoomioTopicItem[] = [];
+  for (let seq = 0; seq < count; seq++) {
+    items.push(
+      seq === 0
+        ? {
+            id: LONG_ITEM_BASE,
+            sequence_id: 0,
+            kind: "new_discussion",
+            actor_id: 502,
+            itemable_type: "Discussion",
+            itemable_id: 601,
+          }
+        : {
+            id: LONG_ITEM_BASE + seq,
+            sequence_id: seq,
+            kind: "new_comment",
+            actor_id: 503,
+            itemable_type: "Comment",
+            itemable_id: LONG_COMMENT_BASE + seq,
+          },
+    );
+  }
+  return items;
+}
+
+/**
+ * The side-loads Loomio sends with one page of `longThreadItems`: the
+ * comments and actors THAT page references, and the discussion only on
+ * the page holding sequence 0.
+ */
+export function longThreadSideLoads(
+  pageRows: ReadonlyArray<Record<string, unknown>>,
+): Record<string, unknown> {
+  const rows = pageRows as LoomioTopicItem[];
+  const comments: LoomioComment[] = rows
+    .filter((i) => i.itemable_type === "Comment" && i.itemable_id != null)
+    .map((i) => ({
+      id: i.itemable_id as number,
+      body: `c${i.sequence_id}`,
+      body_format: "text",
+      author_id: 503,
+    }));
+  const actors = new Set(rows.map((i) => i.actor_id));
+  return {
+    ...(rows.some((i) => i.sequence_id === 0) ? { discussions: [discussionRow()] } : {}),
+    comments,
+    users: [GRACE, LINUS].filter((u) => actors.has(u.id)),
+  };
+}
+
+/** `count` member groups of the connector's user (ids from 1001), each with its own membership row. */
+export function manyGroups(count: number): LoomioGroup[] {
+  return Array.from({ length: count }, (_, i) =>
+    groupRow({
+      id: 1001 + i,
+      key: `grpMANY${1001 + i}`,
+      handle: `example-group-${1001 + i}`,
+      name: `Group ${1001 + i}`,
+      full_name: `Group ${1001 + i}`,
+      parent_id: null,
+      description: null,
+      link_previews: [],
+      current_user_membership_id: 30_001 + i,
+    }),
+  );
+}
+
+/** The side-loads of one groups-index page: the user's own membership row for each group on it, and the user. */
+export function manyGroupsSideLoads(
+  pageRows: ReadonlyArray<Record<string, unknown>>,
+): Record<string, unknown> {
+  const groups = pageRows as LoomioGroup[];
+  return {
+    parent_groups: [],
+    memberships: groups.map((g) =>
+      membershipRow({ id: g.current_user_membership_id ?? 0, group_id: g.id }),
+    ),
+    users: [ADA],
   };
 }

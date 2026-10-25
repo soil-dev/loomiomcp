@@ -37,7 +37,7 @@ setupLoomioTest();
 function mockUpstream(
   groupsStatus: number,
   groupsBody: unknown,
-  version: unknown = { version: "3.9.0" },
+  version: unknown = { version: "3.13.1" },
 ) {
   vi.mocked(fetch).mockImplementation(async (input) => {
     const path = new URL(String(input)).pathname;
@@ -88,7 +88,7 @@ beforeEach(() => {
 afterEach(() => stderrSpy?.mockRestore());
 
 describe("healthzBody / healthzStatusCode", () => {
-  const base = { loomio_version: "3.9.0", checked_at: "2026-09-20T10:00:00.000Z" };
+  const base = { loomio_version: "3.13.1", checked_at: "2026-09-20T10:00:00.000Z" };
 
   it("valid → 200 ok", () => {
     const h: LoomioHealth = { key_status: "valid", ...base };
@@ -97,7 +97,7 @@ describe("healthzBody / healthzStatusCode", () => {
       status: "ok",
       connector_version: VERSION,
       key_status: "valid",
-      loomio_version: "3.9.0",
+      loomio_version: "3.13.1",
       checked_at: base.checked_at,
     });
   });
@@ -131,7 +131,7 @@ describe("healthzHandler", () => {
     await healthzHandler({} as express.Request, res as unknown as express.Response, () => {});
     expect(res.statusCode).toBe(200);
     expect(res.headers["Cache-Control"]).toBe("no-store");
-    expect(res.body).toMatchObject({ status: "ok", key_status: "valid", loomio_version: "3.9.0" });
+    expect(res.body).toMatchObject({ status: "ok", key_status: "valid", loomio_version: "3.13.1" });
   });
 
   it("answers 503 when the key is rejected, with the body an uptime check can match on", async () => {
@@ -230,7 +230,7 @@ describe("GET /health mounted on Express", () => {
       status: "ok",
       connector_version: VERSION,
       key_status: "valid",
-      loomio_version: "3.9.0",
+      loomio_version: "3.13.1",
       checked_at: expect.any(String),
     });
   });

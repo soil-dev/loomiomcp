@@ -20,17 +20,17 @@ rewrites `src`, `tests` and `scripts` in place before a commit.
 - `src/version.ts` — `VERSION` (pinned to `package.json` by `tests/version.test.ts`) and `TESTED_LOOMIO_VERSION`
 - `src/server.ts` — MCP server factory; `SERVER_INSTRUCTIONS` (the routing guide clients receive at `initialize`); every tool registration with its description, in discovery order
 - `src/server/register-tool.ts` — `registerTool` helper + `inferAnnotations` (all four ToolAnnotations hints by naming convention)
-- `src/loomio/client.ts` — undici HTTP client; injects `Authorization: Bearer …` (b2 key, or the b3 secret); `User-Agent: loomiomcp/<version>`; `loomioGet` / `loomioPost` / `loomioPatch` / `loomioDelete` / `loomioGetB3` / `loomioPostB3`; the read profiles (`EXCLUDE_TYPES`, `readParams`); `nestedBody` / `flatBody`; `classifyForbidden` (403 body catalogue, path- and method-aware) and 401 / 429 mapping
-- `src/loomio/types.ts` — wire shapes of Loomio 3.8.1's serializers (everything optional; Loomio hides fields conditionally)
+- `src/loomio/client.ts` — undici HTTP client; injects `Authorization: Bearer …` (b2 key, or the b3 secret); `User-Agent: loomiomcp/<version>`; `loomioGet` / `loomioPost` / `loomioPatch` / `loomioDelete` / `loomioGetB3` / `loomioPostB3` / `loomioPatchB3` / `loomioDeleteB3`; the paged-read helpers (`B2_PAGE_MAX`, `loomioPager`, `loomioGetAllPages`, `mergePageBodies`) for the collections Loomio ≥ 3.11.1 pages; the read profiles (`EXCLUDE_TYPES`, `readParams`); `nestedBody` / `flatBody`; `classifyForbidden` (403 body catalogue, path- and method-aware) and 401 / 429 mapping
+- `src/loomio/types.ts` — wire shapes of Loomio's serializers, 3.8.1 through 3.13.1 (everything optional; Loomio hides fields conditionally, and fields removed or added since are marked with their version)
 - `src/loomio/shape.ts` — pure response shaping: `joinTopics`, `slimUser` / `slimGroup`, `truncateText` / `truncateField`, `highlightToMarkdown`, the canonical URL builders
-- `src/loomio/visibility.ts` — poll result gating (Loomio's `results_visible?(voted:)` applied client-side)
+- `src/loomio/visibility.ts` — poll result gating (Loomio's `results_visible?(voted:)` applied client-side) and `VisibilityRefusalError`, which `get_thread_markdown` throws where Loomio's export would ignore the rule
 - `src/loomio/health.ts` + `health-cache.ts` — key-health probe (`GET /b2/groups` + public `GET /v1/boot/version`), 60 s cache, the parsed groups body kept beside the verdict, forced `loomio.auth` / `loomio.version_drift` events
 - `src/tools/_common.ts` — shared zod helpers (`positiveId`, `idOrKey`, `isoTimestamp`, `PollTypeEnum` + `POLL_TYPE_RULES`, `maxCharsSchema`)
-- `src/tools/{groups,discussions,polls,threads,search,reports,memberships,comments,admin}.ts` — tool schemas + handlers (groups also holds `check_connection`; threads holds `resolveThread`, shared by `create_poll`)
+- `src/tools/{groups,discussions,polls,threads,search,reports,memberships,comments,admin,server-admin}.ts` — tool schemas + handlers (groups also holds `check_connection`; threads holds `resolveThread`, shared by `create_poll`, and `get_thread_markdown`'s vote-visibility guard; admin holds the four b3 user tools, server-admin the five Loomio 3.13 b3 provisioning tools)
 - `src/auth/` — OAuth provider and HMAC token signing
 - `src/http/` — Express app, OAuth routes, MCP transport wiring, `health.ts` (`GET /health`), `rate-limit.ts` (per-IP limiter shared by `/mcp` and `/health`)
 - `src/log.ts` — structured event emission and `redactPath`; see OPTIMIZATIONS.md
-- `tests/fixtures.ts` — anonymised 3.8.1 response builders every tool test shares; `tests/test-helpers.ts` — the undici mock (`mockFetch`, `mockFetchRoutes`, `expectBearerAuth`)
+- `tests/fixtures.ts` — anonymised response builders every tool test shares (3.8.1 shapes, updated to 3.13.1); `tests/test-helpers.ts` — the undici mock (`mockFetch`, `mockFetchRoutes`, `mockFetchPaged` — which emulates Loomio's bounded pages and the pre-3.11.1 whole-collection reply —, `expectBearerAuth`)
 
 ## Public-repo hygiene
 
@@ -89,7 +89,9 @@ WRITE mode only against a sandbox group.
    before its first question: `npm run build && node
    scripts/catalog-size.mjs` prints the bytes per tool, and
    `tests/server.test.ts` fails above 36 000 bytes for the 24 full-mode
-   tools (40 000 with b3; instructions ≤ 1 800 chars). Field-by-field
+   tools (17 000 for the 14 read-only tools — prefix
+   `LOOMIO_MCP_READONLY=1` to measure them —, 44 500 for the 33 with
+   b3; instructions ≤ 1 800 chars). Field-by-field
    outputs, permission rules and the exact 403 / 404 texts go into
    HOWTO.md "Tool reference", one subsection per tool.
 3. Add a focused test in `tests/<area>.test.ts` using the

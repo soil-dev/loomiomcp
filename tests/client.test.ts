@@ -3,8 +3,9 @@
  * verbs and their read-only guard, the nested-vs-flat body helpers,
  * array / csv query encoding, the per-tool read profiles, the
  * success-path body handling (empty body → `{}`, non-JSON 2xx → a
- * named error), and the request deadline (60 s for tool calls, a
- * per-call `timeoutMs` for the raw probe primitives).
+ * named error), the request deadline (60 s for tool calls, a
+ * per-call `timeoutMs` for the raw probe primitives), and the paged-read
+ * helpers that follow Loomio ≥ 3.11.1's bounded pages.
  *
  * Why these matter: Loomio 3.8.1's `permitted_params` takes the WRAPPED
  * resource hash when present and Rails' `wrap_parameters` only wraps
@@ -16,7 +17,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetch } from "undici";
-import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
+import {
+  expectBearerAuth,
+  mockFetch,
+  mockFetchPaged,
+  mockFetchRoutes,
+  setupLoomioTest,
+} from "./test-helpers.js";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
 setupLoomioTest();
@@ -125,6 +132,92 @@ describe("read-only guard on every write verb", () => {
   });
 });
 
+describe("b3 write verbs (Loomio 3.13 provisioning, user (de|re)activation)", () => {
+  const B3 = "b3-secret-longer-than-sixteen-chars";
+  beforeEach(() => {
+    process.env["LOOMIO_B3_API_KEY"] = B3;
+  });
+  afterEach(() => {
+    delete process.env["LOOMIO_B3_API_KEY"];
+  });
+
+  it("loomioPostB3 defaults to an empty JSON object body (what (de|re)activate take) and sends the b3 secret, not the per-user key", async () => {
+    mockFetch(200, { success: true });
+    const { loomioPostB3 } = await import("../src/loomio/client.js");
+    await loomioPostB3("/b3/users/4/deactivate");
+    const req = requestOf();
+    expect(req.method).toBe("POST");
+    expect(req.url.pathname).toBe("/api/b3/users/4/deactivate");
+    expect(req.url.search).toBe("");
+    expect(req.rawBody).toBe("{}");
+    expect(req.headers["Content-Type"]).toBe("application/json");
+    expectBearerAuth(0, B3);
+    expect(req.headers["Authorization"]).not.toContain("test-key");
+  });
+
+  it("loomioPostB3 sends a given body verbatim as JSON", async () => {
+    mockFetch(200, { added_emails: [], removed_emails: [] });
+    const { loomioPostB3 } = await import("../src/loomio/client.js");
+    await loomioPostB3("/b3/memberships", { group_id: 3, emails: ["a@example.org"] });
+    expect(requestOf().body).toEqual({ group_id: 3, emails: ["a@example.org"] });
+    expect(requestOf().headers["Content-Type"]).toBe("application/json");
+    expectBearerAuth(0, B3);
+  });
+
+  it("loomioPatchB3 / loomioDeleteB3 use the b3 secret, JSON, and the member route", async () => {
+    mockFetch(200, { membership: { id: 5 } });
+    mockFetch(200, { success: true });
+    const { loomioDeleteB3, loomioPatchB3 } = await import("../src/loomio/client.js");
+    await loomioPatchB3("/b3/memberships/5", { membership: { delegate: true } });
+    await loomioDeleteB3("/b3/memberships/5");
+    const patch = requestOf(0);
+    expect(patch.method).toBe("PATCH");
+    expect(patch.url.pathname).toBe("/api/b3/memberships/5");
+    expect(patch.body).toEqual({ membership: { delegate: true } });
+    expect(patch.headers["Content-Type"]).toBe("application/json");
+    expectBearerAuth(0, B3);
+    const del = requestOf(1);
+    expect(del.method).toBe("DELETE");
+    expect(del.rawBody).toBe("{}");
+    expect(del.headers["Content-Type"]).toBe("application/json");
+    expectBearerAuth(1, B3);
+  });
+
+  it.each([
+    [
+      "POST",
+      (c: typeof import("../src/loomio/client.js")) => c.loomioPostB3("/b3/memberships", {}),
+    ],
+    [
+      "PATCH",
+      (c: typeof import("../src/loomio/client.js")) => c.loomioPatchB3("/b3/memberships/1", {}),
+    ],
+    [
+      "DELETE",
+      (c: typeof import("../src/loomio/client.js")) => c.loomioDeleteB3("/b3/memberships/1"),
+    ],
+  ])(
+    "b3 %s is refused in read-only mode before the secret is read or a request made",
+    async (method, call) => {
+      process.env["LOOMIO_MCP_READONLY"] = "1";
+      delete process.env["LOOMIO_B3_API_KEY"];
+      const client = await import("../src/loomio/client.js");
+      const err = await call(client).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(client.LoomioReadOnlyError);
+      expect((err as Error).message).toContain(`${method} requests are refused`);
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    },
+  );
+
+  it("the b2 write verbs still send the per-user key (the auth parameter defaults to b2)", async () => {
+    mockFetch(200, {});
+    const { loomioPost } = await import("../src/loomio/client.js");
+    await loomioPost("/b2/memberships", { group_id: 1, emails: ["a@example.org"] });
+    expectBearerAuth(0, "test-key");
+    expect(requestOf().headers["Authorization"]).not.toContain(B3);
+  });
+});
+
 describe("body helpers", () => {
   it("nestedBody wraps the attributes under the resource key and drops undefined", async () => {
     const { nestedBody } = await import("../src/loomio/client.js");
@@ -142,6 +235,13 @@ describe("body helpers", () => {
         { recipient_audience: "group", recipient_emails: undefined },
       ),
     ).toEqual({ poll: { title: "P", poll_type: "proposal" }, recipient_audience: "group" });
+  });
+
+  it("nestedBody('membership', …) is the b3 role-update shape: {membership: {admin, delegate}}", async () => {
+    const { nestedBody } = await import("../src/loomio/client.js");
+    expect(nestedBody("membership", { admin: true, delegate: undefined })).toEqual({
+      membership: { admin: true },
+    });
   });
 
   it("flatBody keeps null (a deliberate clear) but drops undefined", async () => {
@@ -194,7 +294,11 @@ describe("read profiles", () => {
     expect(EXCLUDE_TYPES.items_with_reactions).toBe(
       "topic group parent membership tag translation",
     );
-    for (const profile of ["list", "show", "groups"] as const) {
+    // get_thread_markdown's guard: compact minus `topic`, so a discussion
+    // or poll show brings its thread's TopicSerializer row.
+    expect(EXCLUDE_TYPES.thread_guard).toBe("group parent membership reaction tag translation");
+    expect(readParams("thread_guard")).toEqual({ exclude_types: EXCLUDE_TYPES.thread_guard });
+    for (const profile of ["list", "show", "groups", "thread_guard"] as const) {
       expect(EXCLUDE_TYPES[profile].split(" ")).not.toContain("topic");
       expect(readParams(profile)).toEqual({ exclude_types: EXCLUDE_TYPES[profile] });
     }
@@ -361,6 +465,259 @@ describe("request deadline", () => {
       expect((err as Error).message).toMatch(/timed out after 60s/);
     }
     expect(signals.map((s) => s.aborted)).toEqual([true, true]);
+  });
+});
+
+// Loomio 3.11.1 (bc1a6cc02) pages the groups index and thread items
+// with `page_collection_bounded` (limit default 50, clamped to 500;
+// offset; meta.total = the whole collection). The pager follows those
+// pages, recognises a pre-3.11.1 reply that ignored the window, and
+// stops at a hard page cap that it reports.
+describe("paged reads: loomioPager / loomioGetAllPages / mergePageBodies", () => {
+  const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: i + 1, n: i }));
+  /** Every page side-loads the same two users and one user per row: merging must dedupe them. */
+  const sideLoads = (page: ReadonlyArray<Record<string, unknown>>) => ({
+    users: [{ id: 9001 }, { id: 9002 }],
+    things: page.map((r) => ({ id: 100_000 + (r["id"] as number) })),
+  });
+
+  it("bounded server, 1 234 rows: three requests at offsets 0 / 500 / 1000, every row once, side-loads deduplicated", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(1234), sideLoads, mode: "bounded" },
+    });
+    const { loomioGetAllPages, B2_PAGE_MAX } = await import("../src/loomio/client.js");
+    expect(B2_PAGE_MAX).toBe(500);
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      { compact: 1 },
+      { root: "items", maxPages: 10 },
+    );
+    expect(calls.map((c) => [c.limit, c.offset])).toEqual([
+      ["500", "0"],
+      ["500", "500"],
+      ["500", "1000"],
+    ]);
+    const items = body["items"] as { id: number }[];
+    expect(items).toHaveLength(1234);
+    expect(new Set(items.map((r) => r.id)).size).toBe(1234);
+    expect(items[0]?.id).toBe(1);
+    expect(items[1233]?.id).toBe(1234);
+    expect(body["users"]).toEqual([{ id: 9001 }, { id: 9002 }]);
+    expect(body["things"]).toHaveLength(1234);
+    expect(body["meta"]).toEqual({ root: "items", total: 1234 });
+    expect(state).toEqual({
+      requests: 3,
+      total: 1234,
+      rows: 1234,
+      legacy: false,
+      done: true,
+      capped: false,
+      lastPageFull: false,
+    });
+    expectBearerAuth(0, "test-key");
+  });
+
+  it("always names limit AND offset (offset=0 included) and keeps the caller's params", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(3), mode: "bounded" },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    await loomioGetAllPages("/b2/things", { exclude_types: "tag" }, { root: "items", maxPages: 2 });
+    expect(calls).toEqual([{ path: "/api/b2/things", limit: "500", offset: "0" }]);
+    const url = new URL(String(vi.mocked(fetch).mock.calls[0]![0]));
+    expect(url.searchParams.get("exclude_types")).toBe("tag");
+  });
+
+  it("a window (offset + want) is requested as exactly that: offset 600, want 100 → one request limit=100&offset=600", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(1234), mode: "bounded" },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      { root: "items", offset: 600, want: 100, maxPages: 2 },
+    );
+    expect(calls.map((c) => [c.limit, c.offset])).toEqual([["100", "600"]]);
+    expect((body["items"] as { id: number }[])[0]?.id).toBe(601);
+    expect(state).toMatchObject({ requests: 1, rows: 100, done: true, capped: false });
+  });
+
+  it("legacy server (Loomio < 3.11.1) returning more rows than requested: ONE request, legacy true, the caller slices", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(300), mode: "legacy" },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      { root: "items", offset: 60, want: 20, maxPages: 2 },
+    );
+    expect(calls.map((c) => [c.limit, c.offset])).toEqual([["20", "60"]]);
+    expect(state).toMatchObject({ requests: 1, legacy: true, done: true, capped: false });
+    // The whole collection from row 0: slicing is the caller's job.
+    expect((body["items"] as unknown[]).length).toBe(300);
+  });
+
+  it("legacy server at a non-zero offset whose whole collection is within `limit`: detected by rows === total", async () => {
+    mockFetchPaged({ "/b2/things": { root: "items", rows: rows(30), mode: "legacy" } });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { state } = await loomioGetAllPages(
+      "/b2/things",
+      {},
+      {
+        root: "items",
+        offset: 10,
+        maxPages: 2,
+      },
+    );
+    expect(state).toMatchObject({ requests: 1, legacy: true, total: 30 });
+  });
+
+  it("legacy server whose whole collection FITS the first request at offset 0: one request, legacy false (indistinguishable, and complete), done", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(120), mode: "legacy" },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      { root: "items", maxPages: 10 },
+    );
+    expect(calls).toHaveLength(1);
+    expect(state).toMatchObject({ requests: 1, legacy: false, done: true, capped: false });
+    expect(body["items"]).toHaveLength(120);
+  });
+
+  it("meta.total absent: walks full pages and stops on the short one", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(1234), mode: "bounded", noTotal: true },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      { root: "items", maxPages: 10 },
+    );
+    expect(calls.map((c) => c.offset)).toEqual(["0", "500", "1000"]);
+    expect(state).toMatchObject({
+      requests: 3,
+      total: null,
+      rows: 1234,
+      done: true,
+      capped: false,
+    });
+    expect(body["items"]).toHaveLength(1234);
+  });
+
+  it("a short page is NOT the end while meta.total says more: a Loomio clamping to 100 is walked at offset += rows received", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(250), mode: "bounded", limitMax: 100 },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { state } = await loomioGetAllPages("/b2/things", {}, { root: "items", maxPages: 10 });
+    expect(calls.map((c) => [c.limit, c.offset])).toEqual([
+      ["500", "0"],
+      ["500", "100"],
+      ["500", "200"],
+    ]);
+    expect(state).toMatchObject({ requests: 3, rows: 250, done: true, capped: false });
+  });
+
+  it("a repeating page (no unseen ids) stops the walk instead of looping", async () => {
+    mockFetchRoutes({
+      "/b2/things": {
+        status: 200,
+        body: { items: rows(3), meta: { root: "items", total: 10 } },
+      },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      { root: "items", pageSize: 3, maxPages: 10 },
+    );
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(state).toMatchObject({ requests: 2, rows: 3, done: true, capped: false });
+    expect(body["items"]).toHaveLength(3);
+  });
+
+  it("maxPages reached with rows left: capped true, and exactly maxPages requests", async () => {
+    const calls = mockFetchPaged({
+      "/b2/things": { root: "items", rows: rows(1234), mode: "bounded" },
+    });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { body, state } = await loomioGetAllPages<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      { root: "items", maxPages: 2 },
+    );
+    expect(calls).toHaveLength(2);
+    expect(state).toMatchObject({ requests: 2, rows: 1000, total: 1234, done: true, capped: true });
+    expect(body["items"]).toHaveLength(1000);
+  });
+
+  it("a walk that ENDS on its last allowed page is complete, not capped", async () => {
+    mockFetchPaged({ "/b2/things": { root: "items", rows: rows(1000), mode: "bounded" } });
+    const { loomioGetAllPages } = await import("../src/loomio/client.js");
+    const { state } = await loomioGetAllPages("/b2/things", {}, { root: "items", maxPages: 2 });
+    expect(state).toMatchObject({ requests: 2, rows: 1000, capped: false, done: true });
+  });
+
+  it("the lazy pager hands out one page per next() and undefined once done", async () => {
+    mockFetchPaged({ "/b2/things": { root: "items", rows: rows(700), mode: "bounded" } });
+    const { loomioPager } = await import("../src/loomio/client.js");
+    const pager = loomioPager<Record<string, unknown>>(
+      "/b2/things",
+      {},
+      {
+        root: "items",
+        want: 600,
+        maxPages: 2,
+      },
+    );
+    const first = await pager.next();
+    expect(first?.["items"]).toHaveLength(500);
+    expect(pager.state.done).toBe(false);
+    const second = await pager.next();
+    expect(second?.["items"]).toHaveLength(100);
+    expect(pager.state).toMatchObject({ done: true, capped: false, requests: 2 });
+    expect(await pager.next()).toBeUndefined();
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("errors propagate from the page that failed", async () => {
+    mockFetch(404, { error: 404 });
+    const { loomioGetAllPages, LoomioApiError } = await import("../src/loomio/client.js");
+    const err = await loomioGetAllPages("/b2/things", {}, { root: "items", maxPages: 2 }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(LoomioApiError);
+  });
+
+  it("mergePageBodies: arrays concatenated and deduped by id (first arrival kept), rows without an id kept, meta from the first page, inputs untouched, root always present", async () => {
+    const { mergePageBodies } = await import("../src/loomio/client.js");
+    const a = {
+      items: [{ id: 1, v: "a" }, { id: 2 }],
+      users: [{ id: 7, v: "first" }],
+      notes: [{ text: "x" }],
+      meta: { root: "items", total: 4 },
+    };
+    const b = {
+      items: [{ id: 2 }, { id: 3 }],
+      users: [{ id: 7, v: "second" }, { id: 8 }],
+      notes: [{ text: "x" }],
+      meta: { root: "items", total: 99 },
+    };
+    const before = JSON.stringify(a);
+    const merged = mergePageBodies([a, b], "items");
+    expect(merged.items.map((r) => r.id)).toEqual([1, 2, 3]);
+    expect(merged.users).toEqual([{ id: 7, v: "first" }, { id: 8 }]);
+    expect(merged.notes).toHaveLength(2);
+    expect(merged.meta).toEqual({ root: "items", total: 4 });
+    expect(JSON.stringify(a)).toBe(before);
+    expect(merged.items).not.toBe(a.items);
+    expect(mergePageBodies([{ meta: {} }], "groups")).toEqual({ meta: {}, groups: [] });
   });
 });
 

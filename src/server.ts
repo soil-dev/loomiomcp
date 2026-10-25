@@ -75,6 +75,18 @@ import {
   listUsersSchema,
   listUsers,
 } from "./tools/admin.js";
+import {
+  listInstanceGroupsSchema,
+  listInstanceGroups,
+  listInstanceMembershipsSchema,
+  listInstanceMemberships,
+  addGroupMembersSchema,
+  addGroupMembers,
+  updateMembershipRolesSchema,
+  updateMembershipRoles,
+  revokeMembershipSchema,
+  revokeMembership,
+} from "./tools/server-admin.js";
 
 /**
  * Server-level `instructions` — delivered to the client in the
@@ -175,7 +187,7 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "get_discussion",
-    "One discussion by numeric id or short key: 1 call (2 with `include_items`). Returns the full body, `topic_id`, counters, `url`; `include_items: true` embeds list_thread_items as `thread_items` (`items_limit`; `next_offset` says when to page on). Prose: get_thread_markdown; a group's threads: list_discussions.",
+    "One discussion by numeric id or short key: 1 call (2+ with `include_items`). Returns the full body, `topic_id`, counters, `url`; `include_items: true` embeds list_thread_items as `thread_items` (`items_limit`; `next_offset` says when to page on). Prose: get_thread_markdown; a group's threads: list_discussions.",
     getDiscussionSchema,
     getDiscussion,
   );
@@ -271,7 +283,7 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "list_thread_items",
-    "One thread as structured items: 1 call by `topic_id` (2 by `discussion_id` or `poll_id`; pass exactly one). Returns `items[]` in thread order plus the comments, polls, stances (votes), outcomes and users they reference. The whole thread is fetched once and sliced here (`limit`, `offset`, `kinds`) under the `max_total_chars` budget; `next_offset` says where to continue.",
+    "One thread as structured items: 1 call per 500 items by `topic_id` (+1 by `discussion_id` or `poll_id`; pass exactly one). Returns `items[]` in thread order plus the comments, polls, stances (votes), outcomes and users they reference. Paged by `limit` / `offset` under the `max_total_chars` budget (`kinds` reads the whole thread); `next_offset` says where to continue.",
     listThreadItemsSchema,
     listThreadItems,
   );
@@ -279,7 +291,7 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "get_thread_markdown",
-    "The best single call for 'summarise / read this thread': 1 call by `topic_id` (2 by `discussion_id` or `poll_id`; pass exactly one) returns Loomio's server-rendered Markdown of the thread (`markdown`, `chars`, `truncated`). Structured data: list_thread_items. `max_chars` cuts from the END, so `truncated: true` means the newest items were dropped.",
+    "The best single call for 'summarise / read this thread': 2 calls by `topic_id`, `discussion_id` or `poll_id` (pass exactly one; +1 per 500 items when the thread has replies) return Loomio's server-rendered Markdown (`markdown`, `chars`, `truncated`). REFUSED while an open poll hides results until the user votes: use list_thread_items. `max_chars` cuts the END: `truncated: true` = newest items dropped.",
     getThreadMarkdownSchema,
     getThreadMarkdown,
   );
@@ -366,7 +378,7 @@ export function createLoomioMcpServer(): McpServer {
     registerTool(
       server,
       "deactivate_user",
-      "INSTANCE-ADMIN. Deactivate a user account instance-wide by numeric `id`: 1 call with the LOOMIO_B3_API_KEY server secret (single-tenant deployments). Asynchronous on Loomio's side: the echoed `user` may still show `active: true`, so re-read with get_user. Reversible with reactivate_user; confirm with the human first. 404 unless the user is active.",
+      "INSTANCE-ADMIN. Deactivate a user account instance-wide by numeric `id`: 1 call with the LOOMIO_B3_API_KEY server secret (single-tenant deployments). Asynchronous on Loomio's side: the echoed `user` may still show `active: true`, so re-read with get_user. Votes already cast in open polls are kept (Loomio 3.11+). Reversible with reactivate_user; confirm with the human first. 404 unless the user is active.",
       deactivateUserSchema,
       deactivateUser,
     );
@@ -374,7 +386,7 @@ export function createLoomioMcpServer(): McpServer {
     registerTool(
       server,
       "reactivate_user",
-      "INSTANCE-ADMIN. Reactivate a deactivated user by numeric `id`: 1 call with the LOOMIO_B3_API_KEY server secret. Synchronous: clears `deactivated_at` and restores the memberships the deactivation revoked; returns `user` already `active: true`. 404 unless the user is deactivated.",
+      "INSTANCE-ADMIN. Reactivate a deactivated user by numeric `id`: 1 call with the LOOMIO_B3_API_KEY server secret. Synchronous: clears `deactivated_at` and restores the memberships and (Loomio 3.10+) open-poll ballots the deactivation revoked; returns `user` already `active: true`. 404 unless the user is deactivated.",
       reactivateUserSchema,
       reactivateUser,
     );
@@ -390,9 +402,53 @@ export function createLoomioMcpServer(): McpServer {
     registerTool(
       server,
       "list_users",
-      "INSTANCE-ADMIN READ. EVERY account on the instance, active and deactivated: 1 call, unpaginated, with the LOOMIO_B3_API_KEY server secret; `is_admin` narrows to admins (true) or non-admins (false). Rows carry id, name, username, EMAIL, is_admin, active, identities[]. The whole user table with emails, hence single-tenant deployments only and possibly large: prefer get_user, or list_memberships for 'who is in group X'.",
+      "INSTANCE-ADMIN READ. EVERY account on the instance, active and deactivated: 1 call, unpaginated, with the LOOMIO_B3_API_KEY server secret; `is_admin` narrows to admins (true) or non-admins (false). Rows carry id, name, username, EMAIL, is_admin, active, identities[]. The whole user table with emails, hence single-tenant deployments only and possibly large: prefer get_user, or list_instance_memberships (3.13+; else list_memberships) for 'who is in group X'.",
       listUsersSchema,
       listUsers,
+    );
+
+    // Loomio 3.13 b3 provisioning (src/tools/server-admin.ts): instance-wide
+    // group and roster reads, then the three membership writes. Same gate
+    // as the user tools above — the reads return every member's email.
+
+    registerTool(
+      server,
+      "list_instance_groups",
+      "INSTANCE-ADMIN READ. Every group on the instance, secret ones included, member or not (single-tenant deployments only): 1 call per page of <=50 (by id) with the LOOMIO_B3_API_KEY secret, Loomio 3.13+. Rows: id, key, name, handle, parent_id, group_privacy; page with `offset` until `next_offset` is null. The connector user's own groups: list_groups.",
+      listInstanceGroupsSchema,
+      listInstanceGroups,
+    );
+
+    registerTool(
+      server,
+      "list_instance_memberships",
+      "INSTANCE-ADMIN READ. One group's members and pending invitations, whoever the connector user is: 1 call per page of <=50 with the LOOMIO_B3_API_KEY secret, Loomio 3.13+. Rows: membership `id`, user_id, user_EMAIL, user_name, admin, delegate, pending, for DIRECT members only (no subgroups); single-tenant deployments only. `id` feeds update_membership_roles / revoke_membership.",
+      listInstanceMembershipsSchema,
+      listInstanceMemberships,
+    );
+
+    registerTool(
+      server,
+      "add_group_members",
+      "INSTANCE-ADMIN. Add people to ANY group by email without being its admin: 1 call, <=50 addresses, all-or-nothing, Loomio 3.13+. Unknown addresses get a new unverified account; everyone added gets Loomio's invitation EMAIL. Additive only: nobody is removed. 422 = a deactivated account (reactivate_user first) or an address Loomio refuses; 403 = member cap or inactive subscription. Confirm the list with the human first.",
+      addGroupMembersSchema,
+      addGroupMembers,
+    );
+
+    registerTool(
+      server,
+      "update_membership_roles",
+      "INSTANCE-ADMIN. Set a member's group `admin` and/or `delegate` role by membership `id` (from list_instance_memberships): 1 call, Loomio 3.13+. Omitted roles stay; a grant notifies the member once; repeating is a no-op. Nothing stops demoting a group's last admin. 404 = revoked or unknown membership. Confirm with the human first.",
+      updateMembershipRolesSchema,
+      updateMembershipRoles,
+    );
+
+    registerTool(
+      server,
+      "revoke_membership",
+      "INSTANCE-ADMIN. Remove a person from a group by membership `id`: 1 call, Loomio 3.13+. Also removes them from its SUBGROUPS and its threads and revokes their votes in open polls; no notification, no actor recorded. add_group_members re-adds them to that group only, without the admin role (subgroups stay lost; may return pending). Repeating succeeds. Confirm with the human first.",
+      revokeMembershipSchema,
+      revokeMembership,
     );
   }
 

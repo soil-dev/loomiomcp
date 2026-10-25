@@ -31,15 +31,26 @@
  *   MCP_HTTP_JSON_LIMIT   Body size cap for inbound JSON (default '1mb')
  *   MCP_HTTP_TRUST_PROXY  Number of proxy hops to trust (default 1).
  *   LOOMIO_MCP_LOG_VERBOSE  Set to 1 / true / yes / on to emit structured events.
- *   LOOMIO_B3_API_KEY     Server-instance admin secret. When set, registers
- *                         deactivate_user / reactivate_user. Read SECURITY.md
- *                         before setting this on a multi-user deployment.
+ *   LOOMIO_B3_API_KEY     Server-instance admin secret. When set (and not
+ *                         read-only), registers the nine b3 tools: user
+ *                         deactivate / reactivate / get / list and, on
+ *                         Loomio 3.13+, instance-wide group and roster
+ *                         reads and membership writes (B3_TOOL_NAMES in
+ *                         src/http/config.ts). Single-tenant only — read
+ *                         SECURITY.md. Refused at startup in
+ *                         insecure-auto-approve mode on a non-localhost
+ *                         PUBLIC_BASE_URL (b3ExposureError).
  */
 
 import { isReadOnly } from "./loomio/client.js";
 import { checkLoomioHealth, keyRejectedWarning } from "./loomio/health.js";
 import { OAuthProvider, StatelessClientsStore, FixedClientStore } from "./auth/provider.js";
-import { resolveBaseConfig, selectMode } from "./http/config.js";
+import {
+  b3ExposureError,
+  b3ExposureWarning,
+  resolveBaseConfig,
+  selectMode,
+} from "./http/config.js";
 import { createApp } from "./http/app.js";
 
 function fatal(message: string): never {
@@ -61,6 +72,11 @@ const { publicBaseUrl, signingKey, port, jsonLimit, trustProxy } = baseResult.ok
 const modeResult = selectMode(process.env, publicBaseUrl);
 if ("error" in modeResult) fatal(modeResult.error);
 const mode = modeResult.ok;
+
+// The b3 secret on an open-DCR public deployment would give every
+// self-registered client the instance-admin tools (see b3ExposureError).
+const b3Exposure = b3ExposureError(process.env, mode, publicBaseUrl);
+if (b3Exposure) fatal(b3Exposure);
 
 const issuerUrl = new URL(publicBaseUrl);
 const mcpResourceUrl = new URL("/mcp", issuerUrl);
@@ -107,6 +123,8 @@ app.listen(port, () => {
         "Suitable only for local development or private-network deployments.",
     );
   }
+  const b3Warning = b3ExposureWarning(process.env, mode);
+  if (b3Warning) console.warn(`[loomiomcp] WARNING: ${b3Warning}`);
 
   // Probe the Loomio key once we are listening — non-blocking, and the
   // server keeps serving whatever the verdict. A rejected key must be

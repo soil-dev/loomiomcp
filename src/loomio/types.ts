@@ -1,8 +1,10 @@
 /**
- * Wire shapes of Loomio 3.8.1's b2 API (unchanged in 3.9.0), as its
- * serializers emit them (app/serializers/*.rb) and as captured from a
- * live instance. These
- * are the INPUT side of the connector: what `loomioGet` hands back
+ * Wire shapes of Loomio's b2 API, 3.8.1 through 3.13.1, as its
+ * serializers emit them (app/serializers/*.rb) and as captured from
+ * live instances (3.8.1, 3.13.1). Fields a release added or removed are
+ * dated in their doc comment ("3.10+", "≤ 3.10"); a field that is gone
+ * from the current release stays typed so older servers type-check.
+ * These are the INPUT side of the connector: what `loomioGet` hands back
  * before `shape.ts` slims and joins it. The tool layer decides what an
  * AI caller sees; nothing here is returned verbatim.
  *
@@ -59,7 +61,12 @@ export interface LoomioUser {
   [key: string]: unknown;
 }
 
-/** GroupSerializer (`groups` and `parent_groups` roots). */
+/**
+ * GroupSerializer (`groups` and `parent_groups` roots). Loomio 3.11.0
+ * dropped `closed_polls_count`, `delegates_count`,
+ * `discussion_templates_count` and `org_discussions_count` (79280ee7a,
+ * e3f18abfd); `subgroups_count` is computed live since then.
+ */
 export interface LoomioGroup {
   id: number;
   key?: string;
@@ -69,7 +76,12 @@ export interface LoomioGroup {
   description?: string | null;
   description_format?: string | null;
   parent_id?: number | null;
-  group_privacy?: "open" | "closed" | "secret" | string;
+  /**
+   * `parent_members` (3.11+, ec3d359ac): a subgroup visible to the
+   * parent group's members only. Before 3.11 Loomio reported such a
+   * subgroup as `closed`.
+   */
+  group_privacy?: "open" | "closed" | "parent_members" | "secret" | string;
   is_visible_to_public?: boolean;
   is_visible_to_parent_members?: boolean;
   parent_members_can_see_discussions?: boolean;
@@ -80,7 +92,14 @@ export interface LoomioGroup {
   admin_memberships_count?: number;
   discussions_count?: number;
   polls_count?: number;
+  /** ≤ 3.10. */
   closed_polls_count?: number;
+  /** ≤ 3.10. */
+  delegates_count?: number;
+  /** ≤ 3.10. */
+  discussion_templates_count?: number;
+  /** ≤ 3.10; parent groups only. */
+  org_discussions_count?: number;
   subgroups_count?: number;
   enabled?: boolean;
   discarded_at?: string | null;
@@ -96,7 +115,11 @@ export interface LoomioGroup {
   [key: string]: unknown;
 }
 
-/** MembershipSerializer. `user_email` only for groups the API user administers, or members it invited. */
+/**
+ * MembershipSerializer. `user_email` only for groups the API user
+ * administers, or members it invited; `weight` (3.10+) on the user's own
+ * rows and on every row of a group it administers.
+ */
 export interface LoomioMembership {
   id: number;
   group_id: number;
@@ -104,6 +127,8 @@ export interface LoomioMembership {
   inviter_id?: number | null;
   admin?: boolean;
   delegate?: boolean;
+  /** Vote weight as a decimal STRING ("1", "2.5"; `VoteWeight.format`, 14c07ef6c, 3.10+). */
+  weight?: string;
   title?: string | null;
   created_at?: string | null;
   /** null while the invitation is pending. */
@@ -127,6 +152,12 @@ export interface LoomioTopic {
   group_id?: number | null;
   topicable_type?: "Discussion" | "Poll" | string;
   topicable_id?: number;
+  /**
+   * The thread's sequenced items, the opening one included
+   * (topic.rb:239-246), refreshed on every item create / destroy. ≤ 1 =
+   * nothing but the opening item: get_thread_markdown's guard skips its
+   * items scan then.
+   */
   items_count?: number;
   /** `items_count - 1` (the opening item is not a reply). */
   replies_count?: number;
@@ -135,12 +166,32 @@ export interface LoomioTopic {
   locked_at?: string | null;
   locker_id?: number | null;
   pinned_at?: string | null;
+  /** ≤ 3.10 (79280ee7a removed it). */
   members_count?: number;
   seen_by_count?: number;
+  /**
+   * Kept, opened, unclosed polls whose `topic_id` is this thread
+   * (`Poll.active`, poll.rb:213; `Topic#recount_active_polls!`,
+   * topic.rb:104-106), maintained on every poll state change. It follows
+   * `polls.topic_id`, not where the poll's items are, so it does not say
+   * which polls the thread's Markdown export prints; the vote-visibility
+   * guard does not rely on it (src/tools/threads.ts guard note).
+   */
   active_polls_count?: number;
+  /** ≤ 3.10 (79280ee7a removed it). */
   closed_polls_count?: number;
+  /** ≤ 3.10 (e3f18abfd replaced it with `has_anonymous_polls`). */
   anonymous_polls_count?: number;
+  /** 3.11+. */
+  has_anonymous_polls?: boolean;
+  /**
+   * The thread's tags. Since 3.13 (5934ab182) the union over every
+   * tagged contribution, replies included, not just the opening post's
+   * (`TagService.refresh_topic_tags!`, tag_service.rb:152-164).
+   */
   tags?: string[];
+  /** 3.13+: some reply (not just the opening post) carries tags; see `tags`. */
+  has_tagged_replies?: boolean;
   ranges?: number[][];
   max_depth?: number;
   allow_comments?: boolean;
@@ -181,7 +232,12 @@ export type LoomioHideResults = "off" | "until_vote" | "until_closed";
  * `stv_results` are emitted whenever `results_available?` — that is,
  * unless `hide_results == until_closed` and the poll is still open. The
  * `until_vote` setting is NOT enforced server-side for an API user who
- * has not voted; `visibility.ts` applies it client-side.
+ * has not voted; `visibility.ts` applies it client-side. Since 3.10
+ * scores are decimals: `total_score` is a BigDecimal (a JSON STRING
+ * such as "3.0", or the integer 0 when `stance_counts` is empty,
+ * a3736458b) and `stance_counts` entries can be fractional on a
+ * weighted poll. The connector passes them through and does no
+ * arithmetic on them.
  */
 export interface LoomioPoll {
   id: number;
@@ -194,14 +250,22 @@ export interface LoomioPoll {
   topic_id?: number | null;
   author_id?: number | null;
   anonymous?: boolean;
-  /**
-   * Dropped by PollSerializer on Loomio master (unreleased as of
-   * 2026-10-02, which also adds `result_heading_keys`, `weighted_voting`
-   * and a stance `weight`). Read nowhere in the connector; optional so
-   * either shape type-checks, and new fields ride the index signature.
-   */
+  /** ≤ 3.9: removed in 3.10 (917b2c2e4) once anonymous polls always used separate ballots. Read nowhere. */
   voting_system?: "stance" | "anonymous_ballot" | string;
+  /**
+   * 3.10+ (14c07ef6c): votes count by the voters' membership `weight`;
+   * tallies, `total_score` and `results[]` scores are then in vote-weight
+   * units, and each stance carries its `weight`.
+   */
+  weighted_voting?: boolean;
+  /** 3.10+: i18n keys naming the result-table columns; meaningful only on a weighted poll (42f7199e7). */
+  result_heading_keys?: Record<string, string>;
+  /** 3.11+: UI state for the vote button (8eb9236a4). Dropped by the poll tools. */
+  voter_has_access?: boolean;
   hide_results?: LoomioHideResults | string;
+  opening_at?: string | null;
+  /** null for a draft or a scheduled poll (nobody can vote yet). */
+  opened_at?: string | null;
   closing_at?: string | null;
   closed_at?: string | null;
   created_at?: string | null;
@@ -210,13 +274,19 @@ export interface LoomioPoll {
   poll_option_ids?: number[];
   current_outcome_id?: number | null;
   results?: unknown[];
-  stance_counts?: number[];
-  total_score?: number;
+  stance_counts?: Array<number | string>;
+  total_score?: number | string;
   stv_results?: unknown;
   voters_count?: number;
   decided_voters_count?: number;
   undecided_voters_count?: number;
   cast_stances_pct?: number;
+  /** null = the poll has no quorum; the three fields below then mean nothing. */
+  quorum_pct?: number | null;
+  quorum_count?: number | string;
+  quorum_votes_required?: number | string;
+  /** 3.13+ (ad60e7728); `false` also on a poll with no quorum at all. */
+  quorum_reached?: boolean;
   specified_voters_only?: boolean;
   versions_count?: number;
   [key: string]: unknown;
@@ -236,10 +306,11 @@ export interface LoomioPollOption {
 }
 
 /**
- * StanceSerializer. `participant_id` is null for anonymous polls.
- * `reason`, `option_scores` and `none_of_the_above` are emitted when the
- * stance is the API user's own OR the poll's `results_available?` —
- * again without the `until_vote` gate, see `visibility.ts`.
+ * StanceSerializer. `reason`, `option_scores` and `none_of_the_above`
+ * are emitted when the stance is the API user's own OR the poll's
+ * `results_available?` — again without the `until_vote` gate, see
+ * `visibility.ts`. An anonymous poll has no stances on the b2 API at
+ * all: its ballots are separate records Loomio does not serialize.
  */
 export interface LoomioStance {
   id: number;
@@ -256,6 +327,8 @@ export interface LoomioStance {
   none_of_the_above?: boolean;
   /** `{ "<poll_option_id>": score }`. */
   option_scores?: Record<string, number>;
+  /** 3.10+: the voter's vote weight as a decimal STRING ("1", "2.5"); sent on every stance, meaningful on a weighted poll. */
+  weight?: string;
   [key: string]: unknown;
 }
 
@@ -320,6 +393,17 @@ export interface LoomioTopicItem {
   itemable_id?: number | null;
   pinned?: boolean;
   pinned_title?: string | null;
+  /** 3.11+ (56ca88d8e): the editor's note on a `discussion_edited` / `poll_edited` item; plain text. */
+  change_note?: string | null;
+  /**
+   * 3.11+ (70c5a5a93): for a reply nested past the thread's max depth,
+   * the TopicItem id (not a comment id) of the comment it answers; the
+   * row itself goes to the `parent_topic_items` root. The comment's own
+   * `parent_id` / `parent_type` already name that parent.
+   */
+  reply_parent_id?: number | null;
+  /** 3.13+ (5934ab182): this contribution's own tags. */
+  tags?: string[];
   /** Pointer into the side-loads, e.g. `{ type: "comment", id: 1700 }`. */
   itemable?: { type?: string; id?: number } | null;
   [key: string]: unknown;
@@ -450,6 +534,12 @@ export interface ThreadsResponse extends LoomioSideLoads {
 
 export interface ThreadItemsResponse extends LoomioSideLoads {
   items?: LoomioTopicItem[];
+  /**
+   * Parent / reply-parent items (TopicItemSerializer `has_one :parent`,
+   * `:reply_parent`). The connector excludes `parent`, but Loomio ≥ 3.11
+   * still sends a few `reply_parent` rows here; nothing reads them.
+   */
+  parent_topic_items?: LoomioTopicItem[];
 }
 
 export interface MembershipsResponse extends LoomioSideLoads {

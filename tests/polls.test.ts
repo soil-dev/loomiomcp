@@ -13,6 +13,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fetch } from "undici";
 import { htmlToText } from "../src/loomio/shape.js";
+import type { LoomioPoll } from "../src/loomio/types.js";
 import { HIDDEN_RESULT_FIELDS } from "../src/loomio/visibility.js";
 import {
   discussionRow,
@@ -26,6 +27,7 @@ import {
   pollShowBody,
   pollsListBody,
   topicRow,
+  WEIGHTED_POLL,
 } from "./fixtures.js";
 import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
 
@@ -92,11 +94,10 @@ describe("getPoll", () => {
       replies_count: 2,
       active_polls_count: 1,
       tags: ["budget"],
-      members_count: 12,
-      // gating
+      // gating (total_score: Loomio ≥ 3.10 sends a decimal string)
       results_visible: true,
       stance_counts: [3, 1, 0],
-      total_score: 4,
+      total_score: "4.0",
       url: "https://www.loomio.com/p/polKEY01/adopt-the-2027-budget",
     });
     expect(r.poll).not.toHaveProperty("results_hidden_reason");
@@ -224,7 +225,7 @@ describe("getPoll", () => {
       );
       const r = await getPoll({ id_or_key: 301 });
       expect(r.poll.results_visible).toBe(true);
-      expect(r.poll.total_score).toBe(4);
+      expect(r.poll.total_score).toBe("4.0");
     }
   });
 
@@ -235,7 +236,6 @@ describe("getPoll", () => {
         polls: [
           pollRow({
             anonymous: true,
-            voting_system: "anonymous_ballot",
             hide_results: "until_closed",
             closed_at: "2026-10-01T12:00:00Z",
           }),
@@ -343,7 +343,7 @@ describe("listPolls", () => {
     expect(row.results_visible).toBe(true);
     // The per-option tallies survive, aligned with poll_options[] order.
     expect(row.stance_counts).toEqual([3, 1, 0]);
-    expect(row.total_score).toBe(4);
+    expect(row.total_score).toBe("4.0");
     expect(row.poll_options.map((o) => o.name)).toEqual(["agree", "disagree", "abstain"]);
     // The voter-id breakdown does not: that is get_poll's.
     expect(row).not.toHaveProperty("results");
@@ -929,6 +929,29 @@ describe("createPollSchema — Loomio 3.8.1's poll types and their rules", () =>
     }
   });
 
+  it("stv: stv_seats must be fewer than the options (Loomio ≥ 3.10 answers 422 otherwise); omitted seats pass", async () => {
+    const { createPollSchema } = await import("../src/tools/polls.js");
+    const stv = { ...base, poll_type: "stv", options: ["A", "B", "C"] };
+    expect(createPollSchema.safeParse({ ...stv, stv_seats: 2 }).success).toBe(true);
+    expect(createPollSchema.safeParse(stv).success).toBe(true);
+    const equal = createPollSchema.safeParse({ ...stv, stv_seats: 3 });
+    expect(equal.success).toBe(false);
+    expect(JSON.stringify(equal.error?.issues)).toMatch(/fewer than the options/);
+    expect(createPollSchema.safeParse({ ...stv, stv_seats: 5 }).success).toBe(false);
+    // The rule is STV's: other types ignore stv_seats (it is dropped from their rows anyway).
+    expect(
+      createPollSchema.safeParse({ ...base, poll_type: "poll", options: ["A"], stv_seats: 3 })
+        .success,
+    ).toBe(true);
+  });
+
+  it("the STV refine adds no JSON-schema bytes (a local refusal only)", async () => {
+    const { createPollSchema } = await import("../src/tools/polls.js");
+    const { z } = await import("zod");
+    const json = JSON.stringify(z.toJSONSchema(createPollSchema, { io: "input" }));
+    expect(json).not.toMatch(/fewer than the options/);
+  });
+
   it("question takes NO options", async () => {
     const { createPollSchema } = await import("../src/tools/polls.js");
     const r = createPollSchema.safeParse({ ...base, poll_type: "question", options: ["A"] });
@@ -1256,5 +1279,112 @@ describe("deletePoll", () => {
     const err = await deletePoll({ id_or_key: "newPOLL11" }).catch((e) => e);
     expect(err).toBeInstanceOf(LoomioAuthError);
     expect(err.kind).toBe("not_authorized");
+  });
+});
+
+// ── Loomio 3.10–3.13 poll fields ────────────────────────────────────────────
+//
+// Weighted voting (3.10), decimal-string totals (3.10), `voter_has_access`
+// (3.11) and `quorum_reached` (3.13) — what the tools keep, and when.
+
+describe("shapePoll — Loomio 3.10–3.13 fields", () => {
+  it("a poll with NO quorum (quorum_pct null) loses quorum_count / quorum_votes_required / quorum_reached, in the show and the list", async () => {
+    const { getPoll, listPolls } = await import("../src/tools/polls.js");
+    mockFetch(200, pollShowBody());
+    const show = await getPoll({ id_or_key: 301 });
+    mockFetch(200, pollsListBody());
+    const list = await listPolls({ group_id: 7 });
+    for (const poll of [show.poll, list.polls[0]!]) {
+      // `quorum_reached: false` on a poll that has no quorum would read as
+      // "the quorum was missed".
+      for (const f of ["quorum_count", "quorum_votes_required", "quorum_reached"]) {
+        expect(poll, f).not.toHaveProperty(f);
+      }
+    }
+    expect(show.poll).toHaveProperty("quorum_pct", null);
+  });
+
+  it("a poll WITH a quorum keeps all four quorum fields as Loomio sent them", async () => {
+    mockFetch(
+      200,
+      pollShowBody({
+        polls: [
+          pollRow({
+            quorum_pct: 50,
+            quorum_count: "3.0",
+            quorum_votes_required: "0.0",
+            quorum_reached: true,
+          }),
+        ],
+      }),
+    );
+    const { getPoll } = await import("../src/tools/polls.js");
+    const r = await getPoll({ id_or_key: 301 });
+    expect(r.poll).toMatchObject({
+      quorum_pct: 50,
+      quorum_count: "3.0",
+      quorum_votes_required: "0.0",
+      quorum_reached: true,
+    });
+  });
+
+  it("voter_has_access (the web client's vote-button state) is dropped", async () => {
+    const { getPoll, listPolls } = await import("../src/tools/polls.js");
+    mockFetch(200, pollShowBody());
+    expect((await getPoll({ id_or_key: 301 })).poll).not.toHaveProperty("voter_has_access");
+    mockFetch(200, pollsListBody());
+    expect((await listPolls({ group_id: 7 })).polls[0]).not.toHaveProperty("voter_has_access");
+  });
+
+  it("an UNWEIGHTED poll: no result_heading_keys, no my_stance.weight; the show keeps weighted_voting: false, the list drops it", async () => {
+    const { getPoll, listPolls } = await import("../src/tools/polls.js");
+    mockFetch(200, pollShowBody({ stances: [ownStanceRow()] }));
+    const show = await getPoll({ id_or_key: 301 });
+    expect(show.poll).not.toHaveProperty("result_heading_keys");
+    expect(show.poll.weighted_voting).toBe(false);
+    expect(show.poll.my_stance).not.toHaveProperty("weight");
+    mockFetch(200, pollsListBody({ stances: [ownStanceRow()] }));
+    const row = (await listPolls({ group_id: 7 })).polls[0]!;
+    expect(row).not.toHaveProperty("weighted_voting");
+    expect(row).not.toHaveProperty("result_heading_keys");
+    expect(row.my_stance).not.toHaveProperty("weight");
+  });
+
+  it("a WEIGHTED poll keeps weighted_voting, result_heading_keys (which columns are vote-weight units), the decimal tallies, and the own stance's weight", async () => {
+    const { getPoll, listPolls } = await import("../src/tools/polls.js");
+    const stances = [ownStanceRow({ poll_id: 304, weight: "2.5" })];
+    mockFetch(200, pollShowBody({ polls: [WEIGHTED_POLL], stances }));
+    const show = await getPoll({ id_or_key: 304 });
+    expect(show.poll).toMatchObject({
+      weighted_voting: true,
+      stance_counts: [2.5, 1, 0],
+      total_score: "3.5",
+      result_heading_keys: { votes_cast_percent: "poll_common.pct_of_vote_weight_cast" },
+    });
+    expect(show.poll.my_stance).toMatchObject({ id: 901, weight: "2.5" });
+    mockFetch(200, pollsListBody({ polls: [WEIGHTED_POLL], stances }));
+    const row = (await listPolls({ group_id: 7 })).polls[0]!;
+    expect(row).toMatchObject({ weighted_voting: true, total_score: "3.5" });
+    expect(row).toHaveProperty("result_heading_keys");
+    expect(row.my_stance?.weight).toBe("2.5");
+  });
+
+  it("a Loomio ≤ 3.9 record (voting_system, numeric total_score, no new fields) still shapes", async () => {
+    const legacy: Record<string, unknown> = {
+      ...pollRow({ total_score: 4, voting_system: "stance" }),
+    };
+    for (const f of [
+      "weighted_voting",
+      "result_heading_keys",
+      "voter_has_access",
+      "quorum_reached",
+    ]) {
+      delete legacy[f];
+    }
+    mockFetch(200, pollShowBody({ polls: [legacy as LoomioPoll] }));
+    const { getPoll } = await import("../src/tools/polls.js");
+    const r = await getPoll({ id_or_key: 301 });
+    expect(r.poll).toMatchObject({ id: 301, total_score: 4, results_visible: true });
+    expect(r.poll).not.toHaveProperty("weighted_voting");
   });
 });

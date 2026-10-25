@@ -9,10 +9,15 @@
  * (case-insensitive). Anything else, including unset, is `false`.
  */
 
+/** The truthy-spelling rule on a raw value: 1/true/yes/on (case-insensitive). */
+export function isTruthyEnvValue(value: string | undefined): boolean {
+  const raw = value?.toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 /** Parse a boolean env var. Recognises 1/true/yes/on (case-insensitive). */
 export function readBool(name: string): boolean {
-  const raw = process.env[name]?.toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+  return isTruthyEnvValue(process.env[name]);
 }
 
 /**

@@ -69,6 +69,22 @@ describe("searchContent — request shape", () => {
     expect(url.searchParams.get("order")).toBe("authored_at_asc");
   });
 
+  it("with `tag`, the note says what Loomio 3.13 changed: only contributions tagged with that name match, votes never; without it, no such sentence", async () => {
+    const { searchContent } = await import("../src/tools/search.js");
+    mockFetch(200, searchBody());
+    const tagged = await searchContent({ query: "budget", tag: "guide" });
+    expect(tagged.scope.note).toMatch(
+      /tag: on Loomio 3\.13\+ only contributions explicitly tagged/,
+    );
+    expect(tagged.scope.note).toMatch(/votes never do/);
+    expect(tagged.scope.note).toMatch(
+      /older Loomio matched every item of a thread carrying the tag/,
+    );
+    mockFetch(200, searchBody());
+    const plain = await searchContent({ query: "budget" });
+    expect(plain.scope.note).not.toMatch(/explicitly tagged/);
+  });
+
   it("order 'relevance' sends NO order parameter (Loomio's default ranking)", async () => {
     mockFetch(200, searchBody());
     const { searchContent } = await import("../src/tools/search.js");

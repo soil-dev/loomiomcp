@@ -323,6 +323,51 @@ describe("classifyForbidden", () => {
     expect(threads.message).toContain("thread limit");
   });
 
+  it("(5) the plan wording covers an inactive or expired subscription; on b3 membership writes it names the target group", async () => {
+    // Loomio ≥ 3.13.0: Api::B3::BaseController rescues Subscription::NotActive
+    // as a bare {"error":403}; ServerMembershipService.sync can also raise
+    // MaxMembersExceeded. Both are about the TARGET group, not the secret.
+    const { classifyForbidden } = await import("../src/loomio/client.js");
+    const b2 = classifyForbidden(JSON.stringify({ error: 403 }), {
+      path: "/b2/memberships",
+      method: "POST",
+    });
+    expect(b2.kind).toBe("plan_limit");
+    expect(b2.message).toMatch(/subscription is inactive or expired/);
+    expect(b2.message).not.toMatch(/b3 membership write/);
+    for (const path of ["/api/b3/memberships", "/api/b3/memberships/:id"]) {
+      const b3 = classifyForbidden(JSON.stringify({ error: 403 }), { path, method: "POST" });
+      expect(b3.kind).toBe("plan_limit");
+      expect(b3.message).toMatch(/b3 membership write/);
+      expect(b3.message).toMatch(/member cap/);
+      expect(b3.message).toMatch(/nothing was changed/);
+    }
+  });
+
+  it("(2) a generic 403 on POST /b2/discussions or /b2/polls names the Loomio ≤ 3.12 new-tag refusal; reads and other writes do not", async () => {
+    // TagService.authorize_create_tag_names! raised a bare AccessDenied on
+    // ≤ 3.12 for a create carrying a tag the user may not create; 3.13.0
+    // drops such tags silently. Same body as a rejected key.
+    const { classifyForbidden } = await import("../src/loomio/client.js");
+    for (const path of ["/b2/discussions", "/b2/polls"]) {
+      const c = classifyForbidden(JSON.stringify({ error: GENERIC_BODY }), {
+        path,
+        method: "POST",
+      });
+      expect(c.kind).toBe("unauthenticated");
+      expect(c.message).toMatch(/Loomio 3\.12 and older/);
+      expect(c.message).toMatch(/members_can_create_tags/);
+    }
+    for (const [path, method] of [
+      ["/b2/discussions", "GET"],
+      ["/b2/comments", "POST"],
+      ["/b2/discussions/:id", "PATCH"],
+    ] as const) {
+      const c = classifyForbidden(JSON.stringify({ error: GENERIC_BODY }), { path, method });
+      expect(c.message).not.toMatch(/members_can_create_tags/);
+    }
+  });
+
   it("(6) anything else → unknown, body included", async () => {
     const { classifyForbidden } = await import("../src/loomio/client.js");
     const c = classifyForbidden(JSON.stringify({ error: "Something new" }));

@@ -13,36 +13,40 @@ Loomio offers an aggregate, and bytes trimmed upstream (`exclude_types`
 / `compact=1`) before they are trimmed here (slimming, truncation).
 Every collection surfaces Loomio's exact `meta.total` so "how many"
 never needs a second page. Verified against Loomio 3.8.1; the read tools
-re-verified live on 3.9.0 (same request counts, same shapes).
+re-verified live on 3.9.0 (same request counts, same shapes). Updated
+for 0.0.16 / Loomio 3.13.1: where Loomio ≥ 3.11.1 pages a collection
+(the groups index, thread items — at most 500 rows per request), the
+connector requests 500 at a time and follows only the pages the call
+needs, within a per-call page cap, flagging a walk the cap stopped.
 
 | Tool | Loomio requests | Read profile sent | Bytes controls |
 |---|---|---|---|
-| `check_connection` | the health probe (1 authenticated `GET /b2/groups` + 1 public `GET /v1/boot/version`); its groups body is reused | `exclude_types=tag translation` | fixed-size summary |
-| `list_groups` | 1 (`GET /b2/groups`) | `exclude_types=tag translation` | slim group rows |
+| `check_connection` | the health probe (1 authenticated `GET /b2/groups` + 1 public `GET /v1/boot/version`); its groups body is reused — on Loomio ≥ 3.11.1 that is the first 50 groups, so +1 per further 500 (≤ 20; `groups_partial` if that fails) | `exclude_types=tag translation` | fixed-size summary |
+| `list_groups` | 1 per 500 member groups (`GET /b2/groups?limit=500&offset=…`; ≤ 20 pages, `scope.partial` beyond; always 1 before 3.11.1) | `exclude_types=tag translation` | slim group rows |
 | `get_group` | 1 | `exclude_types=tag translation` | attachments / cover urls dropped |
 | `list_discussions` | 1 | `exclude_types=group parent membership reaction translation` (keeps `topics` — with their `tags` field, which excluding `tag` would strip) | `description_max_chars` (default 1500; an HTML body over the cap loses its tag attributes first — `rel` / `target` / heading `id` — so the cap carries content), slim users |
-| `get_discussion` | 1 (2 with `include_items`; the second excludes `discussion`, so the opening post is not sent twice) | `exclude_types=parent membership reaction translation` (keeps `topics`, `groups`) | full text |
+| `get_discussion` | 1 (2 with `include_items`, +1 per further 500 embedded items, ≤ 3; the items requests exclude `discussion`, so the opening post is not sent twice) | `exclude_types=parent membership reaction translation` (keeps `topics`, `groups`) | full text |
 | `list_polls` | 1 | list profile | `description_max_chars` (caps `details`), results gated; rows drop `results[]` / `stv_results` (per-voter ids and scores, 30–40 % of a visible poll) and null type knobs — `stance_counts` + `total_score` stay |
 | `get_poll` | 1 | show profile | full text, results gated, full `results[]` |
 | `list_threads` | 1 (`GET /b2/threads`) | `exclude_types=topic group parent membership reaction translation` (compact minus `tag`) | `limit` ≤ 100; no bodies |
-| `list_thread_items` | 1 with `topic_id`, 2 with `discussion_id` / `poll_id` | `compact=1` for a bare `topic_id`; compact plus `discussion` when the thread's record is already known; compact minus `reaction` with `include_reactions` | whole thread fetched once (Loomio has no paging); `limit` / `offset` slice here under a `max_total_chars` reply budget (default 120000 shaped characters — `limit` × `body_max_chars` alone would allow ~900 KB; `truncated_by_budget` + `next_offset` continue); `body_max_chars` (default 4000); side-loads narrowed to the returned items; polls carry `poll_options[]` so `option_scores` are readable without a `get_poll` |
-| `get_thread_markdown` | 1 with `topic_id`, 2 otherwise | — | `max_chars` (default 60000) |
+| `list_thread_items` | 1 per 500 items of the window by `topic_id` (≤ 2), +1 with `discussion_id` / `poll_id`; with `kinds` 1 per 500 items of the whole thread (≤ 10); always 1 (+1) before 3.11.1 | `compact=1` for a bare `topic_id`; compact plus `discussion` when the thread's record is already known; compact minus `reaction` with `include_reactions` | Loomio ≥ 3.11.1 serves exactly the `offset` / `limit` window (a second page only when the first was used up without a budget cut); older Loomio returns the whole thread, sliced here (`server_paged: false`); a `max_total_chars` reply budget (default 120000 shaped characters — `limit` × `body_max_chars` alone would allow ~900 KB; `truncated_by_budget` + `next_offset` continue); `body_max_chars` (default 4000); side-loads narrowed to the returned items; polls carry `poll_options[]` so `option_scores` are readable without a `get_poll` |
+| `get_thread_markdown` | 2 on any reference (the vote-visibility guard's thread read + the document), +1 per 500 items when the guard scans (≤ 10: any thread holding more than its opening item; the scan stops early only to refuse) | guard read: `compact=1` by `topic_id`, `thread_guard` (compact minus `topic`) on the discussion / poll show; scan: `items_known_thread` | `max_chars` (default 60000) |
 | `search_content` | 1 | `compact=1` | Loomio's 20-result cap; snippets ≤ 400 chars; the `polls` side-load is read only to gate Stance snippets, never relayed |
 | `get_participation_report` | 1 for the whole group set | — (plain hash) | `country` dropped; rows sorted |
 | `get_user_activity` | N + 1 for N groups (≤ 50; 4 in flight) | — | `sample_events` ≤ 20 |
 | `list_memberships` | 1 | `compact=1` | slim rows and users |
 | every write | 1 (`create_poll`: 2 with `discussion_id`, or with `topic_id` + `group_id`; `update_poll`: 2 with `options` — the current names are read so Loomio's replace-the-set PATCH adds instead of deleting) | none — writes never carry a profile (`update_poll`'s lookup is `compact=1`) | the echoed record, shaped like its `get_*` |
-| b3 tools | 1 | — | `list_users` is Loomio's whole unpaginated user table |
+| b3 tools | 1 per call; `list_instance_groups` / `list_instance_memberships` 1 per page of ≤ 50 (Loomio's b3 maximum) | — | `list_users` is Loomio's whole unpaginated user table; the provisioning rows are Loomio's fixed field lists |
 
 Before → after, for the two tools that used to dominate Loomio's per-IP
 budget (900 requests / 5 minutes):
 
 | Question | 0.0.11 | 0.0.12 |
 |---|---|---|
-| "Which groups can you see?" | `list_groups` probed `GET /b2/polls?group_id=N` per candidate id: **50–500 requests**, blind to groups without polls | **1 request** |
+| "Which groups can you see?" | `list_groups` probed `GET /b2/polls?group_id=N` per candidate id: **50–500 requests**, blind to groups without polls | **1 request** (per 500 member groups) |
 | "How active was user X in these groups?" | `get_user_activity` listed every discussion in every group, then fetched each one's event stream: **~200 requests** (and 0 useful ones on Loomio ≥ 3.4) | **N + 1 requests** on Loomio's participation report |
 | "Who is most engaged?" | not answerable without polls × memberships reconstruction | **1 request** (`get_participation_report`) |
-| "Read this thread" | `list_events` per discussion, paginated, full bodies, anonymous read (public threads only) | **1 request** (`get_thread_markdown`, or `list_thread_items` by `topic_id`), as the key's user |
+| "Read this thread" | `list_events` per discussion, paginated, full bodies, anonymous read (public threads only) | **1–3 requests** (`list_thread_items` by `topic_id`: 1 per 500 items; `get_thread_markdown`: 2, +1 per 500 items when the thread has replies), as the key's user |
 
 Payload before → after, from the live captures the fixtures follow: a
 two-row discussion list went from ~28 KB (groups, memberships,
@@ -79,7 +83,10 @@ and more for guide-like bodies — not a change of the default cap.
 **The catalogue itself.** `tools/list` for the 24 full-mode tools is
 35 946 bytes (7.7 KB descriptions, 23.4 KB input schemas) plus 1 800
 chars of server instructions — about 9 000 tokens, a fixed per-session
-cost paid before the first call; the 28-tool b3 set is 39.4 KB. The
+cost paid before the first call; the 28-tool b3 set is 39.4 KB. (0.0.16,
+measured: read-only 14 tools 16 767 B, full 24 tools 35 646 B, b3 33
+tools 44 189 B — the five Loomio 3.13 provisioning tools account for
+the b3 growth.) The
 first 0.0.12 draft weighed 82 892 bytes (37 KB descriptions, 41 KB
 schemas) plus 3.2 KB of instructions, ~20 700 tokens, more than most
 answers, and was trimmed to a fixed shape: each description says what
@@ -95,9 +102,9 @@ tools, the id-or-key `anyOf`), 4.9 KB are names and the four
 annotations; create_poll (4.9 KB) and update_poll (4.0 KB) share 20
 poll-setting fields emitted twice. `scripts/catalog-size.mjs` prints
 these numbers from the built server (`--b3`, `--json`) and
-`tests/server.test.ts` pins the ceilings — 24 tools ≤ 36 000 bytes, 28
-≤ 40 000, instructions ≤ 1 800 chars — so growth is a decision, not
-drift. Next candidates if it must shrink further: emitting the schema
+`tests/server.test.ts` pins the ceilings — 14 read-only tools ≤ 17 000
+bytes, 24 ≤ 36 000, 33 with the b3 secret ≤ 44 500, instructions ≤ 1 800
+chars — so growth is a decision, not drift. Next candidates if it must shrink further: emitting the schema
 without the safe-integer bounds and `$schema` (needs an SDK hook; ~3 KB)
 and the twice-emitted poll settings.
 
@@ -267,9 +274,12 @@ for path, samples in sorted(by_path.items()):
 ```
 
 Useful for spotting (a) slow endpoints in absolute terms and (b)
-endpoints that are slow *and* called often. `/b2/threads/:id/items`
-(unpaginated) and `/b2/threads/:id/markdown` are the ones expected to
-scale with thread size; `/b2/reports` with the size of the group set.
+endpoints that are slow *and* called often. `/b2/threads/:id/markdown`
+is the one expected to scale with thread size, and
+`/b2/threads/:id/items` too on Loomio before 3.11.1 (whole thread per
+request; since 3.11.1 a page of at most 500 items, so its count per
+call grows instead); `/b2/reports` scales with the size of the group
+set.
 
 ### Error rate per tool
 

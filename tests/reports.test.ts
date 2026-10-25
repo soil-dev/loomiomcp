@@ -575,7 +575,7 @@ describe("getUserActivity — concurrency", () => {
   it("a rejected-key 403 on one lane aborts the call: the lanes already in flight are the last requests issued", async () => {
     const pending = mockDeferredReports();
     const { getUserActivity, REPORT_CONCURRENCY } = await import("../src/tools/reports.js");
-    const groups = [21, 22, 23, 24, 25, 26, 27, 28];
+    const groups = [301, 302, 303, 304, 305, 306, 307, 308];
     const call = getUserActivity({ user_id: 502, group_ids: groups });
     await settle();
     expect(pending).toHaveLength(REPORT_CONCURRENCY);

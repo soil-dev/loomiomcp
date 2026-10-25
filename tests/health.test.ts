@@ -24,6 +24,7 @@ import {
   resetHealthForTests,
 } from "../src/loomio/health.js";
 import { USER_AGENT } from "../src/loomio/client.js";
+import { TESTED_LOOMIO_VERSION } from "../src/version.js";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
 setupLoomioTest();
@@ -31,7 +32,7 @@ setupLoomioTest();
 type Route = { status: number; body: unknown; headers?: Record<string, string> } | Error;
 
 const GENERIC_403 = { status: 403, body: { error: "You are not authorized to access this page." } };
-const VERSION_OK = { status: 200, body: { version: "3.9.0", release: "abc", reload: false } };
+const VERSION_OK = { status: 200, body: { version: "3.13.1", release: "abc", reload: false } };
 
 /**
  * Route mock responses by path suffix. The probe issues its two GETs in
@@ -100,7 +101,7 @@ describe("checkLoomioHealth verdicts", () => {
     });
     const h = await checkLoomioHealth();
     expect(h.key_status).toBe("valid");
-    expect(h.loomio_version).toBe("3.9.0");
+    expect(h.loomio_version).toBe("3.13.1");
     expect(h.detail).toBeUndefined();
     expect(Date.parse(h.checked_at)).not.toBeNaN();
   });
@@ -121,7 +122,7 @@ describe("checkLoomioHealth verdicts", () => {
     expect(h.detail).toMatch(/no active user owns this API key/i);
     expect(h.detail).toContain("/profile/api_access");
     // The version probe is independent of the key.
-    expect(h.loomio_version).toBe("3.9.0");
+    expect(h.loomio_version).toBe("3.13.1");
   });
 
   it("unreachable: 403 with an uncatalogued body → reason unrecognised_403; the body stays in detail only", async () => {
@@ -237,9 +238,9 @@ describe("checkLoomioHealth requests", () => {
   it("parses {version} from /v1/boot/version and tolerates its absence", async () => {
     mockRoutes({
       "/b2/groups": { status: 200, body: {} },
-      "/v1/boot/version": { status: 200, body: { version: "3.9.2" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.13.2" } },
     });
-    expect((await checkLoomioHealth()).loomio_version).toBe("3.9.2");
+    expect((await checkLoomioHealth()).loomio_version).toBe("3.13.2");
 
     for (const bad of [
       { status: 404, body: "not found" },
@@ -375,7 +376,7 @@ describe("forced events", () => {
 
     const auth = stderrEvents().filter((e) => e["event"] === "loomio.auth");
     expect(auth.map((e) => e["key_status"])).toEqual(["valid", "rejected"]);
-    expect(auth[0]).toMatchObject({ loomio_version: "3.9.0" });
+    expect(auth[0]).toMatchObject({ loomio_version: "3.13.1" });
     expect(auth[0]).not.toHaveProperty("reason");
     // A closed-vocabulary reason, never the free-text detail: the event
     // is forced (cannot be switched off) and detail may quote upstream text.
@@ -389,21 +390,26 @@ describe("forced events", () => {
   });
 
   it("emits loomio.version_drift once when major.minor differs from the tested version", async () => {
+    // 3.9.0 was the tested release through 0.0.15; it is now an older
+    // minor and must drift.
     mockRoutes({
       "/b2/groups": { status: 200, body: {} },
-      "/v1/boot/version": { status: 200, body: { version: "3.10.0" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.9.0" } },
     });
     await checkLoomioHealth();
     await checkLoomioHealth({ force: true });
     const drift = stderrEvents().filter((e) => e["event"] === "loomio.version_drift");
     expect(drift).toHaveLength(1);
-    expect(drift[0]).toMatchObject({ loomio_version: "3.10.0", tested_loomio_version: "3.9.0" });
+    expect(drift[0]).toMatchObject({
+      loomio_version: "3.9.0",
+      tested_loomio_version: TESTED_LOOMIO_VERSION,
+    });
   });
 
   it("stays quiet on a patch-level difference or an unknown version", async () => {
     mockRoutes({
       "/b2/groups": { status: 200, body: {} },
-      "/v1/boot/version": { status: 200, body: { version: "3.9.7" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.13.7" } },
     });
     await checkLoomioHealth();
     resetHealthForTests();
@@ -441,6 +447,18 @@ describe("groups body cache (for check_connection)", () => {
     expect(h).not.toHaveProperty("groups");
     const url = new URL(String(callsTo("/b2/groups")[0]?.[0]));
     expect(url.searchParams.get("exclude_types")).toBe("tag translation");
+  });
+
+  it("sends no limit / offset: on Loomio ≥ 3.11.1 the probe keeps the default first page (≤ 50 groups) — its verdict needs the status alone", async () => {
+    mockRoutes({
+      "/b2/groups": { status: 200, body: GROUPS_BODY },
+      "/v1/boot/version": VERSION_OK,
+    });
+    await checkLoomioHealth({ force: true });
+    expect(callsTo("/b2/groups")).toHaveLength(1);
+    const url = new URL(String(callsTo("/b2/groups")[0]?.[0]));
+    expect(url.searchParams.has("limit")).toBe(false);
+    expect(url.searchParams.has("offset")).toBe(false);
   });
 
   it("is undefined when the probe did not answer 200, or answered non-JSON", async () => {

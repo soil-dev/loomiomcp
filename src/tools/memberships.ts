@@ -60,12 +60,20 @@ export const listMembershipsSchema = z.object({
   offset: z.number().int().min(0).optional().describe("Page offset. Default 0."),
 });
 
+/**
+ * `weight` (Loomio 3.10+, 14c07ef6c) is the member's vote weight as a
+ * decimal string ("1", "2.5"); MembershipSerializer sends it on the
+ * user's own row and on every row of a group the user administers
+ * (`include_weight?`: the admin half of the `user_email` rule), so a
+ * plain member's roster mostly lacks it.
+ */
 const MEMBERSHIP_FIELDS = [
   "id",
   "user_id",
   "group_id",
   "admin",
   "delegate",
+  "weight",
   "title",
   "inviter_id",
   "created_at",

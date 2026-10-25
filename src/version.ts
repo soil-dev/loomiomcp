@@ -15,7 +15,15 @@
  * frequently, so the health probe compares the instance's reported
  * `major.minor` to this and logs a one-time `loomio.version_drift`
  * warning when they differ — a prompt to re-verify, not an error.
+ *
+ * 3.13.1 (since 0.0.16): the b2 routes, serializers and the paged
+ * indexes were checked against the source, the upstream tests and
+ * sanitized live captures from a 3.13.1 instance. The five b3
+ * provisioning tools (src/tools/server-admin.ts) were verified ONLY
+ * through Loomio's source, integration tests and server-API docs — no
+ * live b3 capture exists, because the reference deployment holds no b3
+ * secret.
  */
-export const VERSION = "0.0.15";
+export const VERSION = "0.0.16";
 
-export const TESTED_LOOMIO_VERSION = "3.9.0";
+export const TESTED_LOOMIO_VERSION = "3.13.1";
