@@ -126,7 +126,7 @@ jobs:
             echo "npm ${have} is older than ${min}, the first with trusted publishing" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: npm-package
       - name: Tarball is the one verify packed, for the tagged version
