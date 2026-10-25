@@ -3,6 +3,7 @@ import { readBool } from "../env.js";
 import { logEvent, redactPath } from "../log.js";
 import { VERSION } from "../version.js";
 import { getFreshKeyStatus, type LoomioHealth } from "./health-cache.js";
+import type { LoomioSideLoads } from "./types.js";
 
 const DEFAULT_BASE_URL = "https://www.loomio.com/api";
 
@@ -105,7 +106,7 @@ export type ForbiddenKind =
   | "unauthenticated" // Loomio's generic body: no active user owns this key (on the b2 discussions/polls lists: or the group is not visible)
   | "not_authorized" // CanCan authorize!: "Not authorized to <action> <Model>."
   | "not_admin" // memberships#create: "User is not an admin"
-  | "plan_limit" // subscription cap: bare {"error":403} or the thread-limit body
+  | "plan_limit" // subscription cap or inactive subscription: bare {"error":403}, or the thread-limit body
   | "unknown"; // a JSON 403 body we have not catalogued
 
 export class LoomioAuthError extends Error {
@@ -333,16 +334,29 @@ async function fetchWithTimeout(
 //           sends discussion_id, so it does not arise from here.
 //         - PollService.invite, reached from PollsController#create AFTER
 //           the poll was saved, for an anonymous poll that is not active
-//           (`anonymous: true` forces voting_system anonymous_ballot; no
-//           future closing_at means not active). The one bare raiser a
-//           valid key can hit on a write from this connector.
-//         - Api::B3::UsersController#authenticate_api_key! on every /b3/
-//           path — the bearer did not `secure_compare` to the Loomio
-//           server's ENV['B3_API_KEY'], or that variable is unset / 16
-//           characters or shorter. A DIFFERENT secret from the per-user
-//           key (LOOMIO_B3_API_KEY: no per-user page to copy it from, no
-//           relation to the /health verdict), and b3 never calls
-//           `authorize!`, so on a b3 path this is the only 403 there is.
+//           (no future closing_at; Loomio ≤ 3.9 also forced the poll's
+//           `voting_system` to anonymous_ballot, a field 3.10 removed,
+//           917b2c2e4). One of the two bare raisers a valid key can hit
+//           on a write from this connector.
+//         - TagService.authorize_create_tag_names!, reached from
+//           DiscussionService.create / PollService.create on Loomio
+//           ≤ 3.12 when the create carries a tag name the group lacks
+//           and the user may not create tags. 3.13.0 (5934ab182)
+//           replaced it with `permitted_tag_names`, which drops such
+//           tags silently — so on 3.13+ this raiser is gone.
+//         - `authenticate_api_key!` on every /b3/ path — the bearer did
+//           not `secure_compare` to the Loomio server's ENV['B3_API_KEY'],
+//           or that variable is unset / 16 characters or shorter. Since
+//           Loomio 3.13.0 (ee6befeb7) the check lives in
+//           `Api::B3::BaseController` (a `prepend_before_action`, so it
+//           runs before any record lookup) and covers the new groups /
+//           memberships controllers too; before that it was
+//           `Api::B3::UsersController`'s own, with the same rule. A
+//           DIFFERENT secret from the per-user key (LOOMIO_B3_API_KEY: no
+//           per-user page to copy it from, no relation to the /health
+//           verdict), and b3 never calls `authorize!`, so on a b3 path
+//           this is the only key-related 403 there is — the other b3 403
+//           is the numeric body below.
 //       So the body means "unauthenticated" everywhere, and additionally
 //       "group not visible" on the two visibility-gated lists only —
 //       their GET index; #create on the same paths goes through the
@@ -364,7 +378,13 @@ async function fetchWithTimeout(
 //       is_admin do not count.
 //   {"error":403}
 //       `respond_with_standard_error` for Subscription::MaxMembersExceeded
-//       — the instance's plan caps members.
+//       — the instance's plan caps members. On the b3 membership writes
+//       (Loomio ≥ 3.13.0) the same bare body also means
+//       Subscription::NotActive (b3/base_controller.rb:6): the target
+//       group's subscription is inactive or expired
+//       (`ServerMembershipService.sync` / `.update` raise it unless
+//       `group.enabled?`), while `sync` reaches MaxMembersExceeded through
+//       `UserInviter.check_members_limit!`.
 //   {"error":"…thread limit…","action":"upgrade"}
 //       respond_with_thread_limit_reached — the plan caps threads.
 //   non-JSON, or a JSON problem body whose "type" URL mentions cloudflare
@@ -375,6 +395,9 @@ async function fetchWithTimeout(
 // The catalogue is exact as of Loomio 3.8.1 (snorlax_base.rb,
 // authenticates_api_key.rb, b2/base_controller.rb, b2/memberships_controller.rb)
 // and unchanged in 3.9.0 (none of those files is in the 3.8.1 → 3.9.0 diff).
+// Through 3.13.1 the 403 rescues in snorlax_base.rb are unchanged; what
+// 3.10–3.13 added is the b3 base controller (above) and its
+// Subscription::NotActive rescue.
 
 export interface ForbiddenContext {
   /** Redacted path of the failing request, for the message and to decide which raisers apply. */
@@ -428,6 +451,15 @@ function isVisibilityGatedList(path: string | undefined, method: string | undefi
 function isPollCreate(path: string | undefined, method: string | undefined): boolean {
   return (
     path !== undefined && (method ?? "GET").toUpperCase() === "POST" && /\/b2\/polls$/.test(path)
+  );
+}
+
+/** `POST /b2/discussions` or `POST /b2/polls` — the creates that accept `tags` (see `tagCaveat` in `classifyForbidden`). */
+function isTaggableCreate(path: string | undefined, method: string | undefined): boolean {
+  return (
+    path !== undefined &&
+    (method ?? "GET").toUpperCase() === "POST" &&
+    /\/b2\/(discussions|polls)$/.test(path)
   );
 }
 
@@ -522,13 +554,14 @@ export function classifyForbidden(
   const error = json.error;
   const errorText = typeof error === "string" ? error.trim() : "";
 
-  // (2a) Generic CanCan message on a b3 path. `Api::B3::UsersController#
-  // authenticate_api_key!` `secure_compare`s the bearer against the
-  // Loomio server's ENV['B3_API_KEY'] and raises a bare AccessDenied —
-  // the same body as b2's unauthenticated response — when they differ OR
-  // when that variable is unset / 16 characters or shorter. The
-  // controller never calls `authorize!`, so on b3 the generic body has
-  // exactly one meaning, and it is about LOOMIO_B3_API_KEY. The health
+  // (2a) Generic CanCan message on a b3 path. `authenticate_api_key!`
+  // (`Api::B3::BaseController` since Loomio 3.13.0, ee6befeb7;
+  // `Api::B3::UsersController`'s own before) `secure_compare`s the
+  // bearer against the Loomio server's ENV['B3_API_KEY'] and raises a
+  // bare AccessDenied — the same body as b2's unauthenticated response —
+  // when they differ OR when that variable is unset / 16 characters or
+  // shorter. No b3 controller calls `authorize!`, so on b3 the generic
+  // body has exactly one meaning, and it is about LOOMIO_B3_API_KEY. The health
   // probe tests LOOMIO_API_KEY against GET /b2/groups, a different
   // credential, so `keyStatus` must not colour this message either way:
   // a fresh `valid` would claim a rotation that did not happen, a fresh
@@ -597,6 +630,15 @@ export function classifyForbidden(
         "`closing_at` also produces this body, from PollService.invite, AFTER the poll itself was " +
         "saved — check whether the poll now exists before retrying, and give anonymous polls a closing_at."
       : "";
+    // Loomio ≤ 3.12 also raised a bare AccessDenied from
+    // `TagService.authorize_create_tag_names!` when a discussion / poll
+    // create carried a tag name the group lacks and the user may not
+    // create tags; 3.13.0 (5934ab182) drops such tags silently instead.
+    const tagCaveat = isTaggableCreate(opts.path, opts.method)
+      ? " On Loomio 3.12 and older the same body also answers a create carrying a `tags` name the " +
+        "group does not have yet when the user may not create tags (not a group admin, and " +
+        "members_can_create_tags off) — retry without new tags before suspecting the key."
+      : "";
     const onlyCause = isVisibilityFiltered(opts.path)
       ? "On this endpoint Loomio applies visibility as a FILTER, never as a 403 (a thread the user " +
         "cannot see answers 404; search, reports and the groups index simply omit what it cannot " +
@@ -604,7 +646,8 @@ export function classifyForbidden(
       : "On this endpoint Loomio produces this body only when no active user owns the bearer key " +
         "(b2/memberships answers a non-member 200 with an empty list, and record reads answer " +
         '"Not authorized to <action> <Model>." instead), so this is not a visibility or role problem.' +
-        pollCreateCaveat;
+        pollCreateCaveat +
+        tagCaveat;
     if (opts.keyStatus === "valid") {
       return {
         kind: "unauthenticated",
@@ -668,15 +711,28 @@ export function classifyForbidden(
   }
 
   // (5) Subscription / plan caps: a bare numeric body, or the
-  // thread-limit body carrying `action: "upgrade"`.
+  // thread-limit body carrying `action: "upgrade"`. On the b3
+  // membership routes (Loomio ≥ 3.13.0) the bare body has exactly two
+  // causes, both about the TARGET group: Subscription::NotActive (its
+  // subscription is inactive or expired — `sync` and role updates check
+  // `group.enabled?` first) or MaxMembersExceeded (adding these people
+  // would pass its member cap). Named as such there, since the b3 secret
+  // itself is evidently accepted.
   if (typeof error === "number" || json.action === "upgrade") {
     const detail = errorText ? `: "${clip(errorText)}"` : "";
+    const b3Membership =
+      opts.path !== undefined && /\/b3\/memberships(\/:id)?$/.test(opts.path)
+        ? " On a b3 membership write this means the target group's subscription is inactive or " +
+          "expired, or the addition would exceed its member cap; nothing was changed (the b3 secret " +
+          "was accepted)."
+        : "";
     return {
       kind: "plan_limit",
       message:
         `Loomio returned 403 for ${where}${detail}. This is a Loomio subscription/plan limit ` +
-        "(member or thread cap on the instance's plan), not an authentication or role problem. " +
-        "The instance operator or group owner must upgrade the plan or free up capacity.",
+        "(member or thread cap, or the group's subscription is inactive or expired), not an " +
+        "authentication or role problem. The instance operator or group owner must upgrade or " +
+        `renew the plan, or free up capacity.${b3Membership}`,
     };
   }
 
@@ -930,11 +986,36 @@ export const EXCLUDE_TYPES = {
    * all-or-nothing. `parent` stays excluded — TopicItemSerializer would
    * otherwise side-load every item's parent item again under
    * `parent_topic_items`, doubling the payload for a tree the `parent_id`
-   * field already describes. `discussion` must stay INCLUDED here: the
-   * opening post's reactions enter the `reactions` root only through
+   * field already describes. That root still arrives in part, under
+   * every profile, `compact` included: since Loomio 3.11.0 (70c5a5a93)
+   * the serializer also has `has_one :reply_parent` into the SAME
+   * `parent_topic_items` root, and that association is gated by the
+   * serializer's cache scope (`include_reply_parent?`,
+   * topic_item_serializer.rb:24-29), not by `exclude_types` — the
+   * 3.13.1 captures carry a few rows under `compact=1`. No tool reads
+   * the root, the rows are harmless, and nothing client-side can
+   * suppress them. `discussion` must stay INCLUDED here: the opening
+   * post's reactions enter the `reactions` root only through
    * DiscussionSerializer's `has_many :reactions`.
    */
   items_with_reactions: "topic group parent membership tag translation",
+  /**
+   * get_thread_markdown's vote-visibility guard reading a thread by
+   * `discussion_id` or `poll_id` (GET /b2/discussions/{id},
+   * GET /b2/polls/{id}), and every tool's `poll_id` resolution
+   * (`showPollThread`): `compact` minus `topic`. Both need the thread's
+   * TopicSerializer row — `topicable_type` / `topicable_id` name the
+   * thread a poll sits in (a discussion, for a poll inside one), and the
+   * guard reads `items_count` — and a record show reaches that row only
+   * through its own `has_one :topic`, which `compact` (`topic` excluded)
+   * would drop. TopicSerializer then side-loads the fronting discussion
+   * or poll itself (its `include_discussion?` / `include_poll?` test the
+   * topicable type, not `exclude_types`), and PollSerializer adds the
+   * user's `my_stance` under `stances`. The bare-`topic_id` path needs
+   * no profile: GET /b2/threads/{id}?compact=1 returns the topic row as
+   * its resource.
+   */
+  thread_guard: "group parent membership reaction tag translation",
 } as const;
 
 export type ReadProfile = keyof typeof EXCLUDE_TYPES | "compact";
@@ -944,9 +1025,13 @@ export type ReadProfile = keyof typeof EXCLUDE_TYPES | "compact";
  * `loomioGet` call. `compact` is for reads that need neither the topics
  * join nor a `tags` field (memberships, thread items by bare topic_id,
  * the record resolvers, search); every other profile spells out what to
- * drop. Never spread these into a write: the write controllers ignore
- * them and `PermittedParams` (`:raise` mode) would 400 on the unknown
- * keys if they ever reached the resource hash.
+ * drop. Never spread these into a write, and never send them as a
+ * write's query string: Rails merges query and body into one `params`,
+ * and `PermittedParams` (`:raise` mode) answers 400 for any key that
+ * reaches the resource hash. Since Loomio 3.12.0 (`wrap_parameters
+ * false`, e5bd13dfc) that is no longer hypothetical for the FLAT comment
+ * body: the whole top-level hash — `exclude_types` / `compact` included
+ * — is the resource hash there (see "Write bodies" below).
  */
 export function readParams(profile: ReadProfile): QueryParams {
   return profile === "compact" ? { compact: 1 } : { exclude_types: EXCLUDE_TYPES[profile] };
@@ -1057,6 +1142,231 @@ export async function loomioGet<T>(path: string, params?: QueryParams): Promise<
   }
 }
 
+// ── Paged reads ─────────────────────────────────────────────────────────────
+//
+// Loomio 3.11.1 (bc1a6cc02, "Bound User API collection pages") put two
+// routes the connector reads WHOLE behind `page_collection_bounded`:
+// the b2 groups index (ordered by id) and a thread's items (ordered by
+// `sequence_id, id`). The helper (snorlax_base.rb:217-222) reads
+// `offset` (negative → 0) and `limit` (`.clamp(1, limit_max)`) and
+// nothing else — no `per` / `from` aliases — and the B2 override
+// (b2/base_controller.rb:13-16) sets `limit_max: 500` with the default
+// page of 50. `collection_count` is taken BEFORE the page is cut
+// (snorlax_base.rb:185-192 and :88-94; the two controllers set it the
+// same way), so `meta.total` is the whole collection on every page. A
+// caller that reads one reply as "everything" therefore loses every row
+// past the 50th without a trace — which is what the connector did
+// against 3.11.1+ until 0.0.16.
+//
+// The rule (DESIGN.md): follow Loomio's pages up to `meta.total`, within
+// a per-call page cap, and SAY when the cap stopped the walk; never
+// emulate paging Loomio lacks. Every request names `limit` AND `offset`
+// (`offset=0` included) so that a reply which ignored them can be
+// recognised: Loomio before 3.11.1 answers both routes with the whole
+// collection from row 0 whatever was asked. Such a reply is detected
+// on the FIRST response only (`PagerState.legacy`) and ends the walk;
+// the caller slices it. A whole collection that happens to fit the
+// first window at offset 0 cannot be told apart from a bounded page —
+// and needs no telling: it is complete either way.
+//
+// A bounded page side-loads only what ITS rows reference (the 3.13.1
+// capture of items 10-19 carries no `discussions` root: the opening
+// post is on page 0), so roots must be merged (`mergePageBodies`)
+// before anything is looked up by id across pages.
+
+/** Rows per b2 page: Loomio's B2 `limit_max` (b2/base_controller.rb:13-16). A larger `limit` is clamped to it. */
+export const B2_PAGE_MAX = 500;
+
+/** Where a walk stands; read it after the walk (or between `next()` calls). */
+export interface PagerState {
+  /** Upstream requests made so far — every one counts, a repeated page included. */
+  requests: number;
+  /** `meta.total` from the first response that carried one; null when Loomio sent none. */
+  total: number | null;
+  /** Distinct root rows delivered so far (deduplicated by `id`). */
+  rows: number;
+  /**
+   * True only when the FIRST response proved that Loomio ignored
+   * `limit` / `offset` (more rows than requested, or the whole `total`
+   * at a non-zero offset) — Loomio before 3.11.1. It means "detected",
+   * not "the server is older than 3.11.1": an old server whose whole
+   * collection fits the first window at offset 0 is indistinguishable
+   * from a bounded page and leaves this false, correctly, since that
+   * reply is complete. When true the body holds the collection from row
+   * 0 and the CALLER slices it.
+   */
+  legacy: boolean;
+  /** No further request will be made. */
+  done: boolean;
+  /** The walk stopped at `maxPages` with rows still unread: the result is partial and must say so. */
+  capped: boolean;
+  /** The last response returned as many root rows as were requested (the only "more may follow" signal when `total` is null). */
+  lastPageFull: boolean;
+}
+
+export interface PagerOptions {
+  /** The collection root (`items`, `groups`): the array the window counts. */
+  root: string;
+  /** First row wanted. Default 0. */
+  offset?: number;
+  /** Rows wanted from `offset`. Default: all of them (up to `maxPages`). */
+  want?: number;
+  /** Rows asked for per request. Default `B2_PAGE_MAX`. */
+  pageSize?: number;
+  /** Hard cap on requests; reaching it with rows left sets `capped`. */
+  maxPages: number;
+}
+
+export interface Pager<T> {
+  /** The next page (root rows already seen are filtered out), or undefined once the walk is done. */
+  next(): Promise<T | undefined>;
+  readonly state: PagerState;
+}
+
+function rootRows(body: unknown, root: string): unknown[] {
+  const rows =
+    body && typeof body === "object" ? (body as Record<string, unknown>)[root] : undefined;
+  return Array.isArray(rows) ? rows : [];
+}
+
+function rowId(row: unknown): number | undefined {
+  const id = row && typeof row === "object" ? (row as { id?: unknown }).id : undefined;
+  return typeof id === "number" ? id : undefined;
+}
+
+/**
+ * A lazy walk over one paged b2 collection. Each `next()` issues one GET
+ * with `{...params, limit: min(pageSize, want − got), offset: start + got}`
+ * and then applies the stop rules, in order:
+ *
+ *   1. first response only — `rows > limit`, or `offset > 0` and the
+ *      rows equal a non-zero `meta.total`: Loomio ignored the window
+ *      (pre-3.11.1). `legacy`, stop.
+ *   2. no rows: stop.
+ *   3. no row with an unseen id (a repeated page; defensive): stop.
+ *   4. `want` reached: stop.
+ *   5. `total` known and `offset + got ≥ total`: stop.
+ *   6. `total` unknown and a short page: stop.
+ *   7. `maxPages` requests made: `capped`, stop.
+ *
+ * A short page is NOT the end when `total` is known: Loomio may clamp
+ * below the requested size (a future `limit_max`), so the walk carries on
+ * at `offset += rows received` — which is also why `got` counts rows
+ * received, not rows wanted.
+ */
+export function loomioPager<T extends LoomioSideLoads>(
+  path: string,
+  params: QueryParams,
+  opts: PagerOptions,
+): Pager<T> {
+  const start = Math.max(0, opts.offset ?? 0);
+  const want = opts.want ?? Number.POSITIVE_INFINITY;
+  const pageSize = Math.max(1, Math.min(opts.pageSize ?? B2_PAGE_MAX, B2_PAGE_MAX));
+  const state: PagerState = {
+    requests: 0,
+    total: null,
+    rows: 0,
+    legacy: false,
+    done: want <= 0,
+    capped: false,
+    lastPageFull: false,
+  };
+  const seen = new Set<number>();
+  let got = 0;
+
+  async function next(): Promise<T | undefined> {
+    if (state.done) return undefined;
+    const limit = Math.min(pageSize, want - got);
+    const offset = start + got;
+    const body = await loomioGet<T>(path, { ...params, limit, offset });
+    state.requests += 1;
+    const first = state.requests === 1;
+    const rows = rootRows(body, opts.root);
+    const total = typeof body.meta?.total === "number" ? body.meta.total : null;
+    if (state.total === null) state.total = total;
+    const fresh = rows.filter((row) => {
+      const id = rowId(row);
+      if (id === undefined) return true;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    got += rows.length;
+    state.rows += fresh.length;
+    state.lastPageFull = rows.length >= limit;
+
+    if (
+      first &&
+      (rows.length > limit || (offset > 0 && total !== null && total > 0 && rows.length === total))
+    ) {
+      state.legacy = true;
+      state.done = true;
+    } else if (rows.length === 0 || fresh.length === 0 || got >= want) {
+      state.done = true;
+    } else if (state.total !== null ? start + got >= state.total : rows.length < limit) {
+      state.done = true;
+    } else if (state.requests >= opts.maxPages) {
+      state.capped = true;
+      state.done = true;
+    }
+    return fresh.length === rows.length ? body : ({ ...body, [opts.root]: fresh } as T);
+  }
+
+  return { next, state };
+}
+
+/**
+ * Merge page bodies into one: every array-valued root concatenated and
+ * deduplicated by numeric `id`, first arrival kept (rows without an id
+ * are concatenated); `meta` and any other scalar from the first page
+ * that has it. Never mutates its inputs — a cached page (the health
+ * probe's groups body) may be one of them. `root` is always present in
+ * the result, `[]` when no page had it.
+ */
+export function mergePageBodies<T extends object>(pages: readonly T[], root: string): T {
+  const out: Record<string, unknown> = {};
+  const ids = new Map<string, Set<number>>();
+  for (const page of pages) {
+    for (const [key, value] of Object.entries(page)) {
+      if (!Array.isArray(value)) {
+        if (!(key in out)) out[key] = value;
+        continue;
+      }
+      const into = Array.isArray(out[key]) ? (out[key] as unknown[]) : [];
+      out[key] = into;
+      let keyIds = ids.get(key);
+      if (!keyIds) {
+        keyIds = new Set();
+        ids.set(key, keyIds);
+      }
+      for (const row of value) {
+        const id = rowId(row);
+        if (id !== undefined) {
+          if (keyIds.has(id)) continue;
+          keyIds.add(id);
+        }
+        into.push(row);
+      }
+    }
+  }
+  if (!Array.isArray(out[root])) out[root] = [];
+  return out as T;
+}
+
+/** Drain a `loomioPager` walk and merge its pages: the whole window, or as much as `maxPages` allowed (`state.capped`). */
+export async function loomioGetAllPages<T extends LoomioSideLoads>(
+  path: string,
+  params: QueryParams,
+  opts: PagerOptions,
+): Promise<{ body: T; state: PagerState }> {
+  const pager = loomioPager<T>(path, params, opts);
+  const pages: T[] = [];
+  for (let page = await pager.next(); page !== undefined; page = await pager.next()) {
+    pages.push(page);
+  }
+  return { body: mergePageBodies(pages, opts.root), state: pager.state };
+}
+
 export interface RawResponse {
   status: number;
   /** Body as text, "" when unreadable. */
@@ -1153,40 +1463,65 @@ export async function loomioGetPublic(
 // ── Write bodies ────────────────────────────────────────────────────────────
 //
 // Every b2 write is JSON (`Content-Type: application/json`). What the
-// body must LOOK like follows from two Rails mechanisms meeting in
-// `Api::B2::BaseController#permitted_params` (Loomio 3.8.1):
+// body must LOOK like follows from `Api::B2::BaseController#
+// permitted_params`, and HOW it is read changed in Loomio 3.12.0:
 //
 //   1. `permitted_params` uses `params[resource_name]` — the WRAPPED
-//      hash `{"discussion": {…}}` — when it is present, and otherwise
-//      falls back to the flat top-level hash minus a few reserved keys.
-//   2. Rails' `wrap_parameters format: [:json]` is on (config/
-//      initializers/wrap_parameters.rb). For a JSON body it builds the
-//      wrapped hash ITSELF from the top-level keys — but only the keys
-//      that are COLUMNS of the resource's model (`attribute_names`).
+//      hash `{"discussion": {…}}` — when it responds to `permit`, and
+//      otherwise falls back to the flat top-level hash minus a few
+//      reserved keys (b2/base_controller.rb:34-50 at 3.13.1).
+//   2. Loomio 3.1.3 – 3.11.x: Rails' `wrap_parameters format: [:json]`
+//      is on (config/initializers/wrap_parameters.rb). For a JSON body
+//      it builds the wrapped hash ITSELF from the top-level keys — but
+//      only the keys that are COLUMNS of the resource's model
+//      (`attribute_names`). So a flat JSON discussion body reached the
+//      controller already wrapped, containing only the column names;
+//      `group_id`, `private`, `recipient_*`, a poll's `options` /
+//      `poll_option_names` — none of them columns — were silently lost,
+//      and the record landed in the wrong place or failed validation
+//      with an empty `errors` hash.
+//   3. Loomio ≥ 3.12.0 (e5bd13dfc): `wrap_parameters false` on the B2
+//      base controller. Rule 2 is gone, so a flat body now takes rule
+//      1's fallback whole — every top-level key, each one permit-checked,
+//      an unknown one answering 400 (`action_on_unpermitted_parameters =
+//      :raise`; test/integration/b2_poll_requests_test.rb "JSON cannot
+//      assign protected poll attributes") — and an explicitly nested
+//      body still takes rule 1's first branch verbatim (same file,
+//      "nested JSON creates a group draft with every option").
 //
-// Put together: a flat JSON discussion body reaches the controller
-// already wrapped, containing only the column names. `group_id`,
-// `private`, `recipient_*`, a poll's `options` / `poll_option_names` —
-// none of these are columns on Discussion / Poll, so a FLAT body
-// silently loses them and the record is created in the wrong place, or
-// fails validation with an empty `errors` hash. Sending the resource
-// NESTED (`{"discussion": {…}}`) makes rule 1 take the hash verbatim
-// and rule 2 never runs (the wrapper key is already present). That is
-// `nestedBody`. Loomio's `action_on_unpermitted_parameters = :raise`
-// means any key PermittedParams does not list answers 400, so the tool
-// layer must send exactly the permitted attribute names.
+// NESTED (`nestedBody`) therefore stays the cross-version shape for
+// discussions and polls: rule 1's first branch on every version, where
+// a flat body loses `group_id` / `options` on 3.9 – 3.11. Either way the
+// tool layer must send exactly the permitted attribute names.
 //
-// Comments are the exception: `CommentsController#create` reads
-// `params[:discussion_id]` from the TOP level (it is not a Comment
-// column, so wrapping leaves it there) and PermittedParams takes the
-// wrapped `comment` hash rule 2 built from `body`, `body_format`,
-// `parent_id`, `parent_type` — all columns. So a comment body is FLAT
-// (`flatBody`), exactly as Loomio's own controller test posts it
-// (test/controllers/api/b2/comments_controller_test.rb, "create accepts
-// a bearer token with flat parameters"). PollService.invite reads
-// `recipient_user_ids` / `recipient_emails` / `recipient_audience` from
-// the top-level `params`, not the resource hash — `nestedBody` takes a
-// third argument for exactly those keys.
+// Comments are FLAT (`flatBody`) on every version. `CommentsController#
+// create` reads `params[:discussion_id]` from the TOP level. On ≤ 3.11
+// wrapping left it there (not a Comment column) and built the `comment`
+// hash from `body`, `body_format`, `parent_id`, `parent_type`; from 3.12
+// the fallback takes the flat hash as is and DELETES `discussion_id`
+// from it for comments (b2/base_controller.rb:46-48) — which is what
+// keeps that key from answering 400. Proof: Loomio's controller test
+// "create accepts a bearer token with flat parameters"
+// (test/controllers/api/b2/comments_controller_test.rb) and, from 3.12,
+// "shared JSON handling preserves comment discussion context"
+// (b2_poll_requests_test.rb:135-148). The flip side: from 3.12 ANY other
+// top-level key on a comment write — a read profile's `exclude_types`
+// in the query string included — is permit-checked and 400s (see
+// `readParams`). PollService.invite reads `recipient_user_ids` /
+// `recipient_emails` / `recipient_audience` from the top-level `params`,
+// not the resource hash — `nestedBody` takes a third argument for
+// exactly those keys.
+//
+// b3 writes (Loomio ≥ 3.13.0) go through `Api::B3::BaseController`,
+// which does NOT opt out of ParamsWrapper. The connector sends the one
+// resource-hash write there — `PATCH /b3/memberships/{id}`, whose
+// controller does `params.require(:membership).permit(:admin, :delegate)`
+// — explicitly nested anyway (`nestedBody("membership", …)`), so it
+// never depends on the wrapper. `POST /b3/memberships` parses
+// `request.raw_post` itself when the Content-Type is JSON (so `[null]`
+// stays a 400 instead of Rails compacting it to `[]`) and reads
+// `group_id` / `emails` from the top level: a flat body, built field
+// by field in src/tools/server-admin.ts.
 //
 // Form encoding is gone. It existed for Loomio ≤ 3.1.2, whose comments
 // controller double-wrapped a JSON body (NOTES-ON-LOOMIO-API.md, Gotcha
@@ -1202,12 +1537,13 @@ export function flatBody(attrs: JsonBody): JsonBody {
 
 /**
  * `{ [resource]: attrs, ...topLevel }` — the wire shape for discussion
- * and poll writes. `topLevel` is for the keys a SERVICE reads from
- * `params` directly (a poll's `recipient_*`); everything the model owns
- * goes under the resource key.
+ * and poll writes, and for the b3 role update (`membership`).
+ * `topLevel` is for the keys a SERVICE reads from `params` directly (a
+ * poll's `recipient_*`); everything the model owns goes under the
+ * resource key.
  */
 export function nestedBody(
-  resource: "discussion" | "poll" | "comment" | "user",
+  resource: "discussion" | "poll" | "comment" | "user" | "membership",
   attrs: JsonBody,
   topLevel: JsonBody = {},
 ): JsonBody {
@@ -1221,24 +1557,31 @@ export interface WriteOptions {
 type WriteMethod = "POST" | "PATCH" | "DELETE";
 
 /**
- * The single b2 write path. `isReadOnly()` is checked FIRST — before
- * the URL is built, before the key is read — so a read-only deployment
- * refuses with a clear message and never opens a connection. Every
- * verb sends `Content-Type: application/json`; DELETE sends `{}` (no
- * body would also work, but an explicit empty object keeps the same
- * code path and content type on every write).
+ * The single write path, b2 and b3 alike (`auth` picks the credential:
+ * the per-user key by default, the server-instance secret for b3).
+ * `isReadOnly()` is checked FIRST — before the URL is built, before
+ * either secret is read — so a read-only deployment refuses with a
+ * clear message and never opens a connection. Every verb sends
+ * `Content-Type: application/json`, and on b3 that header is
+ * load-bearing: `POST /b3/memberships` parses `request.raw_post` as JSON
+ * only when the request says it is JSON (b3/memberships_controller.rb:13),
+ * which is what keeps a `[null]` email list a 400 instead of the empty
+ * list Rails' form parsing would make of it. DELETE sends `{}` (no body
+ * would also work, but an explicit empty object keeps the same code
+ * path and content type on every write).
  */
 async function loomioWrite<T>(
   method: WriteMethod,
   path: string,
   body: JsonBody | undefined,
   opts: WriteOptions,
+  auth: Auth = B2_AUTH,
 ): Promise<T> {
   if (isReadOnly()) throw new LoomioReadOnlyError(method);
   const url = buildUrl(path, opts.params);
   const start = await doFetch(url, {
     method,
-    headers: { ...authHeaders(B2_AUTH), "Content-Type": "application/json" },
+    headers: { ...authHeaders(auth), "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
   try {
@@ -1284,13 +1627,15 @@ export async function loomioDelete<T>(path: string, opts: WriteOptions = {}): Pr
 
 /**
  * GET a `/b3/...` admin endpoint (`GET /b3/users`, `/b3/users/:id`,
- * `/b3/users/identity/:type/:uid` — Loomio 3.8.1 routes.rb, `namespace
- * :b3`). Same bearer scheme and same server-instance secret as
- * `loomioPostB3`, never the per-user key. A read, so `isReadOnly()` is
- * not consulted here: the gate for these calls is at registration
- * (src/server.ts registers the b3 tools only when `LOOMIO_B3_API_KEY`
- * is set AND the server is not read-only), because every b3 user
- * record carries the account's email — see src/tools/admin.ts.
+ * `/b3/users/identity/:type/:uid`; from Loomio 3.13.0 also `GET
+ * /b3/groups` and `GET /b3/memberships` — routes.rb `namespace :b3`).
+ * Same bearer scheme and same server-instance secret as the b3 writes,
+ * never the per-user key. A read, so `isReadOnly()` is not consulted
+ * here: the gate for these calls is at registration (src/server.ts
+ * registers the b3 tools only when `LOOMIO_B3_API_KEY` is set AND the
+ * server is not read-only), because every b3 user and membership row
+ * carries an email address — see src/tools/admin.ts and
+ * src/tools/server-admin.ts.
  */
 export async function loomioGetB3<T>(path: string, params?: QueryParams): Promise<T> {
   const url = buildUrl(path, params);
@@ -1306,19 +1651,25 @@ export async function loomioGetB3<T>(path: string, params?: QueryParams): Promis
  * POST to a `/b3/...` admin endpoint. b3 uses the same bearer scheme
  * as b2 but a different secret — validated against `ENV['B3_API_KEY']`
  * on the Loomio server, NOT the per-user API key. Caller must have
- * already gated on `hasB3ApiKey()`.
+ * already gated on `hasB3ApiKey()`. `body` defaults to `{}`, which is
+ * what the user (de|re)activate routes take; `POST /b3/memberships`
+ * passes its flat `{group_id, emails}`.
  */
-export async function loomioPostB3<T>(path: string, params?: QueryParams): Promise<T> {
-  if (isReadOnly()) throw new LoomioReadOnlyError("POST");
-  const url = buildUrl(path, params);
-  const start = await doFetch(url, {
-    method: "POST",
-    headers: { ...authHeaders(B3_AUTH), "Content-Type": "application/json" },
-    body: "{}",
-  });
-  try {
-    return await consumeBody(start, () => handleResponse<T>(start));
-  } finally {
-    start.cleanup();
-  }
+export async function loomioPostB3<T>(path: string, body: JsonBody = {}): Promise<T> {
+  return loomioWrite<T>("POST", path, body, {}, B3_AUTH);
+}
+
+/** PATCH a `/b3/...` member route (`/b3/memberships/{id}`, Loomio ≥ 3.13.0) with the b3 secret. */
+export async function loomioPatchB3<T>(path: string, body: JsonBody): Promise<T> {
+  return loomioWrite<T>("PATCH", path, body, {}, B3_AUTH);
+}
+
+/**
+ * DELETE a `/b3/...` member route (`/b3/memberships/{id}`, Loomio ≥
+ * 3.13.0) with the b3 secret. Unlike b2's soft discards this one is a
+ * REVOCATION with side effects (see `revoke_membership` in
+ * src/tools/server-admin.ts); the client only carries it.
+ */
+export async function loomioDeleteB3<T>(path: string): Promise<T> {
+  return loomioWrite<T>("DELETE", path, undefined, {}, B3_AUTH);
 }

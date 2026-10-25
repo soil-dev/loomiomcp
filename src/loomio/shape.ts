@@ -84,6 +84,12 @@ export function indexById<T extends { id: number }>(
  * ranges) and mean nothing to a caller; `ranges`, `max_depth`,
  * `position`-style internals serve Loomio's incremental loading; the
  * `allow_*` flags are group policy the group record already states.
+ *
+ * `members_count` and `closed_polls_count` arrive from Loomio ≤ 3.10
+ * only (TopicSerializer dropped them in 3.11.0, 79280ee7a); they stay
+ * listed so an older server's rows still carry them, and `pick` simply
+ * skips them on a newer one. `has_tagged_replies` (3.13+) says `tags` is
+ * the union over every tagged contribution, replies included.
  */
 export const TOPIC_JOIN_FIELDS = [
   "items_count",
@@ -92,6 +98,7 @@ export const TOPIC_JOIN_FIELDS = [
   "locked_at",
   "pinned_at",
   "tags",
+  "has_tagged_replies",
   "members_count",
   "seen_by_count",
   "active_polls_count",

@@ -30,7 +30,6 @@ function poll(overrides: Partial<LoomioPoll> = {}): LoomioPoll {
     closed_at: null,
     closing_at: "2026-10-01T12:00:00Z",
     anonymous: false,
-    voting_system: "stance",
     topic_id: 601,
     group_id: 7,
     results: [
@@ -198,5 +197,63 @@ describe("stripHiddenStanceResults", () => {
     const out = stripHiddenStanceResults(castStance, { visible: false, reason: "until_closed" });
     expect(out).not.toHaveProperty("option_scores");
     expect(out).not.toHaveProperty("reason");
+  });
+});
+
+// get_thread_markdown's guard predicate and refusal (Loomio ≥ 3.10's
+// Markdown export ignores until_vote: thread_markdown_service.rb:213-215).
+describe("hiddenUntilVote", () => {
+  it("true only for an OPEN until_vote poll the user has not voted in", async () => {
+    const { hiddenUntilVote } = await import("../src/loomio/visibility.js");
+    const open = poll({ hide_results: "until_vote", opened_at: "2026-09-01T12:00:00Z" });
+    expect(hiddenUntilVote(open)).toBe(true);
+    expect(hiddenUntilVote(open, castStance)).toBe(false);
+    expect(hiddenUntilVote(open, { ...castStance, cast_at: null })).toBe(true);
+    expect(hiddenUntilVote(open, { ...castStance, revoked_at: "2026-09-20T00:00:00Z" })).toBe(true);
+    // Closed: results are public. until_closed / off: the export is right.
+    expect(hiddenUntilVote({ ...open, closed_at: "2026-10-01T12:00:00Z" })).toBe(false);
+    expect(hiddenUntilVote({ ...open, hide_results: "until_closed" })).toBe(false);
+    expect(hiddenUntilVote({ ...open, hide_results: "off" })).toBe(false);
+  });
+
+  it("a draft or scheduled poll (opened_at null) has no votes to leak; an absent opened_at counts as opened (fail closed)", async () => {
+    const { hiddenUntilVote } = await import("../src/loomio/visibility.js");
+    expect(hiddenUntilVote(poll({ hide_results: "until_vote", opened_at: null }))).toBe(false);
+    const noField = poll({ hide_results: "until_vote" });
+    expect("opened_at" in noField).toBe(false);
+    expect(hiddenUntilVote(noField)).toBe(true);
+  });
+});
+
+describe("VisibilityRefusalError", () => {
+  it("untilVote names every poll (id, key, title) and says why, where to read instead, and when it lifts", async () => {
+    const { VisibilityRefusalError } = await import("../src/loomio/visibility.js");
+    const err = VisibilityRefusalError.untilVote(701, [
+      { id: 301, key: "pollKEY9", title: "Adopt the budget?" },
+      { id: 302, key: null, title: null },
+    ]);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("VisibilityRefusalError");
+    expect(err.polls.map((p) => p.id)).toEqual([301, 302]);
+    expect(err.message).toMatch(/topic_id 701/);
+    expect(err.message).toMatch(/poll 301 \(key pollKEY9\) "Adopt the budget\?"; poll 302\./);
+    // Dated, not asserted of the instance: Loomio 3.8 / 3.9 still apply the rule.
+    expect(err.message).toMatch(
+      /From Loomio 3\.10 on, the Markdown export ignores 'hide results until vote'/,
+    );
+    expect(err.message).toMatch(/Loomio 3\.8 \/ 3\.9, whose export still applies the rule/);
+    expect(err.message).toMatch(/list_thread_items \(same topic_id\) and get_poll apply the rule/);
+    expect(err.message).toMatch(/lifts when the poll closes or the connector's user votes/);
+  });
+
+  it("unverified says the check could not finish and how far it got", async () => {
+    const { VisibilityRefusalError } = await import("../src/loomio/visibility.js");
+    const err = VisibilityRefusalError.unverified(701, 5000, 6200);
+    expect(err.polls).toEqual([]);
+    expect(err.message).toMatch(/could not verify/);
+    expect(err.message).toMatch(/5000 of 6200 items read/);
+    expect(VisibilityRefusalError.unverified(701, 5000, null).message).toMatch(
+      /\(5000 items read\)/,
+    );
   });
 });

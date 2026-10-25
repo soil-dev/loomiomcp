@@ -36,14 +36,33 @@ function isDestructive(name: string): boolean {
   //     additive, no.
   //   - `manage_memberships` removes members when remove_absent=true.
   //   - `deactivate_user` disables a user account instance-wide (b3).
+  //   - `revoke_membership` (b3) removes a person from a group, its
+  //     subgroups and its threads and revokes their open-poll votes;
+  //     a re-add restores the group only.
+  // `add_group_members` (b3) is NOT here: it never sends `remove_absent`,
+  // so it only adds — an MCP "additive update" even though it creates
+  // accounts and sends invitation emails (the description says so).
+  // `update_membership_roles` is covered by the `update_` prefix.
   // Surface the hint so clients can prompt before invocation.
   return (
     name.startsWith("delete_") ||
     name.startsWith("update_") ||
     name === "manage_memberships" ||
-    name === "deactivate_user"
+    name === "deactivate_user" ||
+    name === "revoke_membership"
   );
 }
+
+/**
+ * Writes that repeat safely without the `update_` / `delete_` prefix.
+ * `revoke_membership`: Loomio's b3 destroy finds the membership with
+ * `Membership.find` (revoked rows included) and re-revoking changes
+ * nothing, so a replay answers 200 (b3_provisioning_test.rb:156-157).
+ * `add_group_members` is deliberately absent: a member whose stored
+ * address differs only in case from the one sent is re-invited on every
+ * replay (Loomio compares stored spellings case-sensitively).
+ */
+const IDEMPOTENT_WRITES = new Set(["revoke_membership"]);
 
 /**
  * Compute the full ToolAnnotations record for a tool by name.
@@ -64,23 +83,28 @@ function isDestructive(name: string): boolean {
  *   readOnlyHint   — true for `get_…` / `list_…` / etc. by naming
  *                     convention
  *   destructiveHint — true for every tool that may delete OR overwrite
- *                     (`delete_…`, `update_…`, manage_memberships with
- *                     remove_absent, deactivate_user); false only for
- *                     reads and the purely additive `create_…` /
- *                     reactivate_user. See `isDestructive`.
+ *                     (`delete_…`, `update_…` — update_membership_roles
+ *                     included — manage_memberships with remove_absent,
+ *                     deactivate_user, revoke_membership); false only
+ *                     for reads and the purely additive `create_…` /
+ *                     reactivate_user / add_group_members. See
+ *                     `isDestructive`.
  *   idempotentHint  — reads are idempotent (no side effects), and so
  *                     are `update_…` (a PATCH with the same fields
- *                     twice leaves the same record) and `delete_…`
+ *                     twice leaves the same record), `delete_…`
  *                     (Loomio's soft discard of an already discarded
- *                     record changes nothing). `create_…` always adds
- *                     a row and `manage_memberships` / `deactivate_…`
- *                     have per-call side effects, so they report false.
+ *                     record changes nothing) and the explicit
+ *                     `IDEMPOTENT_WRITES` (revoke_membership). `create_…`
+ *                     always adds a row, and `manage_memberships` /
+ *                     `deactivate_…` / add_group_members have per-call
+ *                     side effects, so they report false.
  *   openWorldHint   — true for every tool here; this connector exists
  *                     to call out to the Loomio API.
  */
 export function inferAnnotations(name: string): ToolAnnotations {
   const readOnly = isReadOnlyByName(name);
-  const idempotentWrite = name.startsWith("update_") || name.startsWith("delete_");
+  const idempotentWrite =
+    name.startsWith("update_") || name.startsWith("delete_") || IDEMPOTENT_WRITES.has(name);
   return {
     readOnlyHint: readOnly,
     destructiveHint: isDestructive(name),

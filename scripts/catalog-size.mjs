@@ -20,8 +20,16 @@
  * The server needs a key to boot and probes the base URL once at start;
  * both default to placeholders (a closed local port) so that running the
  * script bare never reaches a real Loomio host. `--b3` also registers
- * the LOOMIO_B3_API_KEY admin tools (28 tools instead of 24); `--json`
+ * the LOOMIO_B3_API_KEY admin tools (33 tools instead of 24); `--json`
  * prints the same numbers as one JSON object for scripting.
+ *
+ * Read-only mode: prefix the command with LOOMIO_MCP_READONLY=1 (the
+ * script passes its environment through to the server) to measure the
+ * 14 read tools a read-only deployment advertises. `--b3` adds nothing
+ * there — the b3 tools never register in read-only mode — and the
+ * report's `mode` field still says "full" / "b3" (it names the flag,
+ * not the server's read-only state). tests/server.test.ts pins all
+ * three modes: read-only, full and b3.
  */
 
 import { spawn } from "node:child_process";

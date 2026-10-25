@@ -55,8 +55,18 @@ const WRITES = [
   "manage_memberships",
 ] as const;
 
-/** The 4 b3 tools, present only with LOOMIO_B3_API_KEY AND not read-only. */
-const B3 = ["deactivate_user", "reactivate_user", "get_user", "list_users"] as const;
+/** The 9 b3 tools, present only with LOOMIO_B3_API_KEY AND not read-only (5 need Loomio 3.13+). */
+const B3 = [
+  "deactivate_user",
+  "reactivate_user",
+  "get_user",
+  "list_users",
+  "list_instance_groups",
+  "list_instance_memberships",
+  "add_group_members",
+  "update_membership_roles",
+  "revoke_membership",
+] as const;
 
 async function toolNames(): Promise<string[]> {
   const { createLoomioMcpServer } = await import("../src/server.js");
@@ -87,7 +97,7 @@ describe("tool set per mode (by name)", () => {
     expect(await toolNames()).toEqual(sorted(READS, WRITES));
   });
 
-  it("b3 (LOOMIO_B3_API_KEY set, writable): reads + writes + the 4 b3 tools", async () => {
+  it("b3 (LOOMIO_B3_API_KEY set, writable): reads + writes + the 9 b3 tools", async () => {
     process.env["LOOMIO_B3_API_KEY"] = "long-enough-admin-secret-12345";
     expect(await toolNames()).toEqual(sorted(READS, WRITES, B3));
   });
@@ -104,6 +114,43 @@ describe("tool set per mode (by name)", () => {
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: true,
+    });
+  });
+
+  it.each([
+    // The two b3 reads: by the list_ prefix.
+    ["list_instance_groups", { readOnlyHint: true, destructiveHint: false, idempotentHint: true }],
+    [
+      "list_instance_memberships",
+      { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    ],
+    // Additive (remove_absent is never sent) but NOT idempotent: a member
+    // whose stored address differs only in case is re-invited on replay.
+    ["add_group_members", { readOnlyHint: false, destructiveHint: false, idempotentHint: false }],
+    // update_ prefix: overwrites roles (destructive), same PATCH twice = same state.
+    [
+      "update_membership_roles",
+      { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    ],
+    // Removes access across subgroups (destructive); a repeat DELETE answers 200 (idempotent).
+    ["revoke_membership", { readOnlyHint: false, destructiveHint: true, idempotentHint: true }],
+  ] as const)(
+    "inferAnnotations(%s) — the Loomio 3.13 b3 provisioning tools",
+    async (name, hints) => {
+      const { inferAnnotations } = await import("../src/server/register-tool.js");
+      expect(inferAnnotations(name)).toEqual({ ...hints, openWorldHint: true });
+    },
+  );
+
+  it("the existing b3 tools keep their hints", async () => {
+    const { inferAnnotations } = await import("../src/server/register-tool.js");
+    expect(inferAnnotations("deactivate_user")).toMatchObject({
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    expect(inferAnnotations("reactivate_user")).toMatchObject({
+      destructiveHint: false,
+      idempotentHint: false,
     });
   });
 });

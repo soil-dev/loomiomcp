@@ -1,5 +1,249 @@
 # Changelog
 
+## 0.0.16 — 2026-10-25
+
+**Adopt Loomio 3.13.1.** Loomio 3.10 – 3.13 changed three things the
+connector depends on: the Markdown export stopped applying "hide results
+until vote", the groups index and thread items became paged (3.11.1),
+and several serializers gained or lost fields. This release follows
+Loomio's pages instead of silently truncating at 50, refuses the one
+read that would now leak hidden votes, adapts to the serializer changes,
+and adds the 3.13 b3 provisioning endpoints as five opt-in
+instance-admin tools. Every existing tool input is unchanged; output
+changes are additive except for fields Loomio itself no longer sends.
+Tool count: 14 reads + 10 writes + **9** b3 (was 4) — 14 / 24 / 33 per
+mode. `TESTED_LOOMIO_VERSION` 3.9.0 → **3.13.1**.
+
+Security:
+
+- **`get_thread_markdown` no longer discloses hidden votes.** Since
+  Loomio 3.10 (df28cf845) `ThreadMarkdownService` renders polls by
+  `results_available?` alone, so the Markdown of a thread holding an
+  OPEN `hide_results: until_vote` poll carried every vote and the
+  results table to a reader who had not voted — what `get_poll`,
+  `list_polls`, `list_thread_items` and `search_content` withhold. Live
+  on every deployment (read-only and open-DCR included) since its
+  instance upgraded to 3.10+. The tool now reads the thread first (one
+  call on any reference, which also fills the header) and throws a
+  `VisibilityRefusalError` naming the poll(s) — without fetching the
+  document — when such a poll is present and the connector's user has
+  not voted; the error points to `list_thread_items` / `get_poll`, and
+  the block lifts when the poll closes or the user votes. Nothing is
+  redacted. The guard decides from what the export prints — the
+  thread's ITEMS: a poll the read itself carried (a standalone poll's
+  own, or the one a `poll_id` named) refuses at once; a thread holding
+  only its opening item (`items_count` ≤ 1) costs nothing extra; every
+  other thread's items are scanned (1 call per 500, ≤ 10, stopping at
+  the first page that shows a hidden poll; a capped scan or an unknown
+  own user id refuses). Loomio's `active_polls_count` is deliberately
+  not trusted: it follows `polls.topic_id`, which `PATCH
+  /b2/polls/{id}` (or a stale browser tab after a move) can change
+  without moving the poll's items, leaving a thread that reads 0 while
+  its export prints the poll's votes. The scan also catches polls MOVED
+  into any thread, a standalone poll's included, through Loomio's v1
+  "move comments" (`MoveCommentsWorker` repoints polls into any topic
+  its actor administers; the thread read never shows them). Cost: 2
+  calls for a bare opening post, 3 for most threads — deliberately more
+  than a count-based shortcut (`active_polls_count`, which would keep
+  most threads at 2) because that count can say 0 while the export
+  still prints a poll's votes; do not "restore" it. On Loomio 3.8 / 3.9,
+  whose export still applied the rule per reader
+  (`results_visible?(voted:)`), the guard is skipped — only when a
+  health probe reported that version within the last minute (an older
+  probe is re-run first; an unknown version or 3.10+ keeps the guard),
+  so those instances are not refused threads 0.0.15 served safely and an
+  instance upgraded since the last probe is never exported unguarded
+  (`scope.guard_skipped_pre_3_10`). The refusal text dates the leak
+  ("from Loomio 3.10 on") instead of asserting it of the instance.
+- **The HTTP server refuses to start with `LOOMIO_B3_API_KEY` on an
+  open-DCR public deployment.** In `MCP_OAUTH_INSECURE_AUTO_APPROVE`
+  mode any client that reaches the URL registers itself and gets the
+  full tool list; with the b3 secret set and read-only off that list now
+  includes every roster with emails and invitations to arbitrary
+  addresses. The docs always said "never"; `b3ExposureError`
+  (src/http/config.ts) now makes the non-localhost case fatal (no
+  override: unset the secret, go read-only, or use static-client mode)
+  and logs a warning naming the nine tools on localhost.
+
+Fixed:
+
+- **Thread items past the 50th were silently dropped** on Loomio ≥
+  3.11.1 (bc1a6cc02 bounds the route: 50 by default, ≤ 500, `offset`).
+  `list_thread_items` and `get_discussion(include_items)` read one reply
+  and returned at most 50 items with `next_offset: null`. They now ask
+  Loomio for exactly the caller's window, in pages of 500 (≤ 2 without
+  `kinds`); `kinds` reads the thread page by page from its start
+  (≤ 10 pages; `scope.scan_truncated` when the cap stops it). Every item
+  of a long thread is reachable through `next_offset`. Loomio before
+  3.11.1 still answers with the whole thread, which is detected on the
+  first reply and sliced, with no further request.
+- **`list_groups` and `check_connection` listed at most 50 groups** on
+  Loomio ≥ 3.11.1. `list_groups` now pages to `meta.total` (1 call per
+  500, ≤ 20; `scope.partial` beyond); `check_connection` completes the
+  health probe's first page only when there are more than 50
+  (`groups_partial: true` and a note if that read fails — it never
+  throws).
+- **A parent group the user belongs to could be labelled a non-member**
+  when Loomio's page carried it only under `parent_groups`. Both shapers
+  now decide membership from the own membership row (or
+  `current_user_membership_id`) wherever the group appears.
+- `list_thread_items` labelled a thread a Poll when a later window
+  started with a `poll_created` item; the header now comes only from the
+  opening item (`sequence_id` 0) and stays `null` on a continuation by
+  bare `topic_id` (documented, no extra call).
+- `list_thread_items` by `poll_id` of a poll INSIDE a discussion named
+  the thread a Poll, with the poll's id, key, title and `/p/` url (a
+  pre-0.0.16 behaviour). The `poll_id` resolution now reads the poll
+  with the `thread_guard` profile and takes the header from the
+  thread's topic row — the discussion — exactly as `get_thread_markdown`
+  does for the same reference; still one call.
+- `create_comment` explains two refusals whose Loomio text says
+  nothing: a 403 on a reply to a VOTE while its poll is open and hides
+  results until closing (Loomio 3.13, 11e5187e6 — reply to the poll
+  instead), and a 404 for a missing or soft-deleted target (Loomio 3.11,
+  ac5c1e044, raised before the permission check).
+
+Added:
+
+- **Five b3 provisioning tools** (Loomio 3.13+, ee6befeb7; registered
+  only with `LOOMIO_B3_API_KEY` and not read-only; new
+  `src/tools/server-admin.ts`): `list_instance_groups` (every group on
+  the instance, 50 per page), `list_instance_memberships` (any group's
+  direct members and pending invitations, emails included),
+  `add_group_members` (≤ 50 addresses, all-or-nothing, body exactly
+  `{group_id, emails}` — `remove_absent` is never sent and the strict
+  schema rejects it), `update_membership_roles` (`admin` / `delegate` by
+  membership id) and `revoke_membership` (group, subgroups, threads and
+  open-poll votes; idempotent; a re-add restores the group only, without
+  the admin role). Bare b3 errors are re-worded per operation (400 / 404
+  / 422 — "nothing was changed"; the 422 tells a deactivated account,
+  which needs `reactivate_user`, from a NEW address the User model
+  refuses as spam — b3 does not skip the instance's `SPAM_REGEX`, it
+  fails the whole call where b2 silently drops the address); a numeric
+  `{error:403}` on the
+  membership routes is classified `plan_limit` and now names an inactive
+  or expired subscription. Annotations: the two lists read-only and
+  idempotent; `add_group_members` neither destructive nor idempotent (a
+  stored address differing only in case is re-invited on replay);
+  `update_membership_roles` and `revoke_membership` destructive and
+  idempotent (`IDEMPOTENT_WRITES` in `register-tool.ts`). Deliberately
+  not exposed: the b3 sync's `remove_absent`, `POST /b3/users` (it can
+  mint instance admins), the user update / destroy / redact routes and
+  the `PUT` aliases.
+- `weight` (Loomio 3.10+ vote weights, decimal strings) on
+  `list_memberships` rows, on stances of weighted polls in
+  `list_thread_items`, and on `my_stance` of weighted polls.
+- `change_note` on `discussion_edited` / `poll_edited` items (Loomio
+  3.11+; capped by `body_max_chars`).
+- `has_tagged_replies` on joined thread counters and `list_threads` rows
+  (Loomio 3.13: `tags` is the union over every tagged contribution).
+- `groups_partial` (`check_connection`), `scope.partial` and
+  `scope.upstream_calls` (`list_groups`), `scope.server_paged` and
+  `scope.scan_truncated` (`list_thread_items`; `server_paged` is false
+  only when the connector detected Loomio ignoring `limit` / `offset`),
+  `scope.open_polls_checked` (`get_thread_markdown`).
+- `create_poll` refuses an STV poll whose `stv_seats` is not fewer than
+  its options (Loomio 3.10+ answers 422; 35b632cc7).
+- Paging plumbing in `src/loomio/client.ts`: `B2_PAGE_MAX` (500),
+  `loomioPager`, `loomioGetAllPages`, `mergePageBodies`; b3 write
+  helpers `loomioPatchB3` / `loomioDeleteB3` on the shared write path
+  (`Content-Type: application/json` is load-bearing on
+  `POST /b3/memberships`).
+
+Changed:
+
+- **Tested against Loomio 3.13.1** (`TESTED_LOOMIO_VERSION`); the drift
+  warning now keys off 3.13. Loomio ≥ 3.12's `wrap_parameters false`
+  breaks no write: nested bodies stay for discussions and polls (right
+  on every version), flat for comments (`discussion_id` is deleted for
+  comments; the body carries exactly the five permitted keys).
+- Poll records: `quorum_count` / `quorum_votes_required` /
+  `quorum_reached` are dropped when `quorum_pct` is null (Loomio 3.13
+  sends `quorum_reached: false` on polls with no quorum, ad60e7728);
+  `voter_has_access` (web-client button state) is dropped;
+  `result_heading_keys` is kept on weighted polls only; list rows drop
+  `weighted_voting: false`. `total_score` arrives as a decimal string
+  (pass-through, no arithmetic).
+- `voting_system` is gone (Loomio 3.10, 917b2c2e4) — removed from
+  `list_thread_items`' poll fields (`weighted_voting` added) and from
+  the docs; anonymous polls have no stances on the b2 API at all.
+- `search_content`: Loomio 3.13 changed what `tag` matches — only
+  contributions explicitly tagged with that name, no longer every item
+  of a tagged thread (5934ab182). Same parameter, different answer: the
+  field description and, when `tag` is used, the scope note say so.
+- Tool texts: `list_thread_items` and `get_thread_markdown` state their
+  per-500-items cost ("+1 per 500 items when the thread has replies"
+  for the Markdown guard) and the Markdown refusal; `get_thread_markdown`'s
+  `topic_id` / `discussion_id` / `poll_id` fields carry no cost hint
+  (its guard reads the thread once on any reference, so the three cost
+  the same — `list_thread_items` keeps its "+1 call" hints, and its
+  `poll_id` no longer says "STANDALONE"); `get_discussion` says "1 call
+  (2+ with `include_items`)" and its `include_items` field "+1 call per
+  500 items" (a 1 000-item embed of a long thread costs 3);
+  `reactivate_user` names the restored open-poll ballots (Loomio
+  3.10+); `deactivate_user` says cast votes are kept (Loomio 3.11+);
+  `add_group_members` names both causes of a 422 (a deactivated account,
+  or a new address Loomio refuses — "no spam") and no longer claims to
+  be the only way an account is created (`manage_memberships` and
+  `recipient_emails` on `create_discussion` / `update_discussion` /
+  `create_poll` create accounts for unknown addresses too, the latter as
+  thread guests in no group); `list_users` routes "who is in group X" to
+  `list_instance_memberships` (3.13+; else `list_memberships`); the
+  `check_connection` b3 notes name the nine b3 tools. `list_groups` and
+  `SERVER_INSTRUCTIONS` are unchanged.
+- **Catalogue** (`scripts/catalog-size.mjs` on the built server):
+  read-only 14 tools 16 752 → **16 767 B**, full 24 tools 35 631 →
+  **35 646 B** (+15 B each: the text changes above, net of the shorter
+  `get_thread_markdown` reference fields), b3 28 → **33 tools,
+  39 041 → 44 189 B**; instructions unchanged at 1 747 chars.
+  `tests/server.test.ts` now also pins the read-only catalogue
+  (≤ 17 000 B — what a shared deployment serves), keeps full at
+  ≤ 36 000 B, and raises **only** the b3 ceiling, 40 000 → 44 500 B (the
+  first measurement, 44 164 B, rounded up to the next 500), for the
+  five provisioning tools (~0.8–1.1 KB each with annotations, the
+  density of `get_user` / `list_users`, present only when the operator
+  opts in).
+- Topic counters `members_count` / `closed_polls_count` and group
+  counters `closed_polls_count` / `delegates_count` /
+  `discussion_templates_count` / `org_discussions_count` arrive from
+  Loomio ≤ 3.10 only (3.11.0 removed them); they stay in the join lists
+  for older servers. `group_privacy` may be `parent_members` (3.11.0).
+- Docs: README, HOWTO (tool reference), NOTES-ON-LOOMIO-API (a dated
+  "Loomio 3.9 → 3.13.1 changes that matter" section with commits and
+  first tags, the OpenAPI mismatches, the paged routes), SECURITY (the
+  Markdown refusal, the wider scope of the b3 secret since 3.13, the
+  exact upstream fan-out per tool, the `remove_absent` case-sensitivity
+  risk), DEPLOY (tool counts, the rate-limit fan-out list), DESIGN ("follow
+  Loomio's pages, never emulate paging it lacks"), OPTIMIZATIONS,
+  glama.json; `search_content`'s `sequence_id` is described as 3.13.1
+  computes it (null for a vote in a standalone poll's thread, whose
+  item is not "taggable"). One correction: Loomio 3.10 did not stop enrolling
+  `manage_memberships` invitees in open polls — it only dropped the
+  synchronous call; `PollGroupMembersAddedWorker` still gives them
+  ballots, asynchronously (drafts and scheduled polls included).
+
+Verified: biome, tsc, 737 tests (vitest; undici mocked — paged-route
+mocks emulate Loomio's `page_collection_bounded` and the pre-3.11.1
+whole-collection reply; nothing calls a live host; each of the Markdown
+guard's fail-closed branches — no topic row, no `items_count`, an
+unknown `topicable_type` — is pinned by a test that fails if it is
+turned into "allow") and the tsup build;
+the catalogue measured in all three modes as above. Against Loomio's
+source, tests and OpenAPI document at `v3.9.0` and `v3.13.1`: every
+request shape, the paging rules, the serializer changes, the Markdown
+service and the vote-visibility guard's assumptions (what
+`ThreadMarkdownService` renders, `items_count` maintenance,
+`MoveCommentsWorker`, the poll `topic_id` PATCH that leaves
+`active_polls_count` behind its items, and the per-reader export rule at
+`v3.8.0` – `v3.9.0` behind the 3.8 / 3.9 skip), and the b3 add's two
+422s (`no_spam_for :email` on a new account; a deactivated one). The
+b2 read shapes were also checked
+against sanitized live captures from a 3.13.1 instance (2026-10-24,
+non-admin key). **The five b3 provisioning tools were verified only
+against Loomio's source, `test/integration/b3_provisioning_test.rb` and
+its server-API documentation** — no live b3 capture exists — and no
+write was re-run live on 3.13.1.
+
 ## 0.0.15 — 2026-10-24
 
 Dependency release: every dependency moved to its latest version,

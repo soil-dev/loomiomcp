@@ -92,11 +92,15 @@ export function getCachedHealth(): LoomioHealth | undefined {
 /**
  * The parsed body of the probe's GET /b2/groups, from the SAME probe
  * that produced `getCachedHealth()`, or `undefined` when that probe did
- * not answer 200 (or its body was not JSON). Kept because the probe
- * already paid for the request: `check_connection` forces a probe and
- * then reads this, so "does the connector work, and what can it see"
- * costs one request pair rather than three. Stored beside the verdict
- * — never ON it — so `/health` (which serialises `LoomioHealth`) cannot
+ * not answer 200 (or its body was not JSON). It is the index's FIRST
+ * PAGE: ≤ 50 groups on Loomio ≥ 3.11.1, which pages the index (`meta.total`
+ * still counts every group); older Loomio returns them all.
+ * check_connection completes it — into a copy, never back into this
+ * cache. Kept because the probe already paid for the request:
+ * `check_connection` forces a probe and then reads this, so "does the
+ * connector work, and what can it see" costs one request pair rather
+ * than three for a user in ≤ 50 groups. Stored beside the verdict —
+ * never ON it — so `/health` (which serialises `LoomioHealth`) cannot
  * grow a list of the user's groups.
  */
 export function getCachedGroupsIndex(): GroupsIndexResponse | undefined {
@@ -108,7 +112,9 @@ export function getCachedGroupsIndex(): GroupsIndexResponse | undefined {
  * (`HEALTH_CACHE_TTL_MS`). A tool that can tolerate a minute-old view of
  * the user's groups uses this to avoid a network call; anything that
  * needs the current state calls `checkLoomioHealth({ force: true })`
- * first and then reads `getCachedGroupsIndex()`.
+ * first and then reads `getCachedGroupsIndex()`. Same first-page caveat
+ * as `getCachedGroupsIndex`: compare `groups.length` with `meta.total`
+ * before treating it as the whole list.
  */
 export function getFreshGroupsIndex(now: number = Date.now()): GroupsIndexResponse | undefined {
   return cachedGroups && cachedHealthAgeMs(now) < HEALTH_CACHE_TTL_MS ? cachedGroups : undefined;

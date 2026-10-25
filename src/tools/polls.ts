@@ -79,18 +79,40 @@ import { resolveThread, type ThreadRef } from "./threads.js";
 //
 // Two shapes. The SHOW (get_poll, the write echoes) returns the record
 // whole minus that bloat. A LIST row is slimmer, because `results[]` —
-// per option: `voter_ids` (up to 50), a `voter_scores` map over every
-// voter, colour, icon, rank, percentages, plus a synthetic "undecided"
-// row (id -1) listing the non-voters — was measured at 30–40 % of a
-// visible poll's bytes and, over a 50-row page with ~100 voters,
-// hundreds of KB of user ids a list has no use for. Its per-option
-// tallies are already `stance_counts` (poll.rb `update_counts!`:
+// per option: `voter_ids` (up to 50), a `voter_scores` map, colour,
+// icon, rank, percentages, plus a synthetic row (id -1) listing the
+// non-voters — was measured at 30–40 % of a visible poll's bytes and,
+// over a 50-row page with ~100 voters, hundreds of KB of user ids a
+// list has no use for. Its per-option tallies are already
+// `stance_counts` (poll.rb `update_counts!`:
 // `poll_options.map(&:total_score)` in priority order, i.e. aligned
 // with the `poll_options[]` the row carries), so a list row keeps
 // `stance_counts` + `total_score`, drops `results` / `stv_results`, keeps
 // the type-specific voting knobs only when Loomio set them (they are
 // null for every other type), and drops `poll_option_names` when
 // `poll_options[]` already names them. get_poll has everything.
+//
+// Loomio 3.10–3.13 changed the record (passed through, no arithmetic):
+//   - `results[]` rows gained `unweighted_score` (3.10) and
+//     `test_requirement_key` (3.13); `voter_scores` is `{}` except on
+//     meeting polls (159a9c7a9, 3.10); the id -1 row is named
+//     `poll_receipts_page.not_voted` from 3.13.0 (c42eff3af),
+//     `poll_common_votes_panel.undecided` in 3.10–3.12.
+//   - Weighted voting (3.10, 14c07ef6c): on a `weighted_voting` poll the
+//     tallies, `total_score` and `results[]` scores are in vote-weight
+//     units, possibly fractional; `total_score` is a decimal STRING
+//     ("3.0") on every poll since 3.10 (the integer 0 when
+//     `stance_counts` is empty, a3736458b). `result_heading_keys` (42f7199e7) says which result
+//     columns are weighted, so it is kept on a weighted poll only, and
+//     the own stance's `weight` likewise. A list row drops
+//     `weighted_voting: false`.
+//   - Quorum: `quorum_reached` (3.13.0, ad60e7728) is `false` on a poll
+//     that has no quorum at all, beside `quorum_count` /
+//     `quorum_votes_required` zeros. When `quorum_pct` is null the poll
+//     has no quorum and the three are dropped rather than read as "not
+//     reached".
+//   - `voter_has_access` (3.11.0, 8eb9236a4) is the web client's
+//     vote-button state for the connector's user: dropped.
 
 const POLL_DROP = [
   "attachments",
@@ -103,7 +125,11 @@ const POLL_DROP = [
   "legacy_anonymous_vote_reasons_count",
   "poll_option_name_format",
   "limit_reason_length",
+  "voter_has_access",
 ] as const;
+
+/** Meaningless when `quorum_pct` is null (the poll has no quorum); see the module note. */
+const QUORUM_FIELDS = ["quorum_count", "quorum_votes_required", "quorum_reached"] as const;
 
 /** Result breakdowns a LIST row leaves to get_poll (`stance_counts` / `total_score` stay). */
 const LIST_POLL_DROP = ["results", "stv_results"] as const;
@@ -172,7 +198,10 @@ export type ShapedPoll = Partial<GatedPoll<LoomioPoll>> &
   Record<string, unknown> & {
     poll_options: Pick<LoomioPollOption, (typeof POLL_OPTION_FIELDS)[number]>[];
     current_outcome: Pick<LoomioOutcome, (typeof OUTCOME_FIELDS)[number]> | null;
-    my_stance: Pick<LoomioStance, (typeof OWN_STANCE_FIELDS)[number]> | null;
+    /** `weight` (a decimal string) only on a `weighted_voting` poll. */
+    my_stance:
+      | (Pick<LoomioStance, (typeof OWN_STANCE_FIELDS)[number]> & { weight?: string })
+      | null;
     url?: string;
   };
 
@@ -192,10 +221,16 @@ export function shapePoll(
   const own = ownStanceFor(record.id, side.stances, { showRoot: true });
   const gated = gatePollResults(record, own);
   const list = opts.mode === "list";
+  const weighted = record.weighted_voting === true;
   const base = omit(gated, list ? [...POLL_DROP, ...LIST_POLL_DROP] : POLL_DROP);
   if (list) {
     for (const knob of LIST_POLL_NULLABLE_KNOBS) if (base[knob] == null) delete base[knob];
+    if (base["weighted_voting"] === false) delete base["weighted_voting"];
   }
+  // See the module note: no quorum → no quorum figures; the result
+  // headings matter only where results are in vote-weight units.
+  if (record.quorum_pct == null) for (const f of QUORUM_FIELDS) delete base[f];
+  if (!weighted) delete base["result_heading_keys"];
   const withCounts = Array.isArray(record.attachments)
     ? { ...base, attachments_count: record.attachments.length }
     : base;
@@ -223,7 +258,12 @@ export function shapePoll(
     ...truncated,
     poll_options,
     current_outcome: outcome ? pick(outcome, OUTCOME_FIELDS) : null,
-    my_stance: own ? pick(own, OWN_STANCE_FIELDS) : null,
+    my_stance: own
+      ? {
+          ...pick(own, OWN_STANCE_FIELDS),
+          ...(weighted && typeof own.weight === "string" ? { weight: own.weight } : {}),
+        }
+      : null,
     ...(url ? { url } : {}),
   } as ShapedPoll;
 }
@@ -347,11 +387,22 @@ export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise
 // then `PollService.invite(poll:, actor:, params: params)`. Two
 // different `params`:
 //   - `resource_params` is the permitted `poll` hash — NESTED
-//     `{"poll":{…}}` for the reasons `nestedBody` documents (a FLAT JSON
-//     body loses `group_id` and `options`, which are not Poll columns:
-//     verified live, the result is an orphan poll with no options).
-//     Every key sent under `poll` is in `PermittedParams#poll_attributes`.
+//     `{"poll":{…}}`, the cross-version shape `nestedBody` documents: on
+//     Loomio ≤ 3.11.x `wrap_parameters` made a FLAT JSON body lose
+//     `group_id` and `options`, which are not Poll columns (verified live
+//     on 3.8.1: an orphan poll with no options); from 3.12.0
+//     (`wrap_parameters false`, e5bd13dfc) a flat body would be read
+//     whole, and the nested one takes the same `params[:poll]` branch as
+//     before (upstream test "nested JSON creates a group draft with
+//     every option", b2_poll_requests_test.rb). Every key sent under
+//     `poll` is in `PermittedParams#poll_attributes`.
 //     `options` is `Poll#options=`, an alias of `poll_option_names=`.
+//     `tags` on a standalone poll follow the discussion rule
+//     (src/tools/discussions.ts, create_discussion): a name the user may
+//     not create is dropped SILENTLY on Loomio ≥ 3.13.0
+//     (`TagService.permitted_tag_names` in `PollService.create`) and
+//     refused with the bare generic 403 on ≤ 3.12; the echo is not
+//     compared with the request.
 //   - `params` is the raw request hash, and `invite` reads
 //     `recipient_user_ids` / `recipient_emails` / `recipient_audience`
 //     / `notify_recipients` / `recipient_message` from its TOP level.
@@ -367,8 +418,10 @@ export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise
 // one compact GET (`resolveThread`), and sends `topic_id` alone:
 // `PollService.build` reuses the existing Topic (`poll.topic ||= …`)
 // and derives `group_id` from it, ignoring any `group_id` in the body.
-// Anonymous polls: `build` forces `voting_system: anonymous_ballot`,
-// `hide_results: until_closed`, and `invite` raises a bare
+// Anonymous polls: `build` forces `hide_results: until_closed` (and on
+// Loomio ≤ 3.9 `voting_system: anonymous_ballot`; 3.10 removed that
+// field, 917b2c2e4 — ballots are separate records with no stances on
+// the b2 API), and `invite` raises a bare
 // `CanCan::AccessDenied` for an anonymous poll that is not active — i.e.
 // one without a future `closing_at` — AFTER `create` saved it. The
 // schema therefore requires `closing_at` when `anonymous`.
@@ -596,6 +649,26 @@ export const createPollSchema = z
         code: "custom",
         path: ["options"],
         message: `poll_type '${input.poll_type}' takes no options (voters answer in free text).`,
+      });
+    }
+    // Loomio ≥ 3.10.0 (35b632cc7, `Poll#stv_settings_are_valid`,
+    // poll.rb:870-896) answers 422 when `stv_seats >= poll_option_count`:
+    // a count that elects every candidate is no election. Refused here,
+    // before any request, with Loomio's rule spelled out; an omitted
+    // `stv_seats` is Loomio's default 1, which the 2-option minimum
+    // already satisfies. Loomio 3.9 did not validate the seat count.
+    if (
+      input.poll_type === "stv" &&
+      input.stv_seats !== undefined &&
+      count > 0 &&
+      input.stv_seats >= count
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["stv_seats"],
+        message:
+          `stv_seats must be fewer than the options (${input.stv_seats} seat(s), ${count} option(s)): ` +
+          "Loomio refuses an STV poll that would elect every candidate (422).",
       });
     }
     if (input.anonymous) {

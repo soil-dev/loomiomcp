@@ -1,10 +1,14 @@
 # Design
 
 Short notes on the load-bearing choices. Loomio facts are stated
-against Loomio 3.9.0 (`TESTED_LOOMIO_VERSION` in `src/version.ts`;
-its b2 / b3 routes, OpenAPI document and permitted parameters are
-byte-identical to 3.8.1, where the source citations were made);
-NOTES-ON-LOOMIO-API.md has the line-by-line evidence.
+against Loomio 3.13.1 (`TESTED_LOOMIO_VERSION` in `src/version.ts`,
+since 0.0.16). The 3.9 → 3.13.1 changes that matter — the paged groups
+index and thread items (3.11.1), `wrap_parameters false` on b2 (3.12.0),
+the b3 group / membership provisioning routes (3.13.0), the Markdown
+export ignoring "hide results until vote" (3.10.0) — are dated where
+they matter below; NOTES-ON-LOOMIO-API.md has the line-by-line evidence
+and a per-commit table ("Loomio 3.9 → 3.13.1 changes that matter").
+Citations made at 3.8.1 / 3.9.0 still hold where nothing is dated.
 
 ## Surface area
 
@@ -13,26 +17,37 @@ via `Authorization: Bearer <api_key>`. This is the namespace where
 Loomio's controllers live in the open-source repo (the `b1` namespace
 was removed in Loomio 3.1.0) and the one Loomio's OpenAPI document
 describes. The canonical b2 docs are at https://www.loomio.com/help/api2.
-As of 3.9.0 the connector wraps every b2 resource except `/b2/chatbots`
+As of 3.13.1 the connector wraps every b2 resource except `/b2/chatbots`
 (group-admin webhook configuration whose serializer returns the webhook
 URL — nothing an AI caller needs, and a leak surface), `GET
-/b2/threads/{id}` alone (its row is what `list_threads` returns and the
-items / markdown tools fill the header themselves) and the participation
+/b2/threads/{id}` as a tool of its own (its row is what `list_threads`
+returns; `get_thread_markdown`'s vote-visibility guard and `create_poll`'s
+`topic_id` cross-check read it internally) and the participation
 report's `base` / `countries` sections.
 
 The **b3** namespace uses a separate auth secret — a bearer token
 validated against `ENV['B3_API_KEY']` on the Loomio server, >16 chars.
 This is a server-instance admin secret, not a per-user key. The
-connector wraps four of its routes: the member routes
+connector wraps these of its routes (nine tools): the member routes
 `POST /b3/users/{id}/deactivate` and `…/reactivate` (Loomio's OpenAPI
-marks the older `?id=` collection routes `deprecated: true`), and the
-reads `GET /b3/users/{id}` / `GET /b3/users/identity/{type}/{uid}`
-(`get_user`) and `GET /b3/users[?is_admin=]` (`list_users`). The reads
-return every account's email, so they are gated exactly like the writes
-— registered only when `LOOMIO_B3_API_KEY` is set AND the server is not
-read-only — and documented as single-tenant only. Update / destroy /
-redact are deliberately not wrapped: irreversible, and Loomio records no
-actor identity for b3 calls (SECURITY.md).
+marks the older `?id=` collection routes `deprecated: true`), the reads
+`GET /b3/users/{id}` / `GET /b3/users/identity/{type}/{uid}`
+(`get_user`) and `GET /b3/users[?is_admin=]` (`list_users`), and, on
+Loomio 3.13.0+, the provisioning routes `GET /b3/groups`
+(`list_instance_groups`), `GET /b3/memberships`
+(`list_instance_memberships`), `POST /b3/memberships` (`add_group_members`,
+never with `remove_absent`), `PATCH /b3/memberships/{id}`
+(`update_membership_roles`) and `DELETE /b3/memberships/{id}`
+(`revoke_membership`) — src/tools/server-admin.ts. The reads return
+every account's email or a whole roster, so they are gated exactly like
+the writes — registered only when `LOOMIO_B3_API_KEY` is set AND the
+server is not read-only (and an open-DCR HTTP deployment on a public URL
+refuses to start with the secret set, src/http/config.ts) — and
+documented as single-tenant only. User create / update / destroy /
+redact are deliberately not wrapped: instance-admin creation or
+escalation, a login handed over by an email change, irreversible
+deletes; and Loomio records no actor identity for b3 calls
+(SECURITY.md).
 
 The internal `v1` API (~37 controllers — groups, stances/votes,
 reactions, the browser's own search, …) is out of scope. That isn't an
@@ -69,26 +84,38 @@ widened what is visible to the private threads the user belongs to.
 ## Write bodies: nested for discussions and polls, flat for comments
 
 Two Rails mechanisms meet in `Api::B2::BaseController#permitted_params`
-(Loomio ≥ 3.1.3): it takes the wrapped resource hash
+on Loomio **3.1.3 – 3.11.x**: it takes the wrapped resource hash
 (`{"discussion": {…}}`) when one is present, and Rails'
-`wrap_parameters format: [:json]` builds that hash itself from a flat
-JSON body — but only from the keys that are COLUMNS of the model. So a
-flat JSON discussion or poll body arrives pre-wrapped with `group_id`,
-`private`, `options` and `recipient_*` silently dropped: the record is
-created in the wrong place with HTTP 200. Confirmed live on 2026-09-20 —
-a flat discussion became a group-less private thread, a flat poll a
-group-less poll with no options. The connector therefore sends the
-resource **nested** (`nestedBody` in `src/loomio/client.ts`), which makes
-the first rule take the hash verbatim and the second never run.
+`wrap_parameters format: [:json]` (the ParamsWrapper) builds that hash
+itself from a flat JSON body — but only from the keys that are COLUMNS
+of the model. So a flat JSON discussion or poll body arrives
+pre-wrapped with `group_id`, `private`, `options` and `recipient_*`
+silently dropped: the record is created in the wrong place with HTTP
+200. Confirmed live on 2026-09-20 (3.8.1) — a flat discussion became a
+group-less private thread, a flat poll a group-less poll with no
+options. The connector therefore sends the resource **nested**
+(`nestedBody` in `src/loomio/client.ts`), which makes the first rule
+take the hash verbatim and the second never run.
+
+Loomio **≥ 3.12.0** sets `wrap_parameters false` on the B2 base
+controller (e5bd13dfc): a flat body is now read whole, every top-level
+key permit-checked (an unknown one answers 400), and a nested body
+still takes the same first branch. Nested therefore stays the
+cross-version shape for discussions and polls — it is right on every
+version, where flat is right only from 3.12.
 
 Comments are the exception: `CommentsController#create` reads
 `params[:discussion_id]` from the TOP level (not a Comment column, so
-wrapping leaves it there) and the permitted `comment` hash is the one
-Rails builds from `body`, `body_format`, `parent_id`, `parent_type` —
-all columns. A comment body is therefore **flat JSON** (`flatBody`),
-exactly as Loomio's own controller tests post it; wrapping it hides
-`discussion_id` and answers 400, and the ≤ 3.1.2 form-encoded workaround
-400s too. Form encoding is gone from the client.
+wrapping leaves it there on ≤ 3.11) and the permitted `comment` hash is
+the one Rails builds from `body`, `body_format`, `parent_id`,
+`parent_type` — all columns; from 3.12 the flat hash is permitted as is
+with `discussion_id` deleted from it for comments. A comment body is
+therefore **flat JSON** (`flatBody`) on every version, exactly as
+Loomio's own controller tests post it, carrying exactly those keys —
+from 3.12 any extra top-level key, a read profile in the query string
+included, answers 400. Wrapping it hides `discussion_id` and answers
+400, and the ≤ 3.1.2 form-encoded workaround 400s too. Form encoding is
+gone from the client.
 
 Because a misdirected write is a 200, the create tools verify Loomio's
 echo: `create_discussion` throws if the returned `group_id` differs from
@@ -147,9 +174,10 @@ read therefore goes through `src/loomio/shape.ts`, in one place so the
 rules stay identical across tools:
 
 - **join** — `joinTopics` folds `items_count`, `replies_count`,
-  `last_activity_at`, `locked_at`, `pinned_at`, `tags`, `members_count`,
-  `seen_by_count`, `active_polls_count`, `closed_polls_count` from the
-  `topics[]` row onto the discussion or poll (`discussion.topic_id` →
+  `last_activity_at`, `locked_at`, `pinned_at`, `tags`,
+  `has_tagged_replies` (3.13+), `members_count` (≤ 3.10),
+  `seen_by_count`, `active_polls_count`, `closed_polls_count` (≤ 3.10)
+  from the `topics[]` row onto the discussion or poll (`discussion.topic_id` →
   `topic.id`); `reader_*` state, `ranges` and internals are dropped. A
   record whose topic Loomio withheld comes back WITHOUT the fields, not
   with zeros — a missing join must look missing.
@@ -207,11 +235,17 @@ other voters' `option_scores` / `reason` when it says no, and always
 emits `results_visible` + `results_hidden_reason` so a caller can tell
 "hidden" from "zero". With no cached identity the thread tools assume
 "not voted", which hides more, never less, and `scope.own_user_known`
-says so. `get_thread_markdown` needs no gate: `ThreadMarkdownService`
-applies `results_visible?(voted:)` itself. Anonymous polls carry
-`participant_id: null` on every stance; nothing here can or should
-de-anonymise them, and the server instructions tell the model not to
-try.
+says so. `get_thread_markdown` is the one read Loomio ≥ 3.10 does not
+gate (df28cf845: the export uses `results_available?` alone), so the
+connector checks the thread first and refuses one holding an open
+`until_vote` poll its user has not voted in (`guardThreadMarkdown`,
+src/tools/threads.ts; SECURITY.md); on Loomio 3.8 / 3.9, whose
+`ThreadMarkdownService` still applied `results_visible?(voted:)`, the
+check is skipped when a health probe confirmed that version within the
+last minute. Anonymous polls (Loomio ≥ 3.10) have no stances on the b2
+API at all (≤ 3.9: `participant_id: null` on every stance); nothing
+here can or should de-anonymise them, and the server instructions tell
+the model not to try.
 
 ## Thread addressing
 
@@ -219,10 +253,13 @@ Loomio's thread routes take the THREAD id (`topic_id`), not the
 discussion's or poll's own id, and resolve it with
 `TopicQuery.visible_to(user).find` — so an unknown id and an invisible
 thread both answer 404, never 403. Every thread tool accepts exactly one
-of `topic_id` (free), `discussion_id` or `poll_id` (one `compact=1` GET
-to read the record's `topic_id`, `resolveThread`), and every record the
-connector returns carries its `topic_id` so a caller that already holds
-one never pays the extra call. `get_discussion` with `include_items`
+of `topic_id` (free), `discussion_id` or `poll_id` (one GET to read the
+record's `topic_id`, `resolveThread` — for a poll with its thread's
+topic row, so the header names the thread a poll sits in), and every
+record the connector returns carries its `topic_id` so a caller that
+already holds one never pays the extra call (`get_thread_markdown`
+reads the thread once on any reference anyway, for its
+vote-visibility guard). `get_discussion` with `include_items`
 uses the `topic_id` already on the record — never two fetches for the
 same id in one call.
 
@@ -397,7 +434,7 @@ means:
 
 The first removes them from the catalog (the MCP client can't see
 them); the second is the defence in depth. Read-only mode advertises 14
-tools; full mode 24; with the b3 secret 28.
+tools; full mode 24; with the b3 secret 33.
 
 ## `manage_memberships` safety
 
@@ -459,13 +496,22 @@ that tells it what the rest can do.
   `/health` from becoming a way to make the connector hammer Loomio.
 - **No retry on 429.** Loomio's throttle is per client IP over five
   minutes; a retry loop inside a tool call would only deepen the hole.
-  The one remaining fan-out (`get_user_activity`, one report per group,
-  four in flight, at most 50 groups) is bounded by its schema; the
-  connector maps 429 to a clear message naming it.
-- **No client-side search or pagination emulation over Loomio's caps.**
-  Search stops at Loomio's 20 results and says `capped: true`; the
-  thread items route is fetched whole because Loomio offers no paging
-  there. Pretending otherwise would cost calls or hide the limit.
+  The fan-outs (`get_user_activity`, one report per group, four in
+  flight, at most 50 groups; the paged reads below) are bounded by
+  schema and page caps; the connector maps 429 to a clear message
+  naming the remaining fan-out.
+- **Follow Loomio's pages, never emulate paging it lacks.** Where
+  Loomio pages (the groups index and thread items, since 3.11.1, at
+  most 500 rows per request), a tool follows the pages up to
+  `meta.total` within a per-call page cap — 20 for groups, 2 for a
+  thread-items window, 10 for a whole-thread read (`kinds`, the
+  Markdown visibility guard) — and SAYS when the cap stopped it
+  (`partial`, `groups_partial`, `scan_truncated`, or a refusal for the
+  guard); it never returns a silently short list. Where Loomio does not
+  page — search stops at its 20 results and says `capped: true`; Loomio
+  before 3.11.1 returns a whole collection in one reply, which is
+  sliced — the connector does not fake it. Pretending otherwise would
+  cost calls or hide the limit.
 - **No async task store.** Loomio writes are single-request and fast;
   the sibling's task-polling surface adds complexity we don't need.
 - **No batch fan-out helper.** A future `batch_manage_memberships`

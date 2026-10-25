@@ -210,6 +210,71 @@ describe("createComment", () => {
     const err = await createComment({ discussion_id: 1, body: "x" }).catch((e) => e);
     expect(err).toBeInstanceOf(LoomioAuthError);
     expect(err.kind).toBe("not_authorized");
+    // Not a reply to a vote: no Stance explanation is bolted on.
+    expect(err.message).not.toMatch(/Stance/);
+  });
+
+  it("a 403 on a reply to a VOTE explains Loomio 3.13's until-closed rule and points at the poll", async () => {
+    // Comment#parent_allows_replies? (comment.rb:124-126) is false for a
+    // Stance parent while its poll is open with hide_results until_closed;
+    // Ability::Comment :create requires it — and Loomio says only
+    // "Not authorized to create Comment.".
+    mockFetch(403, { error: "Not authorized to create Comment." });
+    const { LoomioAuthError } = await import("../src/loomio/client.js");
+    const { createComment } = await import("../src/tools/comments.js");
+    const err = await createComment({ parent_id: 77, parent_type: "Stance", body: "x" }).catch(
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(LoomioAuthError);
+    expect(err.status).toBe(403);
+    expect(err.kind).toBe("not_authorized");
+    expect(err.message).toContain("Not authorized to create Comment.");
+    expect(err.message).toMatch(/Loomio ≥ 3\.13 refuses replies to a VOTE/);
+    expect(err.message).toMatch(/until_closed/);
+    expect(err.message).toMatch(/parent_type 'Poll'/);
+  });
+
+  it("a non-permission 403 on a Stance reply (a rejected key) is passed through unchanged", async () => {
+    mockFetch(403, { error: "You are not authorized to access this page." });
+    const { createComment } = await import("../src/tools/comments.js");
+    const err = await createComment({ parent_id: 77, parent_type: "Stance", body: "x" }).catch(
+      (e) => e,
+    );
+    expect(err.kind).toBe("unauthenticated");
+    expect(err.message).not.toMatch(/refuses replies to a VOTE/);
+  });
+
+  it("a 404 from the POST names a missing or soft-deleted target (Loomio ≥ 3.11 ParentDeleted)", async () => {
+    mockFetch(404, { error: 404 });
+    const { LoomioApiError } = await import("../src/loomio/client.js");
+    const { createComment } = await import("../src/tools/comments.js");
+    const err = await createComment({ parent_id: 5, parent_type: "Comment", body: "x" }).catch(
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(LoomioApiError);
+    expect(err.status).toBe(404);
+    expect(err.message).toMatch(/does not exist or was soft-deleted/);
+    expect(err.message).toMatch(/nothing was created/);
+  });
+
+  it("the flat body carries no key beyond the five Loomio ≥ 3.12 permits (any other top-level key would 400), and no query string", async () => {
+    mockFetch(200, { comments: [commentRow({ id: 1 })] });
+    const { createComment } = await import("../src/tools/comments.js");
+    // A direct caller passing an extra key (the MCP layer's z.object strips
+    // it first) still cannot get it onto the wire.
+    await createComment({
+      discussion_id: 64,
+      parent_id: 9,
+      parent_type: "Comment",
+      body: "x",
+      body_format: "md",
+      exclude_types: "topic",
+    } as never);
+    const { url, body } = requestOf();
+    expect(url.search).toBe("");
+    expect(Object.keys(body!).sort()).toEqual(
+      ["body", "body_format", "discussion_id", "parent_id", "parent_type"].sort(),
+    );
   });
 });
 

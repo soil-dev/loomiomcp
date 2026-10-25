@@ -68,7 +68,18 @@ const WRITES = [
   "manage_memberships",
 ] as const;
 
-const B3 = ["deactivate_user", "reactivate_user", "get_user", "list_users"] as const;
+/** The nine b3 tools: the four user tools, then the five Loomio 3.13 provisioning tools. */
+const B3 = [
+  "deactivate_user",
+  "reactivate_user",
+  "get_user",
+  "list_users",
+  "list_instance_groups",
+  "list_instance_memberships",
+  "add_group_members",
+  "update_membership_roles",
+  "revoke_membership",
+] as const;
 
 describe("createLoomioMcpServer — tool sets per mode", () => {
   it("read-only mode advertises only readOnlyHint tools, and none of the writes or b3 tools", async () => {
@@ -96,7 +107,7 @@ describe("createLoomioMcpServer — tool sets per mode", () => {
     for (const name of B3) expect(full.has(name)).toBe(false);
   });
 
-  it("b3 mode adds exactly the four b3 tools, and only when writable", async () => {
+  it("b3 mode adds exactly the nine b3 tools, and only when writable", async () => {
     process.env["LOOMIO_B3_API_KEY"] = "long-enough-admin-secret-12345";
     const b3 = await advertisedTools();
     for (const name of [...WRITES, ...B3]) expect(b3.has(name), `${name} missing`).toBe(true);
@@ -105,6 +116,9 @@ describe("createLoomioMcpServer — tool sets per mode", () => {
     const full = await advertisedTools();
     const added = [...b3.keys()].filter((n) => !full.has(n)).sort();
     expect(added).toEqual([...B3].sort());
+    // The HTTP entry's open-DCR refusal names exactly these tools.
+    const { B3_TOOL_NAMES } = await import("../src/http/config.js");
+    expect([...B3_TOOL_NAMES].sort()).toEqual([...B3].sort());
   });
 
   it("list_events is gone (Loomio 3.4 removed the v1 events endpoint; list_thread_items replaces it)", async () => {
@@ -181,6 +195,61 @@ describe("createLoomioMcpServer — annotations", () => {
       expect(tools.get(name)!.description).toMatch(/single-tenant/);
       expect(tools.get(name)!.description).toMatch(/EMAIL/);
     }
+  });
+
+  it("b3 (Loomio 3.13 provisioning): reads are plain reads, add is additive and not idempotent, role update and revoke are destructive and idempotent", async () => {
+    process.env["LOOMIO_B3_API_KEY"] = "long-enough-admin-secret-12345";
+    const tools = await advertisedTools();
+    const expected: Array<[string, boolean, boolean, boolean]> = [
+      // name, readOnlyHint, destructiveHint, idempotentHint
+      ["list_instance_groups", true, false, true],
+      ["list_instance_memberships", true, false, true],
+      // Never sends remove_absent (additive); a stored address differing
+      // only in case is re-invited on every replay (not idempotent).
+      ["add_group_members", false, false, false],
+      ["update_membership_roles", false, true, true],
+      // Removes subgroup and thread access too; a repeat DELETE succeeds.
+      ["revoke_membership", false, true, true],
+    ];
+    for (const [name, readOnlyHint, destructiveHint, idempotentHint] of expected) {
+      expect(tools.get(name)!.annotations, name).toEqual({
+        readOnlyHint,
+        destructiveHint,
+        idempotentHint,
+        openWorldHint: true,
+      });
+    }
+    // Every b3 tool announces itself as instance-admin; the two new reads
+    // say they return emails / belong on single-tenant deployments.
+    for (const name of B3) expect(tools.get(name)!.description, name).toMatch(/INSTANCE-ADMIN/);
+    for (const name of ["list_instance_groups", "list_instance_memberships"]) {
+      expect(tools.get(name)!.description, name).toMatch(/EMAIL|single-tenant/);
+      expect(tools.get(name)!.description, name).toMatch(/Loomio 3\.13\+/);
+    }
+    // The undo of a revoke is partial, and the description says how.
+    const revoke = tools.get("revoke_membership")!.description!;
+    expect(revoke).toMatch(/SUBGROUPS/);
+    expect(revoke).toMatch(/without the admin role/);
+    expect(revoke).not.toMatch(/as a plain member/);
+    // remove_absent is not even a property of the b3 add tool's schema.
+    const addProps = Object.keys(tools.get("add_group_members")!.inputSchema.properties ?? {});
+    expect(addProps.sort()).toEqual(["emails", "group_id"]);
+    // The description must not claim it is the only way an account is
+    // created: manage_memberships and `recipient_emails` (create /
+    // update_discussion, create_poll) create accounts too. And a 422 is
+    // not always a deactivated account (a NEW address can fail "no spam").
+    const add = tools.get("add_group_members")!.description!;
+    expect(add).not.toMatch(/No tool creates an account/);
+    expect(add).toMatch(/422 = a deactivated account \(reactivate_user first\) or an address/);
+    // 'Who is in group X' on a b3 deployment: the instance-wide roster,
+    // not list_memberships (EMPTY for groups the connector user is not in).
+    expect(tools.get("list_users")!.description).toMatch(/list_instance_memberships/);
+    // The vote-keeping and ballot-restoring behaviour is version-bound;
+    // the connector still serves Loomio 3.8+.
+    expect(tools.get("deactivate_user")!.description).toMatch(/kept \(Loomio 3\.11\+\)/);
+    expect(tools.get("reactivate_user")!.description).toMatch(
+      /\(Loomio 3\.10\+\) open-poll ballots/,
+    );
   });
 
   it("every write description says what happens on Loomio's side (soft delete named as such)", async () => {
@@ -273,25 +342,57 @@ describe("createLoomioMcpServer — instructions and discovery order", () => {
   // the first 0.0.12 draft weighed ~83 KB (~20k tokens) for the 24 full-mode
   // tools; the trim landed at 36 KB. These ceilings stop it creeping back:
   // raise them deliberately, with the reason in CHANGELOG, not by accident.
-  // `scripts/catalog-size.mjs` prints the same numbers from the built server.
-  it("the tools/list catalogue stays under its byte ceiling (24 full-mode tools <= 36 KB, 28 with b3 <= 40 KB)", async () => {
+  // `scripts/catalog-size.mjs` prints the same numbers from the built server
+  // (read-only mode: prefix LOOMIO_MCP_READONLY=1).
+  //
+  //   read-only  14 tools <= 17 000 B  (0.0.16: 16 767) — what a shared,
+  //              open-DCR deployment serves; pinned since 0.0.16
+  //   full       24 tools <= 36 000 B  (0.0.16: 35 646)
+  //   b3         33 tools <= 44 500 B  (0.0.16: 44 189)
+  //
+  // The b3 ceiling was 40 000 B for 28 tools through 0.0.15. 0.0.16 raised
+  // it, and only it, for the five Loomio 3.13 b3 provisioning tools
+  // (list_instance_groups, list_instance_memberships, add_group_members,
+  // update_membership_roles, revoke_membership): ~0.8-1.1 KB each with
+  // annotations, the same density as get_user / list_users, and present
+  // only when the operator opts in with LOOMIO_B3_API_KEY. New value =
+  // the first 0.0.16 measurement (44 164 B) rounded up to the next 500;
+  // the final 0.0.16 texts measure 44 189 B.
+  it("the tools/list catalogue stays under its byte ceiling (14 read-only <= 17 KB, 24 full-mode <= 36 KB, 33 with b3 <= 44.5 KB)", async () => {
+    const bytes = (tools: Map<string, Tool>) =>
+      Buffer.byteLength(JSON.stringify([...tools.values()]), "utf8");
+    const descriptionCap = (name: string) =>
+      name.startsWith("delete_") || name === "update_comment" ? 350 : 700;
+
+    process.env["LOOMIO_MCP_READONLY"] = "1";
+    const readOnly = await handshake();
+    expect(readOnly.tools.size).toBe(14);
+    expect(bytes(readOnly.tools)).toBeLessThanOrEqual(17_000);
+    delete process.env["LOOMIO_MCP_READONLY"];
+
     const full = await handshake();
     expect(full.tools.size).toBe(24);
-    expect(Buffer.byteLength(JSON.stringify([...full.tools.values()]), "utf8")).toBeLessThanOrEqual(
-      36_000,
-    );
+    expect(bytes(full.tools)).toBeLessThanOrEqual(36_000);
     expect((full.instructions ?? "").length).toBeLessThanOrEqual(1_800);
-    for (const tool of full.tools.values()) {
-      const cap = tool.name.startsWith("delete_") || tool.name === "update_comment" ? 350 : 700;
-      expect((tool.description ?? "").length, tool.name).toBeLessThanOrEqual(cap);
-    }
 
     process.env["LOOMIO_B3_API_KEY"] = "long-enough-admin-secret-12345";
     const b3 = await handshake();
-    expect(b3.tools.size).toBe(28);
-    expect(Buffer.byteLength(JSON.stringify([...b3.tools.values()]), "utf8")).toBeLessThanOrEqual(
-      40_000,
-    );
+    expect(b3.tools.size).toBe(33);
+    expect(bytes(b3.tools)).toBeLessThanOrEqual(44_500);
+
+    // Per-tool caps over the widest set (b3 = full + the nine b3 tools):
+    // description <= 700 (350 for delete_* / update_comment), and every
+    // input-field description <= 120.
+    for (const tool of b3.tools.values()) {
+      expect((tool.description ?? "").length, tool.name).toBeLessThanOrEqual(
+        descriptionCap(tool.name),
+      );
+      const props = (tool.inputSchema as { properties?: Record<string, { description?: string }> })
+        .properties;
+      for (const [field, prop] of Object.entries(props ?? {})) {
+        expect((prop.description ?? "").length, `${tool.name}.${field}`).toBeLessThanOrEqual(120);
+      }
+    }
   });
 
   it("lists check_connection first, so the tool that explains the rest is the first one a client reads", async () => {
@@ -345,6 +446,28 @@ describe("createLoomioMcpServer — instructions and discovery order", () => {
     expect(tools.get("list_polls")!.description).toMatch(/results_visible/);
     expect(tools.get("get_poll")!.description).toMatch(/results_hidden_reason/);
     expect(tools.get("get_discussion")!.description).toMatch(/include_items/);
+    // 0.0.16: Loomio >= 3.11.1 pages thread items, so the cost depends on
+    // the thread's size and the reply budget, and the texts say so.
+    expect(tools.get("get_discussion")!.description).toMatch(/2\+ with `include_items`/);
+    expect(tools.get("list_thread_items")!.description).toMatch(/1 call per 500 items/);
+    expect(tools.get("list_thread_items")!.description).not.toMatch(/fetched once/);
+    // The Markdown export ignores 'hide results until vote' (Loomio >= 3.10):
+    // the description must say the tool refuses then, and where to go.
+    expect(tools.get("get_thread_markdown")!.description).toMatch(/REFUSED/);
+    expect(tools.get("get_thread_markdown")!.description).toMatch(/list_thread_items/);
+    // Its guard reads the thread once on every reference, so the three
+    // cost the same; list_thread_items' "+1 call" hints must not leak in.
+    const fieldText = (name: string, prop: string): string =>
+      (tools.get(name)!.inputSchema.properties?.[prop] as { description?: string } | undefined)
+        ?.description ?? "";
+    for (const prop of ["discussion_id", "poll_id", "topic_id"]) {
+      expect(fieldText("get_thread_markdown", prop), prop).not.toMatch(
+        /\+1 call|no extra call|prefer/,
+      );
+    }
+    expect(fieldText("list_thread_items", "discussion_id")).toMatch(/\+1 call/);
+    // include_items pages like list_thread_items: one call per 500 items.
+    expect(fieldText("get_discussion", "include_items")).toMatch(/\+1 call per 500 items/);
     expect(tools.get("get_group")!.description).toMatch(/Not authorized to show Group/);
     expect(tools.get("search_content")!.description).toMatch(/at most 20 results/);
   });

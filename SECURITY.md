@@ -3,17 +3,20 @@
 ## Threat model
 
 loomiomcp is a thin shim. It holds one secret (`LOOMIO_API_KEY`) and
-exposes a small tool surface — 14 reads, 10 writes, 4 opt-in
+exposes a small tool surface — 14 reads, 10 writes, 9 opt-in
 instance-admin tools — that calls Loomio's b2 API on behalf of
 authenticated MCP clients, plus the optional b3 admin endpoints (gated
 by a separate, server-instance secret) when explicitly enabled.
 
-Everything below is stated against Loomio 3.9.0 (`TESTED_LOOMIO_VERSION`
-in `src/version.ts`; 3.8.1 → 3.9.0 changed no b2 / b3 route, permitted
-parameter or authorization check the connector relies on). Loomio
-publishes no API compatibility policy and changed its User API
-permission model between 3.0 and 3.8; re-check this file when the health
-probe reports version drift.
+Everything below is stated against Loomio 3.13.1 (`TESTED_LOOMIO_VERSION`
+in `src/version.ts`). 3.9 → 3.13.1 changed what this file depends on in
+three places, each covered below: the Markdown export stopped applying
+"hide results until vote" (3.10), the groups index and thread items
+became paged (3.11.1, which changes the upstream cost bounds), and the
+b3 secret gained instance-wide group and membership provisioning
+(3.13). Loomio publishes no API compatibility policy and changed its
+User API permission model between 3.0 and 3.8; re-check this file when
+the health probe reports version drift.
 
 ## HTTP / multi-user posture (public deployments)
 
@@ -107,6 +110,44 @@ blast radius. Understand this before exposing the connector publicly:
   confirm word by word — what another withholds. For a group the user is
   not a member of, Loomio answers `200` with an **empty list**, not 403;
   the connector annotates that with `scope.note`.
+- **Loomio's own exports ignore `until_vote`, so `get_thread_markdown`
+  refuses.** Since Loomio 3.10 (df28cf845) `ThreadMarkdownService`
+  decides poll visibility by `results_available?` alone: an OPEN poll
+  with `hide_results: until_vote` has its votes and results table
+  rendered into the Markdown for a reader who has not voted — exactly
+  what `get_poll`, `list_polls`, `list_thread_items` and
+  `search_content` withhold. Redacting Loomio's localised document is
+  not attempted. Instead `get_thread_markdown` reads the thread first
+  (one call on any reference, which it needed anyway for the header) and
+  throws a `VisibilityRefusalError` naming the poll(s) — without
+  fetching the document — when the thread holds an open until_vote poll
+  the connector's user has not voted in. What the export prints is
+  decided by the thread's ITEMS — every poll whose `poll_created` item
+  sits in the thread — so the guard checks the items, never a counter:
+  a poll it read (a standalone poll's own, or the one a `poll_id`
+  named) that hides its results refuses at once; a thread holding only
+  its opening item (`items_count` ≤ 1) adds nothing (2 calls in all);
+  any other thread's items are scanned, 1 call per 500 items, at most
+  10, stopping at the first page that shows a hidden poll — and a scan
+  the cap stops refuses ("could not verify"), failing closed. An
+  unknown own user id counts as "not voted". Why not
+  `active_polls_count` (which would spare most threads the scan): it
+  follows `polls.topic_id`, and a topic or group admin can change that
+  with `PATCH /b2/polls/{id}` (or a stale browser tab after a move)
+  without moving the poll's items — the old thread then reads 0 while
+  its export still prints the poll and every vote. The item rule also
+  covers polls MOVED into a thread, a standalone poll's included: Loomio
+  forbids creating a second poll there, but v1 `topics#move_comments`
+  can move polls into any topic its actor administers, the thread read
+  never shows such a poll, and the move raises `items_count`, so the
+  scan finds it. This was live from Loomio 3.10 until 0.0.16
+  on any deployment, read-only ones included. On Loomio 3.8 / 3.9 the
+  export still applied the rule per reader (`results_visible?(voted:)`,
+  thread_markdown_service.rb:168-172 before df28cf845), so the guard is
+  skipped there — but only on a version a health probe reported within
+  the last minute; an older probe is re-run first, and an unknown
+  version or 3.10+ keeps the guard (fail closed: an instance upgraded
+  since the last probe is never exported unguarded).
 - **Group billing metadata is dropped.** Loomio's GroupSerializer adds a
   `subscription` block (plan, state, active, seat caps, renewal and
   expiry dates) to every group record whenever the API user holds an
@@ -191,14 +232,36 @@ user's own votes; it is never serialised by `/health` and never logged.
 The runbook is in DEPLOY.md.
 
 **Scope of the b3 secret.** The b3 Server API covers far more than the
-four operations this connector wraps: user update (including
-`is_admin`), hard destroy and redact, in addition to deactivate /
-reactivate / show / index and lookup by external identity. The secret
-authenticates the *server*, not a user, and Loomio applies no per-user
-authorization to it and records no actor identity. The connector calls
-only the deactivate / reactivate member routes and the show / index
-reads, but the *credential* unlocks all of it on the Loomio side — one
-more reason it must never sit on a shared deployment.
+operations this connector wraps: user update (including `is_admin`),
+hard destroy and redact, in addition to deactivate / reactivate / show /
+index and lookup by external identity. Since Loomio 3.13 the same
+secret can also:
+
+- create accounts (`POST /b3/users`), instance admins included
+  (`is_admin` is a permitted field);
+- enumerate every group on the instance, secret ones included;
+- read every group's roster with every member's email;
+- invite any syntactically valid address into any group — accounts are
+  created on the spot, and invitation emails go out subject only to
+  Loomio's delivery-time spam and suppression filters: no admin check,
+  no per-actor rate limit. The instance's `SPAM_REGEX` still applies to
+  NEW accounts, as the User model's validation: a matching address fails
+  the whole call (422 "no spam") instead of being dropped silently as on
+  b2;
+- sync-remove a whole group's membership across its subgroups
+  (`remove_absent`);
+- grant or revoke the group admin role anywhere.
+
+The secret authenticates the *server*, not a user, and Loomio applies
+no per-user authorization to it. **Attribution:** the b3 membership
+writes record no actor at all (no inviter, no revoker, no notification
+actor; the role update's PaperTrail `whodunnit` is nil), and a b3
+deactivation is recorded as the user deactivating themself. The
+connector's `tool.call` log line (tool name, OAuth `clientId`, argument
+NAMES, time) is the only trail of who asked. The connector calls only
+the routes listed under "b3 admin tools" below, but the *credential*
+unlocks all of it on the Loomio side — one more reason it must never
+sit on a shared deployment.
 
 ## Read-only mode
 
@@ -206,13 +269,16 @@ more reason it must never sit on a shared deployment.
 server-init time — `create_discussion`, `update_discussion`,
 `delete_discussion`, `create_poll`, `update_poll`, `delete_poll`,
 `create_comment`, `update_comment`, `delete_comment`,
-`manage_memberships` — and of every b3 tool, `get_user` / `list_users`
-included (they return emails, so they share the writes' gate).
+`manage_memberships` — and of every b3 tool, `get_user`, `list_users`,
+`list_instance_groups` and `list_instance_memberships` included (they
+return instance-wide data with emails, so they share the writes'
+gate).
 Belt-and-braces: even if a misbehaving MCP client asked for one, the
 tool isn't in the catalog. The client-layer guard in
 `src/loomio/client.ts` (`isReadOnly()` → throw before any request in
-`loomioPost`, `loomioPatch`, `loomioDelete` and `loomioPostB3`) is the
-second line of defence; `create_poll` checks it before its thread
+`loomioPost`, `loomioPatch`, `loomioDelete` and the b3 writes
+`loomioPostB3` / `loomioPatchB3` / `loomioDeleteB3`, which share one
+write path) is the second line of defence; `create_poll` checks it before its thread
 resolution GET as well. `tests/readonly.test.ts` pins the advertised set
 per mode by name.
 
@@ -237,6 +303,13 @@ flag is true and omits the key otherwise: Loomio reads
 `params[:remove_absent].to_i == 1`, and a JSON boolean would raise
 `NoMethodError` → HTTP 500 *after* the invitations had already been
 sent. The tool's own input stays a boolean.
+
+**Case-sensitivity risk.** Loomio computes the members to remove as
+`current_emails - params_emails` over the members' STORED addresses,
+case-sensitively and without normalising the list. A member stored as
+`alice@example.org` and listed as `Alice@example.org` is therefore
+REMOVED even though the caller meant to keep them. Send the addresses
+exactly as `list_memberships` returns them.
 
 The `manage_memberships` tool:
 
@@ -286,9 +359,14 @@ is `403 "Not authorized to <action> <Model>."`, surfaced verbatim.
 
 ## b3 admin tools
 
-`deactivate_user`, `reactivate_user`, `get_user` and `list_users` are
-opt-in (registered only when `LOOMIO_B3_API_KEY` is set and the server
-is not read-only). They call the member routes
+Nine tools, all opt-in (registered only when `LOOMIO_B3_API_KEY` is set
+and the server is not read-only). The four user tools —
+`deactivate_user`, `reactivate_user`, `get_user` and `list_users` —
+work on every supported Loomio; the five provisioning tools need
+Loomio 3.13+ and were verified only against Loomio's source, tests and
+documentation.
+
+The user tools call the member routes
 `POST /api/b3/users/{id}/deactivate` and `…/{id}/reactivate` (the
 `?id=` collection routes are deprecated in Loomio's OpenAPI document),
 `GET /api/b3/users/{id}`, `GET /api/b3/users/identity/{type}/{uid}` and
@@ -300,10 +378,13 @@ instance-wide:
   `{ success: true, user }` **immediately** — the echoed user may still
   show `active: true`. The worker then stamps `deactivated_at`, revokes
   the user's memberships, mobile devices and pending membership
-  requests. There is no soft confirmation step.
+  requests, and their undecided open-poll ballots (votes already cast
+  are kept since Loomio 3.11). Loomio records the user as its own
+  deactivator. There is no soft confirmation step.
 - `reactivate_user` is synchronous: it clears `deactivated_at` and
-  **restores the memberships the deactivation revoked**. It is the
-  inverse of the above and isn't marked destructive.
+  **restores the memberships and open-poll ballots the deactivation
+  revoked**. It is the inverse of the above and isn't marked
+  destructive.
 - `get_user` and `list_users` return every account's **email address**
   (plus `is_admin`, `active`, `deactivated_at` and linked external
   identities) for any user on the instance, member of the connector's
@@ -313,25 +394,83 @@ instance-wide:
   per Loomio instance. On a shared or hosted instance leave
   `LOOMIO_B3_API_KEY` unset.
 
-Never set `LOOMIO_B3_API_KEY` on a Cloud Run deployment that's
-accessible to multiple users. The b3 secret authenticates the
-*server* as a Loomio instance operator, not the calling user — any
-client that can reach the MCP server can deactivate any user and read
-every email (and, see "Scope of the b3 secret" above, the same
+The provisioning tools (`GET /api/b3/groups`, `GET /api/b3/memberships`,
+`POST /api/b3/memberships`, `PATCH` / `DELETE /api/b3/memberships/{id}`):
+
+- `list_instance_groups` lists every group on the instance, secret ones
+  included; `list_instance_memberships` lists any group's roster with
+  every member's email, whoever the connector's user is. Gated like the
+  writes for that reason.
+- `add_group_members` (`destructiveHint: false`, `idempotentHint:
+  false`) invites up to 50 addresses per call into any group: unknown
+  addresses become new unverified accounts and everyone added gets
+  Loomio's invitation email. Its body is built field by field —
+  exactly `{group_id, emails}` — under a strict schema, so
+  **`remove_absent` is never sent** and cannot be smuggled in. The
+  50-address cap is the connector's: b3 skips Loomio's per-actor
+  invitation throttle (new accounts still pass the User model's
+  `SPAM_REGEX` validation, which fails the whole call rather than
+  dropping the address). A 422 is either a deactivated account or an
+  address Loomio refuses to create; the error says which.
+- `update_membership_roles` (`destructiveHint: true`) grants or removes
+  `admin` / `delegate` on any membership; nothing stops demoting a
+  group's last admin.
+- `revoke_membership` (`destructiveHint: true`, idempotent) removes a
+  person from a group AND its subgroups and threads and revokes their
+  open-poll votes, cast ones included, without notification. A re-add
+  restores the target group only, without the admin role.
+
+**Never sent:** `remove_absent` on the b3 sync, `POST /b3/users`, the
+user `PATCH` / `DELETE` / redact routes and their identity variants,
+and the `PUT` aliases (README "Deliberately not exposed").
+
+Never set `LOOMIO_B3_API_KEY` on a shared deployment or on any open-DCR
+deployment (where anyone who completes the OAuth dance is a caller).
+The HTTP entry enforces the open-DCR half: in `MCP_OAUTH_INSECURE_AUTO_APPROVE`
+mode on a non-localhost `PUBLIC_BASE_URL` it refuses to start while the
+secret is set and read-only mode is off (`b3ExposureError`,
+src/http/config.ts; no override — use static-client mode), and on
+localhost it logs a warning naming the nine tools. A shared deployment
+in static-client mode cannot be detected and stays the operator's call.
+The b3 secret authenticates the *server* as a Loomio instance operator,
+not the calling user — any client that can reach the MCP server can
+deactivate any user, read every email and roster, and invite or remove
+members anywhere (and, see "Scope of the b3 secret" above, the same
 credential does much more on the Loomio side).
 
 ## Upstream cost bounds
 
 Every read is one upstream call unless stated (README.md has the table).
-The exceptions and caps that matter for abuse sizing:
+Since Loomio 3.11.1 pages the groups index and thread items (at most
+500 rows per request), the connector follows those pages within fixed
+per-call caps and flags a walk the cap stopped. The exact fan-out, for
+abuse sizing:
 
 - `get_user_activity` makes one `GET /b2/reports` per requested group
   (schema cap 50, at most 4 in flight) plus one search — N + 1 calls
   per invocation. The 0.0.11 per-discussion fan-out (~200 calls) and the
-  `list_groups` id probe (50–500 calls) are gone; nothing else fans out.
-- `list_thread_items` (and `get_discussion` with `include_items`) fetch
-  the WHOLE thread once per call — Loomio's items route is unpaginated
-  — so the cost is one request but its size scales with the thread;
+  `list_groups` id probe (50–500 calls) are gone.
+- `list_groups`: 1 call per 500 member groups, at most 20.
+- `check_connection`: the health probe's two requests, and no extra
+  call up to 50 member groups; beyond that 1 per further 500, at most
+  20.
+- `list_thread_items`: at most 2 item requests without `kinds` (one per
+  500 items of the window, `limit` ≤ 1000), at most 10 with `kinds`
+  (the thread from its start, 5 000 items), +1 by `discussion_id` /
+  `poll_id`.
+- `get_discussion` with `include_items`: 2, +1 per further 500 embedded
+  items — at most 3 (`items_limit` ≤ 1000).
+- `get_thread_markdown`: 2, +1 per 500 items (at most 10) when the
+  vote-visibility guard scans the thread's items — any thread holding
+  more than its opening item, unless the guard's read already refuses;
+  a refusal skips the document. On Loomio 3.8 / 3.9 (guard skipped): 2,
+  or 4 when the health probe behind that decision has to be re-run
+  (at most once a minute).
+- b3: `list_instance_groups` / `list_instance_memberships` 1 per page
+  of ≤ 50; each write 1.
+- On Loomio before 3.11.1 every one of these paged reads is a single
+  request (Loomio returns the whole collection; the connector detects
+  it and stops), so its SIZE scales with the thread or group count;
   `body_max_chars` and the `max_total_chars` reply budget (default
   120000 shaped characters) bound what is returned to the client, not
   what Loomio sends.

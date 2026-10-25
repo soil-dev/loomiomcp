@@ -14,7 +14,7 @@ stdio server. The host launches the process; the API key stays on your
 machine.
 
 To run in read-only mode: also set `LOOMIO_MCP_READONLY=1`. Only the
-14 read tools are registered; the 10 write tools and the 4 b3 tools are
+14 read tools are registered; the 10 write tools and the 9 b3 tools are
 not even visible to the MCP host. See [README.md](README.md) for the
 full tool catalog and which tools are reads vs writes.
 
@@ -77,15 +77,15 @@ Other env:
 | `MCP_HTTP_JSON_LIMIT` | `1mb` | Request body cap. |
 | `MCP_HTTP_TRUST_PROXY` | `1` | `app.set("trust proxy", …)`. `1` is correct for Cloud Run. |
 | `MCP_ALLOWED_ORIGINS` | unset | Extra browser origins (comma-separated, `https://` or loopback `http://`) allowed alongside `PUBLIC_BASE_URL`'s origin and `https://claude.ai`. Only needed for a browser-based MCP client on another origin. |
-| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Request cap per window, keyed on the **source IP** (not the OAuth client_id — under open DCR a caller can mint unlimited client_ids, so IP is the only sound key). Tighten on open-DCR deployments; the reference deployment uses 300. Per-call upstream cost is bounded separately: every read is one Loomio call except `get_user_activity` (one report call per requested group, ≤ 50, 4 in flight, plus one search). The same config applies to `GET /health`, in a separate bucket. |
+| `MCP_HTTP_RATE_LIMIT_MAX` | `600` | Request cap per window, keyed on the **source IP** (not the OAuth client_id — under open DCR a caller can mint unlimited client_ids, so IP is the only sound key). Tighten on open-DCR deployments; the reference deployment uses 300. Per-call upstream cost is bounded separately: every read is one Loomio call except `get_user_activity` (one report call per requested group, ≤ 50, 4 in flight, plus one search) and, because Loomio ≥ 3.11.1 pages its groups index and thread items, `list_groups` (1 per 500 member groups, ≤ 20), `check_connection` (+1 per 500 groups beyond the first 50, ≤ 20), `list_thread_items` (≤ 2 item calls, ≤ 10 with `kinds`, +1 by `discussion_id` / `poll_id`), `get_discussion` with `include_items` (2, +1 per further 500 embedded items, ≤ 3) and `get_thread_markdown` (2, +1 per 500 items, ≤ 10, when its vote-visibility guard scans the thread — any thread with replies; on Loomio 3.8 / 3.9 the guard is skipped: 2, or 4 when it first re-runs a health probe older than a minute); SECURITY.md "Upstream cost bounds" has the detail. The same config applies to `GET /health`, in a separate bucket. |
 | `MCP_HTTP_RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window. |
 | `MCP_HTTP_RATE_LIMIT_DISABLED` | unset | Set to `1` to disable rate limiting entirely (only useful for local dev). |
 | `MCP_HTTP_DEBUG` | unset | Set to `1` to include the error message (not just its class and status) in the `[loomiomcp] /mcp error:` stderr line. Off by default because that message can quote clipped upstream text. |
 | `LOOMIO_MCP_LOG_VERBOSE` | unset | When `1`, emits structured JSON events to stderr (Cloud Run auto-parses). See OPTIMIZATIONS.md. The key-health events `loomio.auth` and `loomio.version_drift` are **forced** — they are emitted regardless of this flag. |
 | `LOOMIO_MCP_HEALTH_PATH` | `/health` | Where the health page is served. Change it only if the hosting front-end reserves `/health` too (Cloud Run's frontend is known to reserve `/healthz`, which is why the default is `/health`; see the health-check section below); point the uptime check at the same path. Must be an absolute path with no query string. |
-| `LOOMIO_B3_API_KEY` | unset | Server-instance admin secret. When set (and the server is not read-only), registers `deactivate_user`, `reactivate_user`, `get_user` and `list_users` — the last two return **email addresses** for every account on the instance. **Do not set on a multi-user deployment** — see SECURITY.md. |
+| `LOOMIO_B3_API_KEY` | unset | Server-instance admin secret. When set (and the server is not read-only), registers the nine b3 tools: `deactivate_user`, `reactivate_user`, `get_user`, `list_users` and, for Loomio 3.13+, `list_instance_groups`, `list_instance_memberships`, `add_group_members`, `update_membership_roles`, `revoke_membership`. They return **email addresses** for every account and every group roster on the instance, and `add_group_members` sends Loomio's **invitation emails** to any address it is given. **Do not set on a multi-user or open-DCR deployment** — see SECURITY.md. The HTTP server refuses to start when it is set with `MCP_OAUTH_INSECURE_AUTO_APPROVE` on a non-localhost `PUBLIC_BASE_URL` and read-only mode off (every self-registered client would get the b3 tools), and warns on localhost. |
 
-Tool count per mode: read-only 14, full 24, full + b3 28. The
+Tool count per mode: read-only 14, full 24, full + b3 33. The
 `tools/list` a client receives is pinned per mode by
 `tests/readonly.test.ts`.
 
@@ -113,10 +113,10 @@ Loomio still accept the connector's API key?
 ```json
 {
   "status": "ok",
-  "connector_version": "0.0.14",
+  "connector_version": "0.0.16",
   "key_status": "valid",
-  "loomio_version": "3.9.0",
-  "checked_at": "2026-10-02T10:00:00.000Z"
+  "loomio_version": "3.13.1",
+  "checked_at": "2026-10-24T10:00:00.000Z"
 }
 ```
 

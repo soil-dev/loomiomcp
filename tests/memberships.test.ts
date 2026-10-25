@@ -69,6 +69,20 @@ describe("listMemberships", () => {
     expect(r).not.toHaveProperty("scope");
   });
 
+  it("keeps `weight` (Loomio 3.10+ vote weight, a decimal string) where Loomio sent it: the own row and every row of a group the user administers", async () => {
+    const body = membershipsListBody();
+    body.memberships![0]!.weight = "2.5";
+    body.memberships![1]!.weight = "1";
+    mockFetch(200, body);
+    const { listMemberships } = await import("../src/tools/memberships.js");
+    const r = await listMemberships({ group_id: 7 });
+    expect(r.memberships.map((m) => m.weight)).toEqual(["2.5", "1"]);
+    // A plain member's roster (the default fixture) carries none.
+    mockFetch(200, membershipsListBody());
+    const plain = await listMemberships({ group_id: 7 });
+    for (const m of plain.memberships) expect(m).not.toHaveProperty("weight");
+  });
+
   it("keeps user_email on rows where Loomio sent it (admin groups); users[] never carry email", async () => {
     const body = membershipsListBody();
     body.memberships![1]!.user_email = "linus@example.org";

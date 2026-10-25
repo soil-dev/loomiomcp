@@ -4,6 +4,8 @@
  * top-level server-startup code in `src/http.ts`.
  */
 
+import { isTruthyEnvValue } from "../env.js";
+
 export const DEFAULT_ANTHROPIC_REDIRECT_URIS = [
   "https://claude.ai/api/mcp/auth_callback",
   "https://claude.ai/api/oauth/callback",
@@ -96,6 +98,76 @@ export function selectMode(
       "  - Set MCP_OAUTH_CLIENT_ID and MCP_OAUTH_CLIENT_SECRET (recommended for public deployments)\n" +
       "  - Or set MCP_OAUTH_INSECURE_AUTO_APPROVE=1 (only safe for local development or private-network deployments)",
   };
+}
+
+/**
+ * The b3 tools `src/server.ts` registers when `LOOMIO_B3_API_KEY` is set
+ * and the server is not read-only — named in the startup refusal and
+ * warning below so the operator sees what the secret would expose.
+ */
+export const B3_TOOL_NAMES = [
+  "deactivate_user",
+  "reactivate_user",
+  "get_user",
+  "list_users",
+  "list_instance_groups",
+  "list_instance_memberships",
+  "add_group_members",
+  "update_membership_roles",
+  "revoke_membership",
+] as const;
+
+/** True when the b3 tools would be registered: the secret is set and read-only mode is off. */
+function b3ToolsEnabled(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env["LOOMIO_B3_API_KEY"]) && !isTruthyEnvValue(env["LOOMIO_MCP_READONLY"]);
+}
+
+/**
+ * Refuse to start an open-DCR deployment that would hand the b3 tools to
+ * anyone. In insecure-auto-approve mode any client that reaches the URL
+ * registers itself (StatelessClientsStore) and gets the full tool list,
+ * and with the b3 secret set and read-only off that list includes every
+ * roster with emails (`list_instance_memberships`), invitations to ≤ 50
+ * arbitrary addresses per call with no per-actor throttle
+ * (`add_group_members`) and instance-wide account and membership changes.
+ * SECURITY.md / DEPLOY.md / README already say "never set
+ * LOOMIO_B3_API_KEY on an open-DCR deployment"; this makes the public-URL
+ * case impossible rather than merely documented. Localhost stays allowed
+ * (single-user development; `b3ExposureWarning` makes it loud), and so
+ * does read-only mode, where the b3 tools never register. There is no
+ * override: an operator who needs b3 over HTTP uses static-client mode.
+ * Returns the fatal message, or `undefined` when the combination is safe.
+ */
+export function b3ExposureError(
+  env: NodeJS.ProcessEnv,
+  mode: Mode,
+  publicBaseUrl: string,
+): string | undefined {
+  if (mode.kind !== "insecure-auto-approve" || !b3ToolsEnabled(env)) return undefined;
+  if (isLocalhostUrl(publicBaseUrl)) return undefined;
+  return (
+    "LOOMIO_B3_API_KEY is set on an open-DCR deployment (MCP_OAUTH_INSECURE_AUTO_APPROVE with a " +
+    "non-localhost PUBLIC_BASE_URL) and read-only mode is off, so every self-registered OAuth " +
+    `client would get the instance-admin tools ${B3_TOOL_NAMES.join(", ")} — every group roster ` +
+    "with emails, invitations to arbitrary addresses, account and membership changes anywhere. " +
+    "Unset LOOMIO_B3_API_KEY, set LOOMIO_MCP_READONLY=1, or use static-client mode " +
+    "(MCP_OAUTH_CLIENT_ID / MCP_OAUTH_CLIENT_SECRET)."
+  );
+}
+
+/**
+ * The startup warning for the one auto-approve + b3 combination
+ * `b3ExposureError` lets through (a localhost URL): anyone who can reach
+ * that port gets the b3 tools. `undefined` when there is nothing to warn
+ * about.
+ */
+export function b3ExposureWarning(env: NodeJS.ProcessEnv, mode: Mode): string | undefined {
+  if (mode.kind !== "insecure-auto-approve" || !b3ToolsEnabled(env)) return undefined;
+  return (
+    "LOOMIO_B3_API_KEY is set in INSECURE_AUTO_APPROVE mode: any client that can reach this " +
+    `port registers itself and gets the instance-admin tools ${B3_TOOL_NAMES.join(", ")}. ` +
+    "Keep it to single-user local development."
+  );
 }
 
 export interface BaseConfig {

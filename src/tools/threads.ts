@@ -1,6 +1,20 @@
 import { z } from "zod";
-import { LoomioApiError, loomioGet, readParams } from "../loomio/client.js";
-import { cachedOwnUserId } from "../loomio/health.js";
+import {
+  B2_PAGE_MAX,
+  LoomioApiError,
+  loomioGet,
+  loomioGetAllPages,
+  loomioPager,
+  type PagerState,
+  readParams,
+} from "../loomio/client.js";
+import {
+  cachedHealthAgeMs,
+  cachedOwnUserId,
+  checkLoomioHealth,
+  getCachedHealth,
+  HEALTH_CACHE_TTL_MS,
+} from "../loomio/health.js";
 import {
   indexById,
   pick,
@@ -9,6 +23,7 @@ import {
   stripBodyHtml,
   threadUrl,
   truncateBody,
+  truncateField,
   truncateText,
 } from "../loomio/shape.js";
 import type {
@@ -17,20 +32,24 @@ import type {
   LoomioOutcome,
   LoomioPoll,
   LoomioPollOption,
+  LoomioSideLoads,
   LoomioStance,
   LoomioTopic,
   LoomioTopicItem,
+  LoomioUser,
   PollsResponse,
   ThreadItemsResponse,
   ThreadsResponse,
 } from "../loomio/types.js";
 import {
   type GatedPoll,
-  pollResultsVisible,
+  hiddenUntilVote,
   ownStanceFor,
+  pollResultsVisible,
   type ResultsVisibility,
   stripHiddenResults,
   stripHiddenStanceResults,
+  VisibilityRefusalError,
 } from "../loomio/visibility.js";
 import { encodePathSegment, idOrKey, isoTimestamp, maxCharsSchema, positiveId } from "./_common.js";
 
@@ -47,17 +66,46 @@ import { encodePathSegment, idOrKey, isoTimestamp, maxCharsSchema, positiveId } 
 //                                    controller reads none — so `group_id`
 //                                    below is applied to the fetched page.
 //   GET /b2/threads/{topic_id}       one TopicSerializer row (`threads` root).
-//   GET /b2/threads/{topic_id}/items EVERY item of the thread ordered by
-//                                    sequence_id, UNPAGINATED (no limit /
-//                                    offset are read), `meta.total` = count.
-//                                    The connector pages client-side.
+//   GET /b2/threads/{topic_id}/items the thread's items ordered by
+//                                    `sequence_id, id`. Loomio ≥ 3.11.1
+//                                    (bc1a6cc02) pages them with
+//                                    `page_collection_bounded`: `limit`
+//                                    default 50, clamped to 1..500,
+//                                    `offset`; `meta.total` = the whole
+//                                    thread on every page. The connector
+//                                    requests the caller's window (at most
+//                                    two pages of 500); `kinds`, a filter
+//                                    Loomio does not have, reads the thread
+//                                    page by page from the start. Older
+//                                    Loomio returns every item whatever
+//                                    was asked, and that reply is sliced
+//                                    here (src/loomio/client.ts
+//                                    `loomioPager`).
 //   GET /b2/threads/{topic_id}/markdown  {markdown} from
-//                                    ThreadMarkdownService: front matter,
-//                                    title, body, then every comment, poll
-//                                    (with a results table or a "hidden
-//                                    until…" line — Loomio applies the
-//                                    vote-visibility rule itself here),
-//                                    stance and outcome.
+//                                    ThreadMarkdownService behind
+//                                    `authorize!(:export, thread)` (= can
+//                                    show, ability/topic.rb:9-11). The
+//                                    ≥ 3.10 document: front matter (key,
+//                                    url, group, created, last_activity,
+//                                    tags, 3.13+ root_tags), a `# <Type>:
+//                                    <title> · <author> · <UTC time>`
+//                                    title, the opening body, then the
+//                                    activity as a reply tree of nested
+//                                    blockquotes — polls as `##` sections
+//                                    with their votes and replies, each
+//                                    item headed `**Author** · <time> ·
+//                                    #<seq>`, reactions inline, `Tags:`
+//                                    lines, removed items as `_Removed_`
+//                                    placeholders. Since 3.10 (df28cf845)
+//                                    it decides poll visibility with
+//                                    `results_available?` alone
+//                                    (thread_markdown_service.rb:213-215):
+//                                    an open `until_vote` poll's votes and
+//                                    results table are printed for a
+//                                    reader who has not voted. The
+//                                    connector refuses that case (see
+//                                    "get_thread_markdown" below); every
+//                                    other document passes through.
 //
 // The `{topic_id}` is the THREAD id (`discussion.topic_id` /
 // `poll.topic_id`), not the discussion's or poll's own id. It is
@@ -70,10 +118,14 @@ import { encodePathSegment, idOrKey, isoTimestamp, maxCharsSchema, positiveId } 
 // `outcomes`) and its actor into `users`; PollSerializer adds
 // `poll_options`, the poll's `current_outcome` and the API user's
 // `my_stance` (into the same `stances` root every voter's stance lands
-// in). `compact=1` drops the `topics`, `groups`, `parent_topic_items`,
-// `memberships`, `reactions`, `tags` and `translations` roots — none of
-// which the items read needs (the counters live on the topic the caller
-// already has, and `parent_id` describes the tree). Two variations on
+// in). `compact=1` drops the `topics`, `groups`, `memberships`,
+// `reactions`, `tags` and `translations` roots and the parent copies
+// under `parent_topic_items` — none of which the items read needs (the
+// counters live on the topic the caller already has, and `parent_id`
+// describes the tree; the few `reply_parent` rows Loomio ≥ 3.11 still
+// puts there are ignored, see `EXCLUDE_TYPES.items_with_reactions`).
+// Each PAGE side-loads only what its own items reference, so the pages
+// of one call are merged before anything is looked up. Two variations on
 // it (src/loomio/client.ts `EXCLUDE_TYPES`): when the thread's own
 // record is already in hand — a `discussion_id` was just resolved, or
 // get_discussion passed its record through — `items_known_thread` also
@@ -126,9 +178,24 @@ export const THREAD_ITEM_KINDS = [
 
 const KNOWN_KINDS: ReadonlySet<string> = new Set(THREAD_ITEM_KINDS);
 
-/** Default and ceiling for the client-side page over a thread's items. */
+/**
+ * Default and ceiling for list_thread_items' window (`limit`). On
+ * Loomio ≥ 3.11.1 the window is what the connector asks Loomio for, so
+ * the ceiling is two pages of `B2_PAGE_MAX`: a call costs at most two
+ * item requests without `kinds`, one per 500 items of the window.
+ */
 export const DEFAULT_ITEMS_LIMIT = 200;
 export const MAX_ITEMS_LIMIT = 1000;
+/**
+ * Pages a WHOLE-thread read may spend: `kinds` filtering (a filter
+ * Loomio does not have, so the thread is read from item 0) and
+ * get_thread_markdown's vote-visibility scan. 10 × `B2_PAGE_MAX` = 5 000
+ * items, far beyond any thread a person reads, and a hard bound on what
+ * one tool call can cost Loomio (DEPLOY.md's rate-limit sizing counts
+ * it). A walk the cap stops is flagged (`scope.scan_truncated`), never
+ * returned as if complete.
+ */
+export const MAX_ITEM_SCAN_PAGES = 10;
 /** Default cap on each comment / stance reason / outcome statement / poll details body. */
 export const DEFAULT_BODY_MAX_CHARS = 4000;
 /**
@@ -152,21 +219,32 @@ export const MAX_THREADS_LIMIT = 100;
 //
 // Every thread tool addresses a thread by exactly one of three ids. The
 // `topic_id` is what Loomio's routes want and costs nothing to resolve;
-// a `discussion_id` or `poll_id` costs one `GET /b2/{discussions,polls}/
-// {id}?compact=1` to read the record's `topic_id` (compact, because
-// only the record itself is needed — the counters come with the thread).
-// Callers that already hold a record (from list_discussions,
-// list_threads, search_content) should pass its `topic_id` and skip
-// that call; the descriptions say so.
+// a `discussion_id` or `poll_id` costs one show of the record to read
+// its `topic_id` (`resolveThread`). Callers that already hold a record
+// (from list_discussions, list_threads, search_content) should pass its
+// `topic_id` and skip that call; list_thread_items' field descriptions
+// say so (`threadRefFields`). get_thread_markdown is the exception: its
+// vote-visibility guard reads the thread once on EVERY reference
+// (`loadThreadForGuard`), so there the three cost the same and its
+// fields carry no cost hint (`markdownRefFields`) — a "+1 call" there
+// would send a model on a wasted lookup for a `topic_id` it does not
+// need.
 
 const threadRefFields = {
   discussion_id: idOrKey
     .optional()
     .describe("Discussion id or short key (+1 call); prefer `topic_id`."),
-  poll_id: idOrKey.optional().describe("Poll id or short key of a STANDALONE poll (+1 call)."),
+  poll_id: idOrKey.optional().describe("Poll id or short key (+1 call)."),
   topic_id: positiveId
     .optional()
     .describe("Thread id (`topic_id` on any thread row, NOT `id`); no extra call."),
+};
+
+/** get_thread_markdown's references: the same three, every one costing the guard's single read. */
+const markdownRefFields = {
+  discussion_id: idOrKey.optional().describe("Discussion id or short key."),
+  poll_id: idOrKey.optional().describe("Poll id or short key."),
+  topic_id: positiveId.optional().describe("Thread id (`topic_id` on any thread row, NOT `id`)."),
 };
 
 export type ThreadRef = {
@@ -231,11 +309,13 @@ function notFound(what: "discussion" | "poll", id: string | number): LoomioApiEr
  * Resolve a thread reference to its `topic_id`, spending one call for a
  * discussion or poll reference and none for a topic id. The record read
  * along the way fills the header (type, key, title, group) so the tool
- * output can name the thread without a second lookup. Exported for
+ * output can name the thread without a second lookup — for a poll, from
+ * its thread's topic row (`showPollThread`), so a poll inside a
+ * discussion names that discussion. Exported for
  * `create_poll`, which needs a discussion's `topic_id` (Loomio's
  * PermittedParams has no `discussion_id` for polls) and its `group_id`
  * (to refuse a poll aimed at one group but attached to a thread of
- * another) — the same one compact GET, the same 404 wording.
+ * another) — the same one GET, the same 404 wording.
  *
  * `opts.lookupTopic` makes the topic_id path spend one call too:
  * `GET /b2/threads/{topic_id}?compact=1` (TopicSerializer carries
@@ -263,30 +343,8 @@ export async function resolveThread(
         calls: 0,
       };
     }
-    let body: ThreadsResponse;
-    try {
-      body = await loomioGet<ThreadsResponse>(`/b2/threads/${ref.topic_id}`, readParams("compact"));
-    } catch (err) {
-      rethrowThreadNotFound(err, ref.topic_id);
-    }
-    const topic = body.threads?.[0];
-    if (!topic) {
-      throw new LoomioApiError(
-        502,
-        `Loomio answered GET /b2/threads/${ref.topic_id} without a thread row; the response shape is ` +
-          "not the one Loomio 3.8.1 produces.",
-      );
-    }
-    const row = shapeThreadRow(topic, body);
-    const base = {
-      topic_id: ref.topic_id,
-      type: row.type,
-      id: row.id,
-      key: row.key,
-      title: row.title,
-      group_id: row.group_id,
-    };
-    return { header: { ...base, ...headerUrl(base) }, calls: 1 };
+    const { body, topic } = await showThread(ref.topic_id);
+    return { header: headerFromTopic(ref.topic_id, topic, body), calls: 1 };
   }
   if (ref.discussion_id !== undefined) {
     let body: DiscussionsResponse;
@@ -320,37 +378,66 @@ export async function resolveThread(
     return { header: { ...base, ...headerUrl(base) }, calls: 1 };
   }
   if (ref.poll_id !== undefined) {
-    let body: PollsResponse;
-    try {
-      body = await loomioGet<PollsResponse>(
-        `/b2/polls/${encodePathSegment(ref.poll_id)}`,
-        readParams("compact"),
-      );
-    } catch (err) {
-      if (err instanceof LoomioApiError && err.status === 404) throw notFound("poll", ref.poll_id);
-      throw err;
-    }
-    const p = body.polls?.[0];
-    if (!p || p.topic_id == null) {
-      throw new LoomioApiError(
-        502,
-        `Loomio answered GET /b2/polls/${ref.poll_id} without a poll carrying a topic_id; the response ` +
-          "shape is not the one Loomio 3.8.1 produces.",
-      );
-    }
-    const base = {
-      topic_id: p.topic_id,
-      type: "Poll" as const,
-      id: p.id,
-      key: p.key ?? null,
-      title: p.title ?? null,
-      group_id: p.group_id ?? null,
-    };
-    return { header: { ...base, ...headerUrl(base) }, calls: 1 };
+    const { header } = await showPollThread(ref.poll_id);
+    return { header, calls: 1 };
   }
   // The schema's refinement makes this unreachable; keep the throw so a
   // direct caller gets a message rather than an undefined path segment.
   throw new Error("list_thread_items: pass exactly one of discussion_id, poll_id or topic_id.");
+}
+
+/**
+ * GET /b2/polls/{id} with the `thread_guard` profile (`compact` minus
+ * `topic`): the poll, the TopicSerializer row of the thread it sits in
+ * and that row's fronting record (`discussions` / `polls`), plus the
+ * user's `my_stance` under `stances`. The header names the THREAD
+ * (`headerFromTopic`): for a poll inside a discussion that is the
+ * discussion, not the poll asked for. `compact` would drop the topic
+ * row, and before 0.0.16 list_thread_items built the header from the
+ * poll alone — labelling a discussion thread a Poll thread with the
+ * poll's `/p/` url, while get_thread_markdown named the discussion for
+ * the same reference. Falls back to the poll when no topic row arrives
+ * (a Loomio that sends none). Shared by `resolveThread` and the
+ * Markdown guard's read, so both tools say the same thing for one
+ * `poll_id`; one call either way.
+ */
+async function showPollThread(pollRef: string | number): Promise<{
+  body: PollsResponse;
+  topic: LoomioTopic | undefined;
+  header: ThreadHeader;
+}> {
+  let body: PollsResponse;
+  try {
+    body = await loomioGet<PollsResponse>(
+      `/b2/polls/${encodePathSegment(pollRef)}`,
+      readParams("thread_guard"),
+    );
+  } catch (err) {
+    if (err instanceof LoomioApiError && err.status === 404) throw notFound("poll", pollRef);
+    throw err;
+  }
+  const p = requestedPoll(body.polls ?? [], pollRef);
+  if (!p || p.topic_id == null) {
+    throw new LoomioApiError(
+      502,
+      `Loomio answered GET /b2/polls/${pollRef} without a poll carrying a topic_id; the response ` +
+        "shape is not the one Loomio 3.8.1 produces.",
+    );
+  }
+  const topic = (body.topics ?? []).find((t) => t.id === p.topic_id);
+  const base = {
+    topic_id: p.topic_id,
+    type: "Poll" as const,
+    id: p.id,
+    key: p.key ?? null,
+    title: p.title ?? null,
+    group_id: p.group_id ?? null,
+  };
+  return {
+    body,
+    topic,
+    header: topic ? headerFromTopic(p.topic_id, topic, body) : { ...base, ...headerUrl(base) },
+  };
 }
 
 const THREAD_NOT_VISIBLE =
@@ -384,16 +471,34 @@ const ITEM_FIELDS = [
   "itemable_id",
 ] as const;
 
-export type ShapedThreadItem = Pick<LoomioTopicItem, (typeof ITEM_FIELDS)[number]> & {
-  /** Only when the item is pinned with a title. */
-  pinned_title?: string;
-};
+export type ShapedThreadItem = Pick<LoomioTopicItem, (typeof ITEM_FIELDS)[number]> &
+  Record<string, unknown> & {
+    /** Only when the item is pinned with a title. */
+    pinned_title?: string;
+    /** Loomio 3.11+: the editor's note on a `discussion_edited` / `poll_edited` item, when one was written. */
+    change_note?: string;
+  };
 
-/** One item minus its internals (`position_key`, `topic_id`, the redundant `itemable` pointer). */
-export function shapeThreadItem(item: LoomioTopicItem): ShapedThreadItem {
+/**
+ * One item minus its internals (`position_key`, `topic_id`, the
+ * redundant `itemable` pointer). `change_note` (Loomio 3.11+,
+ * 56ca88d8e: the edit note an editor typed, plain text) rides along
+ * when non-empty, capped by `body_max_chars` with the usual
+ * `change_note_truncated` / `_chars` / `_omitted` flags. Not surfaced:
+ * `reply_parent_id` (3.11+, a TopicItem id for a reply nested past the
+ * thread's max depth) — the comment's own `parent_id` / `parent_type`
+ * already name the real parent — and the per-item `tags` (3.13+).
+ */
+export function shapeThreadItem(
+  item: LoomioTopicItem,
+  bodyMaxChars = DEFAULT_BODY_MAX_CHARS,
+): ShapedThreadItem {
   const out: ShapedThreadItem = pick(item, ITEM_FIELDS);
   if (item.pinned && typeof item.pinned_title === "string" && item.pinned_title !== "") {
     out.pinned_title = item.pinned_title;
+  }
+  if (typeof item.change_note === "string" && item.change_note !== "") {
+    return truncateField({ ...out, change_note: item.change_note }, "change_note", bodyMaxChars);
   }
   return out;
 }
@@ -451,6 +556,10 @@ export function shapeComment(
  * `poll_option`); when it is missing for a poll the map is rebuilt from
  * the record's own `poll_option_ids` / `poll_option_names`, which the
  * serializer emits from the same priority-ordered association.
+ *
+ * `weighted_voting` (3.10+) says the tallies and every stance's `weight`
+ * are in vote-weight units; `voting_system` is gone (Loomio ≤ 3.9 only,
+ * 917b2c2e4 removed it). `total_score` is a decimal string since 3.10.
  */
 const ITEM_POLL_FIELDS = [
   "id",
@@ -466,7 +575,7 @@ const ITEM_POLL_FIELDS = [
   "discarded_at",
   "hide_results",
   "anonymous",
-  "voting_system",
+  "weighted_voting",
   "specified_voters_only",
   "voters_count",
   "decided_voters_count",
@@ -542,14 +651,25 @@ const STANCE_FIELDS = [
 ] as const;
 
 export type ShapedStance = Pick<LoomioStance, (typeof STANCE_FIELDS)[number]> &
-  Record<string, unknown>;
+  Record<string, unknown> & {
+    /** The voter's vote weight (decimal string), on a `weighted_voting` poll only. */
+    weight?: string;
+  };
 
+/**
+ * `weighted` is the stance's poll's `weighted_voting`: StanceSerializer
+ * sends `weight` on EVERY stance since 3.10 ("1" on an ordinary poll),
+ * so it is kept only where it changes what a vote counts for and an
+ * unweighted thread pays no bytes for it. It is the voter's weight, not
+ * their choice, so the results gate does not touch it.
+ */
 export function shapeStance(
   stance: LoomioStance,
   visibility: ResultsVisibility,
   bodyMaxChars: number,
   ownUserId: number | undefined,
   stripHtml = false,
+  weighted = false,
 ): ShapedStance {
   // `stripHiddenStanceResults` types its result with `Omit`, which over a
   // record carrying an index signature (every Loomio type does) collapses
@@ -558,6 +678,7 @@ export function shapeStance(
   // A hidden stance has no `reason` left for `stripBodyHtml` to touch.
   const stripped = stripHiddenStanceResults(stance, visibility, { ownUserId }) as LoomioStance;
   const picked: ShapedStance = pick(stripped, STANCE_FIELDS);
+  if (weighted && typeof stance.weight === "string") picked.weight = stance.weight;
   const text = stripHtml ? stripBodyHtml(picked, "reason", "reason_format") : picked;
   return truncateBody(text, "reason", bodyMaxChars, "reason_format");
 }
@@ -632,11 +753,19 @@ export function filterKinds(
  * The thread's own record, from the items response: the item at
  * sequence 0 (`new_discussion`, or the `poll_created` of a standalone
  * poll) points at it. Fills whatever the header does not know yet.
+ *
+ * ONLY the sequence-0 item, never "the first item": on a page that
+ * starts further in (an `offset` on Loomio ≥ 3.11.1, which pages this
+ * route) the first item can be the `poll_created` of a poll INSIDE a
+ * discussion, and taking it would label the discussion a Poll thread.
+ * A continuation addressed by bare `topic_id` therefore keeps `type`,
+ * `id`, `key` and `title` null — they were on the page at offset 0 —
+ * rather than spend a call to learn them.
  */
 function completeHeader(header: ThreadHeader, body: ThreadItemsResponse): ThreadHeader {
   if (header.type && header.id != null) return header;
   const items = body.items ?? [];
-  const root = items.find((i) => i.sequence_id === 0) ?? items[0];
+  const root = items.find((i) => i.sequence_id === 0);
   if (!root) return header;
   const type = root.itemable_type;
   const base = { ...header };
@@ -725,9 +854,9 @@ export interface ListThreadItemsResult extends ThreadHeader {
   users: SlimUser[];
   /** Present only when `include_reactions` was requested. */
   reactions?: ShapedReaction[];
-  /** Loomio's `meta.total`: every item in the thread, before the kinds filter and the slice. */
+  /** Loomio's `meta.total`: every item in the thread, before the kinds filter and the window. */
   total: number;
-  /** Items that passed the kinds filter (= `total` without a filter). */
+  /** Items that passed the kinds filter (= `total` without a filter; with one, counted over the items scanned). */
   matched: number;
   returned: number;
   /** True when `max_total_chars` stopped the slice before `limit` did. */
@@ -746,8 +875,27 @@ export interface ListThreadItemsResult extends ThreadHeader {
     body_max_chars: number;
     /** True when HTML bodies / reasons / statements were converted to text (their `*_format` says "text"). */
     strip_html: boolean;
-    /** Upstream requests this call made: 1, or 2 when a discussion_id / poll_id had to be resolved. */
+    /**
+     * Upstream requests this call made: the reference's resolution (0 by
+     * `topic_id`, 1 by `discussion_id` / `poll_id`) plus the item
+     * requests — one per 500 items of the window without `kinds` (at
+     * most 2), one per 500 items of the thread with it (at most
+     * `MAX_ITEM_SCAN_PAGES`), and always exactly one when Loomio returned
+     * the whole thread at once (`server_paged: false`).
+     */
     upstream_calls: number;
+    /**
+     * False ONLY when the connector detected that Loomio ignored `limit`
+     * / `offset` and returned the whole thread (Loomio < 3.11.1), which it
+     * then sliced itself. A pre-3.11.1 reply that happens to fit the
+     * window at offset 0 (say 120 items under `limit: 200`) cannot be told
+     * from a bounded page and reports true; the items, `total` and
+     * `next_offset` are right either way, only this flag cannot say which
+     * server answered.
+     */
+    server_paged: boolean;
+    /** With `kinds`: present (true) when the whole-thread scan hit `MAX_ITEM_SCAN_PAGES` — `matched` counts the scanned items only. */
+    scan_truncated?: true;
     /** The `exclude_types` profile sent with the items request (see src/loomio/client.ts). */
     profile: "compact" | "items_known_thread" | "items_with_reactions";
     /** True when the connector could recognise its own stances (poll results gated exactly); false = it assumed "not voted". */
@@ -757,15 +905,22 @@ export interface ListThreadItemsResult extends ThreadHeader {
 }
 
 const ITEMS_SCOPE_NOTE =
-  "Every item of the thread was fetched once (Loomio's items route is unpaginated) and sliced here; " +
-  "comments, polls, stances, outcomes and users are those the returned items reference. The slice " +
-  "also stops when the reply would exceed max_total_chars (truncated_by_budget: true; continue at " +
-  "next_offset). Poll " +
+  "Loomio 3.11.1+ pages a thread's items (thread order, at most 500 per request, meta.total = the " +
+  "whole thread): the connector asks for exactly the offset/limit window, and with kinds reads the " +
+  "thread page by page from the start to filter it. Older Loomio returns the whole thread, which is " +
+  "sliced here (server_paged: false when that was detected). Comments, polls, stances, outcomes and " +
+  "users are those the returned items reference. The window also stops when the reply would exceed " +
+  "max_total_chars (truncated_by_budget: true; continue at next_offset). Poll " +
   "results and other voters' choices are hidden where the poll's hide_results setting hides them " +
   "from a member who has not voted (results_visible / results_hidden_reason on each poll). A " +
   "stance's option_scores is keyed by poll_option ID — resolve the keys through the poll's " +
   "poll_options[] {id, name}; stance_counts[i] is the tally of poll_options[i]. Anonymous polls " +
-  "carry participant_id null on every stance — do not try to infer voters.";
+  "have no stances here at all (Loomio's b2 API does not serialize their ballots) — do not try to " +
+  "infer voters.";
+
+const ITEMS_HEADER_UNKNOWN_NOTE =
+  " The thread's type, id, key and title are null: they come from its opening item, which is not " +
+  "in this window (they were on the page at offset 0).";
 
 /**
  * What a caller that already holds the thread's fronting record can pass
@@ -815,28 +970,47 @@ export async function listThreadItems(
     : headerKnown
       ? "items_known_thread"
       : "compact";
-  let body: ThreadItemsResponse;
-  try {
-    body = await loomioGet<ThreadItemsResponse>(
-      `/b2/threads/${resolved.topic_id}/items`,
-      readParams(profile),
-    );
-  } catch (err) {
-    rethrowThreadNotFound(err, resolved.topic_id);
-  }
-  const header = completeHeader(resolved, body);
+  const path = `/b2/threads/${resolved.topic_id}/items`;
+  const kinds = input.kinds?.length ? input.kinds : undefined;
+  const fail = (err: unknown): never => rethrowThreadNotFound(err, resolved.topic_id);
 
-  const all = Array.isArray(body.items) ? body.items : [];
-  const matched = filterKinds(all, input.kinds);
-  const page = matched.slice(offset, offset + limit);
-
-  // Visibility per poll, computed over EVERY stance in the response
-  // (the user's own may sit outside the slice) with the identity the
-  // health probe learned; unknown identity ⇒ "not voted" ⇒ hide.
+  // Side-loads, merged page by page with the rule `mergePageBodies`
+  // applies (first arrival wins): a bounded page carries only what its
+  // OWN items reference, so the record a page-2 item points at is looked
+  // up in everything read so far. Visibility per poll is decided when the
+  // poll first arrives, over every stance read so far, with the identity
+  // the health probe learned — PollSerializer side-loads the user's
+  // `my_stance` beside the poll on every page that serialises it, so the
+  // own stance is in by then even when its item sits outside the window.
+  // Unknown identity ⇒ "not voted" ⇒ hide.
   const ownUserId = cachedOwnUserId();
+  const roots = {
+    comments: new Map<number, LoomioComment>(),
+    polls: new Map<number, LoomioPoll>(),
+    stances: new Map<number, LoomioStance>(),
+    outcomes: new Map<number, LoomioOutcome>(),
+  };
+  const users = new Map<number, LoomioUser>();
+  const pollOptions = new Map<number, LoomioPollOption>();
+  const reactions = new Map<number, ShapedReaction>();
   const visibility = new Map<number, ResultsVisibility>();
-  for (const p of body.polls ?? []) {
-    visibility.set(p.id, pollResultsVisible(p, ownStanceFor(p.id, body.stances, { ownUserId })));
+  function absorb(page: ThreadItemsResponse): void {
+    addNew(roots.comments, page.comments);
+    addNew(roots.polls, page.polls);
+    addNew(roots.stances, page.stances);
+    addNew(roots.outcomes, page.outcomes);
+    addNew(users, page.users);
+    addNew(pollOptions, page.poll_options);
+    for (const raw of Array.isArray(page.reactions) ? page.reactions : []) {
+      const r = shapeReaction(raw);
+      if (r && !reactions.has(r.id)) reactions.set(r.id, r);
+    }
+    const stances = [...roots.stances.values()];
+    for (const p of page.polls ?? []) {
+      if (visibility.has(p.id)) continue;
+      const poll = roots.polls.get(p.id) ?? p;
+      visibility.set(p.id, pollResultsVisible(poll, ownStanceFor(p.id, stances, { ownUserId })));
+    }
   }
   // A stance whose poll is not in the response cannot be judged; Loomio
   // only emits its scores when results_available?, but until_vote is
@@ -849,16 +1023,10 @@ export async function listThreadItems(
   // costs its own row plus the record it points at and, for a stance or
   // outcome, the poll it belongs to when that poll is not in yet (the
   // vote must be readable even when the poll_created item is outside
-  // the slice). Each record enters once however many items point at it.
+  // the window). Each record enters once however many items point at it.
   // The walk stops BEFORE the item that would overrun `budget` — never
   // before the first, so a single oversized comment (already capped by
   // body_max_chars) is returned rather than nothing.
-  const roots = {
-    comments: indexById(body.comments),
-    polls: indexById(body.polls),
-    stances: indexById(body.stances),
-    outcomes: indexById(body.outcomes),
-  };
   const items: ShapedThreadItem[] = [];
   const shaped = {
     comments: [] as ShapedComment[],
@@ -894,53 +1062,137 @@ export async function listThreadItems(
   }
   const pendingPoll = (pollId: number): Pending | undefined =>
     pending<LoomioPoll, ShapedItemPoll>("polls", pollId, (p) =>
-      shapeItemPoll(p, visibilityOf(p.id), bodyMax, body.poll_options),
+      shapeItemPoll(p, visibilityOf(p.id), bodyMax, [...pollOptions.values()]),
     );
 
   let used = 0;
   let cut = false;
-  for (const item of page) {
-    const row = shapeThreadItem(item);
-    const adds: Pending[] = [];
-    const id = item.itemable_id;
-    if (id != null) {
-      if (item.itemable_type === "Comment") {
-        const c = pending<LoomioComment, ShapedComment>("comments", id, (raw) =>
-          shapeComment(raw, bodyMax, stripHtml),
-        );
-        if (c) adds.push(c);
-      } else if (item.itemable_type === "Poll") {
-        const p = pendingPoll(id);
-        if (p) adds.push(p);
-      } else if (item.itemable_type === "Stance") {
-        const st = roots.stances.get(id);
-        const sp = pending<LoomioStance, ShapedStance>("stances", id, (raw) =>
-          shapeStance(raw, visibilityOf(raw.poll_id), bodyMax, ownUserId, stripHtml),
-        );
-        if (sp) adds.push(sp);
-        const p = st ? pendingPoll(st.poll_id) : undefined;
-        if (p) adds.push(p);
-      } else if (item.itemable_type === "Outcome") {
-        const o = roots.outcomes.get(id);
-        const op = pending<LoomioOutcome, ShapedOutcome>("outcomes", id, (raw) =>
-          shapeOutcome(raw, bodyMax, stripHtml),
-        );
-        if (op) adds.push(op);
-        const p = o ? pendingPoll(o.poll_id) : undefined;
-        if (p) adds.push(p);
+  /** Shape `window`'s items in order under the reply budget; sets `cut` when the budget stops it. */
+  function walk(window: readonly LoomioTopicItem[]): void {
+    for (const item of window) {
+      const row = shapeThreadItem(item, bodyMax);
+      const adds: Pending[] = [];
+      const id = item.itemable_id;
+      if (id != null) {
+        if (item.itemable_type === "Comment") {
+          const c = pending<LoomioComment, ShapedComment>("comments", id, (raw) =>
+            shapeComment(raw, bodyMax, stripHtml),
+          );
+          if (c) adds.push(c);
+        } else if (item.itemable_type === "Poll") {
+          const p = pendingPoll(id);
+          if (p) adds.push(p);
+        } else if (item.itemable_type === "Stance") {
+          const st = roots.stances.get(id);
+          const sp = pending<LoomioStance, ShapedStance>("stances", id, (raw) =>
+            shapeStance(
+              raw,
+              visibilityOf(raw.poll_id),
+              bodyMax,
+              ownUserId,
+              stripHtml,
+              roots.polls.get(raw.poll_id)?.weighted_voting === true,
+            ),
+          );
+          if (sp) adds.push(sp);
+          const p = st ? pendingPoll(st.poll_id) : undefined;
+          if (p) adds.push(p);
+        } else if (item.itemable_type === "Outcome") {
+          const o = roots.outcomes.get(id);
+          const op = pending<LoomioOutcome, ShapedOutcome>("outcomes", id, (raw) =>
+            shapeOutcome(raw, bodyMax, stripHtml),
+          );
+          if (op) adds.push(op);
+          const p = o ? pendingPoll(o.poll_id) : undefined;
+          if (p) adds.push(p);
+        }
       }
+      const cost = size(row) + adds.reduce((sum, a) => sum + a.cost, 0);
+      if (budget >= 0 && items.length > 0 && used + cost > budget) {
+        cut = true;
+        return;
+      }
+      used += cost;
+      items.push(row);
+      for (const a of adds) a.add();
     }
-    const cost = size(row) + adds.reduce((sum, a) => sum + a.cost, 0);
-    if (budget >= 0 && items.length > 0 && used + cost > budget) {
-      cut = true;
-      break;
-    }
-    used += cost;
-    items.push(row);
-    for (const a of adds) a.add();
   }
 
-  const users = indexById(body.users);
+  let header = resolved;
+  let state: PagerState;
+  let total: number;
+  let matched: number;
+  let nextOffset: number | null;
+  let scanned = 0;
+  if (kinds) {
+    // `kinds` is the connector's filter, not Loomio's, so `offset` /
+    // `limit` are positions in the FILTERED list and no upstream window
+    // can stand for them: the thread is read from item 0, page by page,
+    // up to MAX_ITEM_SCAN_PAGES — and a scan the cap stopped says so.
+    const all = await loomioGetAllPages<ThreadItemsResponse>(path, readParams(profile), {
+      root: "items",
+      maxPages: MAX_ITEM_SCAN_PAGES,
+    }).catch(fail);
+    state = all.state;
+    absorb(all.body);
+    header = completeHeader(header, all.body);
+    const thread = Array.isArray(all.body.items) ? all.body.items : [];
+    scanned = thread.length;
+    const kept = filterKinds(thread, kinds);
+    walk(kept.slice(offset, offset + limit));
+    total = state.total ?? thread.length;
+    matched = kept.length;
+    nextOffset = offset + items.length < kept.length ? offset + items.length : null;
+  } else {
+    // The caller's window IS the upstream window: page 1 asks for
+    // min(limit, 500) items at `offset`; page 2 is fetched only when
+    // page 1 went into the reply whole (no budget cut), still short of
+    // `limit`, and Loomio has more — so a budget-cut call never pays for
+    // items it would not return.
+    const pager = loomioPager<ThreadItemsResponse>(path, readParams(profile), {
+      root: "items",
+      offset,
+      want: limit,
+      pageSize: B2_PAGE_MAX,
+      maxPages: Math.ceil(MAX_ITEMS_LIMIT / B2_PAGE_MAX),
+    });
+    state = pager.state;
+    const first: ThreadItemsResponse = (await pager.next().catch(fail)) ?? {};
+    absorb(first);
+    header = completeHeader(header, first);
+    const rows = Array.isArray(first.items) ? first.items : [];
+    let received = rows.length;
+    if (state.legacy) {
+      // Loomio < 3.11.1: the whole thread from item 0. Slice it here.
+      walk(rows.slice(offset, offset + limit));
+    } else {
+      walk(rows);
+      if (!cut && items.length < limit && !state.done) {
+        const second = await pager.next().catch(fail);
+        if (second) {
+          absorb(second);
+          header = completeHeader(header, second);
+          const more = Array.isArray(second.items) ? second.items : [];
+          received += more.length;
+          walk(more);
+        }
+      }
+    }
+    // Loomio always sends meta.total on this route; the fallbacks are a
+    // lower bound and a "the last page was full, so ask again" guess.
+    total = state.total ?? (state.legacy ? received : offset + received);
+    matched = total;
+    const at = offset + items.length;
+    nextOffset =
+      state.total !== null || state.legacy
+        ? at < total
+          ? at
+          : null
+        : cut || state.lastPageFull
+          ? at
+          : null;
+  }
+
   const wantUsers = new Set<number>();
   for (const item of items) if (item.actor_id != null) wantUsers.add(item.actor_id);
   for (const c of included.comments.values()) if (c.author_id != null) wantUsers.add(c.author_id);
@@ -949,6 +1201,14 @@ export async function listThreadItems(
   for (const s of included.stances.values()) {
     if (s.participant_id != null) wantUsers.add(s.participant_id);
   }
+
+  let note = ITEMS_SCOPE_NOTE;
+  if (kinds && state.capped) {
+    note +=
+      ` Only the first ${scanned} items of the thread were scanned for kinds (scan_truncated): ` +
+      `matched and next_offset cover those; read later items without kinds, from offset ${scanned}.`;
+  }
+  if (header.type === null && header.id === null) note += ITEMS_HEADER_UNKNOWN_NOTE;
 
   const returned = items.length;
   const result: ListThreadItemsResult = {
@@ -959,24 +1219,26 @@ export async function listThreadItems(
     stances: shaped.stances,
     outcomes: shaped.outcomes,
     users: slimUsers([...wantUsers].flatMap((id) => users.get(id) ?? [])),
-    total: typeof body.meta?.total === "number" ? body.meta.total : all.length,
-    matched: matched.length,
+    total,
+    matched,
     returned,
     truncated_by_budget: cut,
-    next_offset: offset + returned < matched.length ? offset + returned : null,
+    next_offset: nextOffset,
     scope: {
       offset,
       limit,
       max_total_chars: budget,
       chars: used,
-      kinds: input.kinds?.length ? input.kinds : null,
+      kinds: kinds ?? null,
       include_reactions: includeReactions,
       body_max_chars: bodyMax,
       strip_html: stripHtml,
-      upstream_calls: calls + 1,
+      upstream_calls: calls + state.requests,
+      server_paged: !state.legacy,
+      ...(kinds && state.capped ? { scan_truncated: true as const } : {}),
       profile,
       own_user_known: ownUserId !== undefined,
-      note: ITEMS_SCOPE_NOTE,
+      note,
     },
   };
   if (includeReactions) {
@@ -986,18 +1248,26 @@ export async function listThreadItems(
     for (const id of included.outcomes.keys()) reactable.add(`Outcome:${id}`);
     for (const id of included.polls.keys()) reactable.add(`Poll:${id}`);
     if (header.type === "Discussion" && header.id != null) reactable.add(`Discussion:${header.id}`);
-    result.reactions = (Array.isArray(body.reactions) ? body.reactions : [])
-      .flatMap((r) => shapeReaction(r) ?? [])
-      .filter((r) => reactable.has(`${r.reactable_type}:${r.reactable_id}`));
+    result.reactions = [...reactions.values()].filter((r) =>
+      reactable.has(`${r.reactable_type}:${r.reactable_id}`),
+    );
   }
   return result;
+}
+
+/** Add `rows` to `into` by id, keeping the first arrival (the `mergePageBodies` rule). */
+function addNew<R extends { id: number }>(
+  into: Map<number, R>,
+  rows: readonly R[] | undefined,
+): void {
+  for (const row of rows ?? []) if (!into.has(row.id)) into.set(row.id, row);
 }
 
 // ── get_thread_markdown ─────────────────────────────────────────────────────
 
 export const getThreadMarkdownSchema = z
   .object({
-    ...threadRefFields,
+    ...markdownRefFields,
     max_chars: z
       .number()
       .int()
@@ -1021,21 +1291,62 @@ export const getThreadMarkdownSchema = z
 export type GetThreadMarkdownInput = z.infer<typeof getThreadMarkdownSchema>;
 
 export interface GetThreadMarkdownResult extends ThreadHeader {
-  /** The document's `# …` title line (Loomio: "Discussion: <title> · <author> <date>"), locale-dependent wording. */
+  /**
+   * The document's `# …` title line without the `# `. Loomio ≥ 3.10:
+   * "<Type>: <title> · <author> · <YYYY-MM-DD HH:MM>" (UTC); older
+   * releases put no separator before the date. The type word follows the
+   * connector user's locale.
+   */
   heading: string | null;
   markdown: string;
   /** Length of the FULL document in characters. */
   chars: number;
   truncated: boolean;
-  scope: { max_chars: number; upstream_calls: number; note: string };
+  scope: {
+    max_chars: number;
+    /**
+     * Upstream requests: the guard's one read of the thread (any
+     * reference), plus one per 500 items when the guard scanned the
+     * thread's items (any thread holding more than its opening item),
+     * plus the document itself. On Loomio 3.8 / 3.9 (guard skipped): the
+     * read and the document, plus 2 when a stale health probe had to be
+     * refreshed to confirm the version.
+     */
+    upstream_calls: number;
+    /**
+     * Open polls (opened, not closed, not discarded) whose vote
+     * visibility the guard checked before fetching the document: every
+     * open poll the items scan found, or — when the thread holds only its
+     * opening item — 1 for an open standalone poll and 0 otherwise. 0
+     * when the guard was skipped.
+     */
+    open_polls_checked: number;
+    /**
+     * Present only when the guard was skipped: a health probe within the
+     * last minute reported Loomio 3.8 / 3.9, whose export still applies
+     * 'hide results until vote' per reader (thread_markdown_service.rb:
+     * 168-172 before df28cf845).
+     */
+    guard_skipped_pre_3_10?: true;
+    note: string;
+  };
 }
 
 const MARKDOWN_SCOPE_NOTE =
-  "Rendered by Loomio (ThreadMarkdownService): YAML front matter (group, created, last_activity, " +
-  "tags), the thread title and body, then every comment, poll (options, status, and either a results " +
-  "table or a 'hidden until…' line — Loomio applies the poll's hide_results rule for the connector's " +
-  "user itself), vote and outcome in thread order, headings carrying author and UTC timestamp. " +
-  "Discarded items are omitted; anonymous votes never name the voter.";
+  "Rendered by Loomio (ThreadMarkdownService, 3.10+ layout): YAML front matter (key, url, group, " +
+  "created, last_activity, tags = the union over every tagged contribution, and on 3.13+ root_tags " +
+  "= the opening post's own), the title line `<Type>: <title> · <author> · <UTC time>`, the opening " +
+  "body, then the activity as a reply tree of nested blockquotes: each poll is a `##` section " +
+  "(status, options, results table or a 'hidden until…' line) with its votes and their replies " +
+  "beneath; each item is headed `**Author** · <UTC time> · #<seq>` (seq = list_thread_items' " +
+  "sequence_id), with reactions inline and `Tags:` lines. Removed items stay as `_Removed_` " +
+  "placeholders that keep their replies. Superseded, removed and undecided votes are listed; an " +
+  "open poll hiding results until it closes shows `voted` without the choice. Loomio 3.10+'s " +
+  "export ignores hide_results 'until_vote', so the connector checks the thread first and REFUSES " +
+  "one holding an open until_vote poll its user has not voted in (open_polls_checked counts the " +
+  "open polls it checked; the check is skipped, guard_skipped_pre_3_10, when a recent health " +
+  "probe reports Loomio 3.8 / 3.9, whose export applies the rule itself). Anonymous polls never " +
+  "name a voter.";
 
 /** The first Markdown H1 after the front matter, without its `# `. */
 export function markdownHeading(markdown: string): string | null {
@@ -1043,11 +1354,346 @@ export function markdownHeading(markdown: string): string | null {
   return m?.[1]?.trim() || null;
 }
 
+// ── The vote-visibility guard ───────────────────────────────────────────────
+//
+// Loomio ≥ 3.10 renders an open `until_vote` poll's votes and results
+// table into the Markdown for a reader who has not voted (module note;
+// src/loomio/visibility.ts). The JSON tools withhold exactly that, so
+// get_thread_markdown checks the thread FIRST and refuses
+// (`VisibilityRefusalError`) instead of fetching a document it would
+// have to redact — redacting Loomio's localised Markdown is not
+// attempted. One read per reference, which also fills the header on
+// every path (`loadThreadForGuard`):
+//
+//   topic_id       GET /b2/threads/{id}?compact=1: the topic row, the
+//                  fronting record and, on a Poll topic, that poll with
+//                  the user's `my_stance` under `stances`.
+//   discussion_id  GET /b2/discussions/{id} with `thread_guard` (compact
+//                  minus `topic`), so the `topics` row comes along.
+//   poll_id        GET /b2/polls/{id}, same profile (`showPollThread`):
+//                  the poll, the topic row of its thread (the
+//                  discussion's, for a poll inside one) and `my_stance`.
+//
+// What the export prints is decided by the thread's ITEMS, not by a
+// counter: ThreadMarkdownService#activity_items
+// (thread_markdown_service.rb:81-92) renders `topic.items` of the
+// comment / poll / vote / outcome kinds and keeps a poll item when it is
+// that poll's `created_topic_item` — an association not scoped to the
+// topic (has_topic_items.rb:7-17). So, from the read (`guardVerdict`):
+//
+//   1. Every poll the read side-loaded (a Poll topic's fronting poll, the
+//      poll a poll_id named) carries the user's `my_stance`
+//      (PollSerializer): one hiding its results from the user is final —
+//      refuse, no scan.
+//   2. A Poll topic whose fronting poll F (the `polls` row whose id is
+//      the topic's `topicable_id`; on the poll_id path not necessarily
+//      the poll asked for) did not arrive → scan.
+//   3. `items_count` ≤ 1 → allow, nothing else to read. The thread holds
+//      its opening item only: a discussion's `new_discussion`, or F's own
+//      `poll_created`, which the export replaces by the overview step 1
+//      cleared. `items_count` counts the topic's sequenced items
+//      (topic.rb:239-246), refreshed on every item create and destroy
+//      (topic_item.rb:25-27) and by the repair a move ends with.
+//   4. Anything else (a reply, a vote, an unknown topicable, no topic
+//      row) → scan.
+//
+// WHY not `active_polls_count`, which would skip the scan on most
+// threads (0 on a discussion; no more than F explains on a Poll topic):
+// it follows `polls.topic_id`, and nothing keeps that where the poll's
+// items are. b2 `PATCH /b2/polls/{id}` permits `topic_id`
+// (permitted_params.rb:39, polls_controller.rb `update`) for an admin of
+// both threads; `Poll#with_topic_lock` keeps that destination
+// (poll.rb:338-357) and `update_poll_counts` moves the count with it
+// (poll.rb:272, 312-331), but PollService.update moves no item
+// (poll_service.rb:75-140) — and Loomio's own client includes `topic_id`
+// in its poll saves, so a stale tab after a move does the same. The old
+// thread then reads `active_polls_count: 0` while its export still
+// prints the poll's section and every vote. The other direction — v1
+// `topics#move_comments` (routes.rb:341 → TopicItemService.move_comments
+// → MoveCommentsWorker) moving any selected `poll_created` items and
+// their polls into any topic the actor administers, Poll topics included
+// (move_comments_worker.rb:15-25, 38; ability/topic.rb:13-15) — raises
+// the target's `items_count`, so step 3 sends it to the scan too; the
+// thread show never side-loads a moved-in poll (TopicSerializer's
+// `has_one :poll` is the topicable only, topic_serializer.rb:37, 48-54).
+//
+// The scan reads the thread's items, up to `MAX_ITEM_SCAN_PAGES` pages
+// of 500, and checks every poll they side-load — a `poll_created` item
+// brings its poll, a stance or outcome item its poll, whatever the
+// poll's own `topic_id` — with the identity the health probe learned
+// (`cachedOwnUserId`; unknown ⇒ "not voted" ⇒ refuse). It stops at the
+// first page that shows a hidden poll: PollSerializer sends `my_stance`
+// beside the poll on every page that serialises it, so that verdict
+// cannot change later. It never stops early to ALLOW — no counter bounds
+// what the export prints (above) — and a scan its page cap stopped fails
+// CLOSED ("could not verify"). WHY a scan at all: the b2 polls index
+// lists standalone polls only (`records_visible_in_group`,
+// b2/base_controller.rb:21-32) and no b2 route lists a thread's polls.
+//
+// On Loomio 3.8 / 3.9, confirmed by a health probe within the last
+// minute, the whole guard is skipped (the read still fills the header):
+// that export applies 'until vote' per reader itself — see "Loomio 3.8 –
+// 3.9" below `guardThreadMarkdown`.
+
+/** What the guard's one read learned about the thread. */
+interface GuardRead {
+  header: ThreadHeader;
+  /** The thread's TopicSerializer row; undefined when Loomio sent none. */
+  topic: LoomioTopic | undefined;
+  /** The read's `polls` root. */
+  polls: readonly LoomioPoll[];
+  /** The read's `stances` root: on these shows, the user's `my_stance` rows only. */
+  stances: readonly LoomioStance[];
+  calls: number;
+}
+
+/** The header a TopicSerializer row names (`shapeThreadRow`), with `topic_id` set to the thread read. */
+function headerFromTopic(
+  topicId: number,
+  topic: LoomioTopic,
+  body: Pick<LoomioSideLoads, "discussions" | "polls">,
+): ThreadHeader {
+  const row = shapeThreadRow(topic, body);
+  const base = {
+    topic_id: topicId,
+    type: row.type,
+    id: row.id,
+    key: row.key,
+    title: row.title,
+    group_id: row.group_id,
+  };
+  return { ...base, ...headerUrl(base) };
+}
+
+/** GET /b2/threads/{topic_id}?compact=1 — the thread's own row, with the 404 reworded. */
+async function showThread(topicId: number): Promise<{ body: ThreadsResponse; topic: LoomioTopic }> {
+  let body: ThreadsResponse;
+  try {
+    body = await loomioGet<ThreadsResponse>(`/b2/threads/${topicId}`, readParams("compact"));
+  } catch (err) {
+    rethrowThreadNotFound(err, topicId);
+  }
+  const topic = body.threads?.[0];
+  if (!topic) {
+    throw new LoomioApiError(
+      502,
+      `Loomio answered GET /b2/threads/${topicId} without a thread row; the response shape is ` +
+        "not the one Loomio 3.8.1 produces.",
+    );
+  }
+  return { body, topic };
+}
+
+/** The requested poll in a poll show's `polls` root (which may also hold the thread's fronting poll). */
+function requestedPoll(polls: readonly LoomioPoll[], ref: string | number): LoomioPoll | undefined {
+  const byRef = polls.find((p) =>
+    typeof ref === "number" || /^\d+$/.test(ref) ? p.id === Number(ref) : p.key === ref,
+  );
+  return byRef ?? polls[0];
+}
+
+/** One read per reference, with the module's 404 wording (see the guard note). */
+async function loadThreadForGuard(ref: ThreadRef): Promise<GuardRead> {
+  if (ref.topic_id !== undefined) {
+    const { body, topic } = await showThread(ref.topic_id);
+    return {
+      header: headerFromTopic(ref.topic_id, topic, body),
+      topic,
+      polls: body.polls ?? [],
+      stances: body.stances ?? [],
+      calls: 1,
+    };
+  }
+  if (ref.discussion_id !== undefined) {
+    let body: DiscussionsResponse;
+    try {
+      body = await loomioGet<DiscussionsResponse>(
+        `/b2/discussions/${encodePathSegment(ref.discussion_id)}`,
+        readParams("thread_guard"),
+      );
+    } catch (err) {
+      if (err instanceof LoomioApiError && err.status === 404) {
+        throw notFound("discussion", ref.discussion_id);
+      }
+      throw err;
+    }
+    const d = body.discussions?.[0];
+    if (!d || d.topic_id == null) {
+      throw new LoomioApiError(
+        502,
+        `Loomio answered GET /b2/discussions/${ref.discussion_id} without a discussion carrying a ` +
+          "topic_id; the response shape is not the one Loomio 3.8.1 produces.",
+      );
+    }
+    const topic = (body.topics ?? []).find((t) => t.id === d.topic_id);
+    const base = {
+      topic_id: d.topic_id,
+      type: "Discussion" as const,
+      id: d.id,
+      key: d.key ?? null,
+      title: d.title ?? null,
+      group_id: d.group_id ?? null,
+    };
+    return {
+      header: topic ? headerFromTopic(d.topic_id, topic, body) : { ...base, ...headerUrl(base) },
+      topic,
+      polls: body.polls ?? [],
+      stances: body.stances ?? [],
+      calls: 1,
+    };
+  }
+  if (ref.poll_id !== undefined) {
+    const { body, topic, header } = await showPollThread(ref.poll_id);
+    return {
+      header,
+      topic,
+      polls: body.polls ?? [],
+      stances: body.stances ?? [],
+      calls: 1,
+    };
+  }
+  // The schema's refinement makes this unreachable (see resolveThread).
+  throw new Error("get_thread_markdown: pass exactly one of discussion_id, poll_id or topic_id.");
+}
+
+/** Loomio's `Poll.active` (poll.rb:213): kept, opened, not closed — what `active_polls_count` counts. */
+function isActivePoll(p: Pick<LoomioPoll, "opened_at" | "closed_at" | "discarded_at">): boolean {
+  return p.opened_at != null && p.closed_at == null && p.discarded_at == null;
+}
+
+type GuardVerdict =
+  | { kind: "allow"; checked: number }
+  | { kind: "refuse"; polls: LoomioPoll[] }
+  | { kind: "scan" };
+
+/** The decision the guard can make from its one read (steps 1-4 of the guard note). */
+function guardVerdict(read: GuardRead): GuardVerdict {
+  // 1. On these shows the `stances` root holds the user's `my_stance`
+  //    rows only, so `showRoot` reads it without an identity.
+  const hidden = read.polls.filter((p) =>
+    hiddenUntilVote(p, ownStanceFor(p.id, read.stances, { showRoot: true })),
+  );
+  if (hidden.length > 0) return { kind: "refuse", polls: hidden };
+  const topic = read.topic;
+  if (!topic) return { kind: "scan" };
+  // 2. The fronting poll is what the export's overview renders.
+  let front: LoomioPoll | undefined;
+  if (topic.topicable_type === "Poll") {
+    front = read.polls.find((p) => p.id === topic.topicable_id);
+    if (!front) return { kind: "scan" };
+  } else if (topic.topicable_type !== "Discussion") {
+    return { kind: "scan" };
+  }
+  // 3. The opening item alone: nothing the read has not already cleared.
+  if (typeof topic.items_count === "number" && topic.items_count <= 1) {
+    return { kind: "allow", checked: front && isActivePoll(front) ? 1 : 0 };
+  }
+  // 4.
+  return { kind: "scan" };
+}
+
+/**
+ * Refuse (throw `VisibilityRefusalError`) when the thread holds an open
+ * `until_vote` poll the connector's user has not voted in; otherwise
+ * return how many upstream calls the check cost beyond the read and how
+ * many open polls it checked.
+ */
+async function guardThreadMarkdown(read: GuardRead): Promise<{ calls: number; checked: number }> {
+  const topicId = read.header.topic_id;
+  const verdict = guardVerdict(read);
+  if (verdict.kind === "refuse") throw VisibilityRefusalError.untilVote(topicId, verdict.polls);
+  if (verdict.kind === "allow") return { calls: 0, checked: verdict.checked };
+
+  // Page by page, merging side-loads (each bounded page carries only what
+  // its own items reference) and refusing at the first page that shows a
+  // hidden poll — its `my_stance` came with it, so later pages cannot
+  // change that verdict. Allowing needs the whole thread (guard note).
+  // The polls the read already cleared are not judged again: the read's
+  // `stances` root is the user's own `my_stance` rows, which an items page
+  // mixes with every voter's, so re-judging them here would need the
+  // cached identity the read did not.
+  const cleared = new Set(read.polls.map((p) => p.id));
+  const pager = loomioPager<ThreadItemsResponse>(
+    `/b2/threads/${topicId}/items`,
+    readParams("items_known_thread"),
+    { root: "items", maxPages: MAX_ITEM_SCAN_PAGES },
+  );
+  const nextPage = () => pager.next().catch((err: unknown) => rethrowThreadNotFound(err, topicId));
+  const ownUserId = cachedOwnUserId();
+  const polls = new Map<number, LoomioPoll>();
+  const stances = new Map<number, LoomioStance>();
+  for (let page = await nextPage(); page !== undefined; page = await nextPage()) {
+    addNew(polls, page.polls);
+    addNew(stances, page.stances);
+    const seen = [...stances.values()];
+    const offending = [...polls.values()].filter(
+      (p) => !cleared.has(p.id) && hiddenUntilVote(p, ownStanceFor(p.id, seen, { ownUserId })),
+    );
+    if (offending.length > 0) throw VisibilityRefusalError.untilVote(topicId, offending);
+  }
+  if (pager.state.capped) {
+    throw VisibilityRefusalError.unverified(topicId, pager.state.rows, pager.state.total);
+  }
+  return { calls: pager.state.requests, checked: [...polls.values()].filter(isActivePoll).length };
+}
+
+// ── Loomio 3.8 – 3.9: the export applies 'until vote' itself ────────────────
+//
+// The leak the guard closes dates from 3.10.0 (df28cf845). Before it,
+// ThreadMarkdownService decided per reader: `poll_results_visible?` was
+// `poll.results_visible?(voted:)` with `voted = poll.stances.latest.
+// decided.exists?(participant_id: user.id)` (thread_markdown_service.rb:
+// 168-172 at v3.8.0 – v3.9.0), `poll_results` printed the "hidden until
+// voted" line instead of the table (:117) and `stance_visible?` (:144)
+// showed another voter's stance only when results were visible. So on
+// 3.8.x / 3.9.x the export withholds exactly what the JSON tools do, and
+// the guard would only refuse documents Loomio renders safely — and pay a
+// whole-thread read for it. It is skipped there, but ONLY on a version a
+// health probe reported within `HEALTH_CACHE_TTL_MS`: an instance
+// upgraded to 3.10+ since an old probe must never be exported unguarded.
+// A stale "3.8 / 3.9" is refreshed through `checkLoomioHealth()` (the
+// shared probe, GET /b2/groups + GET /v1/boot/version, at most once a
+// minute however many callers ask). An unknown, unparseable or ≥ 3.10
+// version — the case of any up-to-date instance — costs nothing and
+// keeps the guard: fail closed. Versions before 3.8, which the connector
+// does not serve, are not assumed either way.
+
+/** True for a Loomio version whose Markdown export still applies 'until vote' per reader (3.8.x, 3.9.x). */
+export function exportAppliesUntilVote(version: string | null | undefined): boolean {
+  const m = typeof version === "string" ? /^v?(\d+)\.(\d+)(?:\D|$)/.exec(version.trim()) : null;
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  return major === 3 && minor >= 8 && minor < 10;
+}
+
+/**
+ * Whether the guard can be skipped (see the note above), and how many
+ * upstream requests finding out cost: 0 from a fresh cached probe or a
+ * version that keeps the guard, 2 when a stale 3.8 / 3.9 verdict had to
+ * be re-probed.
+ */
+async function exportHonoursUntilVote(): Promise<{ honours: boolean; calls: number }> {
+  const cached = getCachedHealth();
+  if (!cached || !exportAppliesUntilVote(cached.loomio_version)) {
+    return { honours: false, calls: 0 };
+  }
+  if (cachedHealthAgeMs() < HEALTH_CACHE_TTL_MS) return { honours: true, calls: 0 };
+  const fresh = await checkLoomioHealth();
+  return {
+    honours: exportAppliesUntilVote(fresh.loomio_version),
+    calls: fresh === cached ? 0 : 2,
+  };
+}
+
 export async function getThreadMarkdown(
   input: GetThreadMarkdownInput,
 ): Promise<GetThreadMarkdownResult> {
   const max = input.max_chars ?? DEFAULT_MARKDOWN_MAX_CHARS;
-  const { header, calls } = await resolveThread(input);
+  const read = await loadThreadForGuard(input);
+  const header = read.header;
+  const legacy = await exportHonoursUntilVote();
+  const guard = legacy.honours ? { calls: 0, checked: 0 } : await guardThreadMarkdown(read);
   let body: { markdown?: unknown };
   try {
     body = await loomioGet<{ markdown?: unknown }>(`/b2/threads/${header.topic_id}/markdown`);
@@ -1068,7 +1714,13 @@ export async function getThreadMarkdown(
     markdown: text ?? "",
     chars,
     truncated,
-    scope: { max_chars: max, upstream_calls: calls + 1, note: MARKDOWN_SCOPE_NOTE },
+    scope: {
+      max_chars: max,
+      upstream_calls: read.calls + legacy.calls + guard.calls + 1,
+      open_polls_checked: guard.checked,
+      ...(legacy.honours ? { guard_skipped_pre_3_10: true as const } : {}),
+      note: MARKDOWN_SCOPE_NOTE,
+    },
   };
 }
 
@@ -1095,6 +1747,12 @@ export const listThreadsSchema = z.object({
 
 export type ListThreadsInput = z.infer<typeof listThreadsSchema>;
 
+/**
+ * The TopicSerializer fields a thread row carries. `members_count` and
+ * `closed_polls_count` arrive from Loomio ≤ 3.10 only (3.11.0 dropped
+ * them, 79280ee7a) and are kept for those servers; `has_tagged_replies`
+ * (3.13+) says `tags` is the union over every tagged contribution.
+ */
 const THREAD_ROW_FIELDS = [
   "items_count",
   "replies_count",
@@ -1102,6 +1760,7 @@ const THREAD_ROW_FIELDS = [
   "locked_at",
   "pinned_at",
   "tags",
+  "has_tagged_replies",
   "members_count",
   "active_polls_count",
   "closed_polls_count",
@@ -1162,8 +1821,16 @@ const THREADS_SINCE_NOTE =
   "last_activity_at were dropped and counted in undated_dropped; page further with offset until " +
   "exhausted is true.";
 
-/** One `threads[]` row joined with the discussion or poll it fronts. */
-export function shapeThreadRow(topic: LoomioTopic, body: ThreadsResponse): ThreadRow {
+/**
+ * One `threads[]` row joined with the discussion or poll it fronts —
+ * looked up in the response's `discussions` / `polls` roots, which a
+ * thread read and a discussion / poll show (with `topic` kept) both
+ * carry.
+ */
+export function shapeThreadRow(
+  topic: LoomioTopic,
+  body: Pick<LoomioSideLoads, "discussions" | "polls">,
+): ThreadRow {
   const type: ThreadType | null =
     topic.topicable_type === "Discussion" || topic.topicable_type === "Poll"
       ? topic.topicable_type

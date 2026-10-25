@@ -30,10 +30,16 @@ import {
   stripBodyHtml,
 } from "../src/loomio/shape.js";
 import type { LoomioGroup, LoomioTopic, LoomioUser } from "../src/loomio/types.js";
+import { BOARD } from "./fixtures.js";
 
 afterEach(() => delete process.env["LOOMIO_API_BASE_URL"]);
 
-/** A `topics[]` row as GET /b2/discussions side-loads it (TopicSerializer). */
+/**
+ * A `topics[]` row as GET /b2/discussions side-loads it (TopicSerializer),
+ * carrying EVERY join field: the ≤ 3.10 counters (`members_count`,
+ * `closed_polls_count`) beside 3.13's `has_tagged_replies`, so one row
+ * pins the whole TOPIC_JOIN_FIELDS list.
+ */
 const topic101: LoomioTopic = {
   id: 101,
   group_id: 7,
@@ -56,6 +62,7 @@ const topic101: LoomioTopic = {
   members_count: 42,
   anonymous_polls_count: 0,
   closed_polls_count: 2,
+  has_tagged_replies: true,
   seen_by_count: 17,
   tags: ["budget", "2026"],
   reader_volume_email: "normal",
@@ -86,6 +93,7 @@ describe("joinTopics", () => {
       locked_at: null,
       pinned_at: "2026-05-29T11:28:24.096Z",
       tags: ["budget", "2026"],
+      has_tagged_replies: true,
       members_count: 42,
       seen_by_count: 17,
       active_polls_count: 1,
@@ -205,6 +213,14 @@ describe("slimGroup / slimGroups", () => {
       polls_count: 9,
       enabled: true,
       parent_id: 2,
+    });
+  });
+
+  it("passes Loomio 3.11's `parent_members` privacy through verbatim (older Loomio said `closed`)", () => {
+    expect(slimGroup(BOARD)).toMatchObject({
+      id: 16,
+      group_privacy: "parent_members",
+      parent_id: 7,
     });
   });
 

@@ -17,9 +17,11 @@ import {
   discussionsListBody,
   EXAMPLE_ORG,
   LONG_HTML,
+  longThreadItems,
+  longThreadSideLoads,
   topicRow,
 } from "./fixtures.js";
-import { expectBearerAuth, mockFetch, setupLoomioTest } from "./test-helpers.js";
+import { expectBearerAuth, mockFetch, mockFetchPaged, setupLoomioTest } from "./test-helpers.js";
 
 vi.mock("undici", () => ({ fetch: vi.fn() }));
 setupLoomioTest();
@@ -81,14 +83,19 @@ describe("getDiscussion", () => {
       locked_at: null,
       pinned_at: "2026-05-29T11:28:24.096Z",
       tags: ["guide"],
-      members_count: 369,
+      has_tagged_replies: false,
       seen_by_count: 103,
       active_polls_count: 0,
-      closed_polls_count: 0,
       attachments_count: 1,
       url: "https://www.loomio.com/d/dscKEY01/budget-planning-for-2027",
     });
-    for (const f of TOPIC_JOIN_FIELDS) expect(r.discussion).toHaveProperty(f);
+    // Every join field Loomio 3.13 sends arrives; the two counters 3.11
+    // removed (79280ee7a) are simply absent — never a fake zero.
+    const removed = ["members_count", "closed_polls_count"];
+    for (const f of TOPIC_JOIN_FIELDS) {
+      if (removed.includes(f)) expect(r.discussion).not.toHaveProperty(f);
+      else expect(r.discussion).toHaveProperty(f);
+    }
     // … the reader-state and loading internals are not.
     for (const f of READER_FIELDS) expect(r.discussion).not.toHaveProperty(f);
     for (const f of ["attachments", "link_previews", "content_locale", "mentioned_usernames"]) {
@@ -226,6 +233,52 @@ describe("getDiscussion", () => {
     spy.mockRestore();
   });
 
+  // Loomio ≥ 3.11.1 pages the items route; the embedded list is the
+  // window [0, items_limit) requested upstream, one request per 500.
+  describe("include_items on Loomio's paged items route", () => {
+    function pagedItems(n: number) {
+      return mockFetchPaged({
+        "/b2/discussions/601": { status: 200, body: discussionShowBody() },
+        "/b2/threads/701/items": {
+          root: "items",
+          rows: longThreadItems(n),
+          sideLoads: longThreadSideLoads,
+          mode: "bounded",
+        },
+      });
+    }
+
+    it("sends limit and offset=0; the default items_limit costs 2 calls in all", async () => {
+      const calls = pagedItems(120);
+      const { getDiscussion } = await import("../src/tools/discussions.js");
+      const r = await getDiscussion({ id_or_key: 601, include_items: true });
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+      expect(calls.map((c) => [c.limit, c.offset])).toEqual([["200", "0"]]);
+      const items = r.thread_items as { returned: number; scope: { upstream_calls: number } };
+      expect(items.returned).toBe(120);
+      expect(items.scope.upstream_calls).toBe(1);
+    });
+
+    it("items_limit 1000 on a 1 200-item thread whose first 500 items fit the reply budget: 3 calls (discussion, 500@0, 500@500)", async () => {
+      const calls = pagedItems(1200);
+      const { getDiscussion } = await import("../src/tools/discussions.js");
+      const r = await getDiscussion({ id_or_key: 601, include_items: true, items_limit: 1000 });
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3);
+      expect(calls.map((c) => [c.limit, c.offset])).toEqual([
+        ["500", "0"],
+        ["500", "500"],
+      ]);
+      const items = r.thread_items as {
+        returned: number;
+        next_offset: number | null;
+        scope: { upstream_calls: number };
+      };
+      expect(items.returned).toBeGreaterThan(500);
+      expect(items.next_offset).toBe(items.returned);
+      expect(items.scope.upstream_calls).toBe(2);
+    });
+  });
+
   it("a record whose topic is missing from topics[] comes back without counters (no zeros invented)", async () => {
     mockFetch(200, discussionShowBody({ topics: [] }));
     const { getDiscussion } = await import("../src/tools/discussions.js");
@@ -343,7 +396,6 @@ describe("listDiscussions", () => {
       id: 602,
       items_count: 1,
       replies_count: 0,
-      members_count: 27,
       tags: [],
       url: "https://www.loomio.com/d/dscKEY02/how-to-nominate-a-candidate",
     });
