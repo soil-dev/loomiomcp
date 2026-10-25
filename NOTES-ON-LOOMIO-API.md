@@ -1244,7 +1244,26 @@ otherwise.
   "default and maximum page size 50"). The connector's schema stops at
   50.
 
-## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0 and captured 2026-10-24 on 3.13.1)
+## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0; reads, writes and the Markdown guard on 3.13.1 on 2026-10-24/25)
+
+**2026-10-25, Loomio 3.13.1, connector 0.0.16, non-admin key, sandbox group
+(`private_only`, `group_privacy: parent_members`).** Write round-trip
+13/13: `create_discussion` (nested body lands in the group) →
+`update_discussion` → `create_comment` (flat JSON, `parent_type:
+Discussion`) → `update_comment` → threaded reply (`parent_type: Comment`) →
+`delete_comment` → `create_poll` (proposal inside the thread, options
+title-cased by Loomio, `notify_on_open: false`) → `update_poll` →
+`list_thread_items` / `get_thread_markdown` → `delete_comment` /
+`delete_poll` / `delete_discussion` (soft-discard). `wrap_parameters false`
+(3.12) changed nothing for these bodies. Markdown guard, with real polls:
+an open in-thread `hide_results: until_vote` poll the connector's user had
+not voted in — `get_poll` and `list_thread_items` withhold its results,
+Loomio's own `GET /b2/threads/{id}/markdown` **does render a results
+section** for it (the 3.10 behaviour the guard exists for), and
+`get_thread_markdown` refuses by `topic_id` and by `discussion_id`, naming
+the poll; a standalone `until_vote` poll is refused by `poll_id`; an open
+`until_closed` poll's thread is served (Loomio's export says the results
+are hidden). Everything created was deleted.
 
 Reads were captured with a non-admin key (roots and `meta.total`
 presence are what `tests/fixtures.ts` follows, anonymised); writes ran

@@ -243,6 +243,9 @@ non-admin key). **The five b3 provisioning tools were verified only
 against Loomio's source, `test/integration/b3_provisioning_test.rb` and
 its server-API documentation** — no live b3 capture exists — and no
 write was re-run live on 3.13.1.
+*Post-release (2026-10-25): the b2 write round-trip and the
+`get_thread_markdown` guard were verified live on 3.13.1 in a sandbox
+group — see NOTES-ON-LOOMIO-API.md, "Verified live".*
 
 ## 0.0.15 — 2026-10-24
 
