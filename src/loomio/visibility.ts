@@ -67,13 +67,33 @@ export type OwnStance = Pick<LoomioStance, "cast_at" | "revoked_at"> | null | un
  * show) — `undefined` / `null` means the API user has not voted.
  */
 export function pollResultsVisible(
-  poll: Pick<LoomioPoll, "hide_results" | "closed_at">,
+  poll: Pick<LoomioPoll, "hide_results" | "closed_at"> & { discarded_at?: string | null },
   ownStance?: OwnStance,
 ): ResultsVisibility {
   const closed = Boolean(poll.closed_at);
-  const hide = poll.hide_results ?? "off";
-  if (hide === "until_closed" && !closed) return { visible: false, reason: "until_closed" };
   const voted = Boolean(ownStance?.cast_at) && !ownStance?.revoked_at;
+  // A MISSING `hide_results` (security review nit 8). PollSerializer
+  // always sends it on a kept poll and hides it only on a discarded one
+  // (`hide_when_discarded`, poll_serializer.rb:77-91), whose results go
+  // with it. v0.0.16 read "absent" as "off" — the one fail-open default
+  // in a module that otherwise withholds what it cannot judge. Now an
+  // absent setting on a non-discarded poll is unknown, and unknown is
+  // hidden while the poll is open (every setting shows results once it
+  // closes, so a closed poll stays exact): "until_vote" when the user
+  // has not voted — which also makes get_thread_markdown refuse, the
+  // only safe answer when the export might print the votes — and
+  // "until_closed" when it has (the one setting that would still hide
+  // them). The reason vocabulary stays closed; the choice is the
+  // strictest setting consistent with the user's own vote.
+  const raw = poll.hide_results;
+  if (raw == null && !poll.discarded_at) {
+    if (closed) return { visible: true };
+    return voted
+      ? { visible: false, reason: "until_closed" }
+      : { visible: false, reason: "until_vote" };
+  }
+  const hide = raw ?? "off";
+  if (hide === "until_closed" && !closed) return { visible: false, reason: "until_closed" };
   if (hide === "until_vote" && !closed && !voted) return { visible: false, reason: "until_vote" };
   return { visible: true };
 }
@@ -216,6 +236,22 @@ export class VisibilityRefusalError extends Error {
         "topic_id) and get_poll apply the rule: read the thread there. The block lifts when the " +
         "poll closes or the connector's user votes.",
       polls,
+    );
+  }
+
+  /**
+   * Refused because the thread holds votes whose poll Loomio did not
+   * side-load on any items page, so their visibility cannot be judged
+   * (security review F-15: v0.0.16 fetched the document anyway).
+   */
+  static pollsMissing(topicId: number, pollIds: readonly number[]): VisibilityRefusalError {
+    return new VisibilityRefusalError(
+      `get_thread_markdown refused for topic_id ${topicId}: the thread holds votes on poll(s) ` +
+        `${pollIds.join(", ")} that Loomio's item pages did not include, so the connector cannot check ` +
+        "whether they hide results until the user votes — and Loomio 3.10+'s export would print those " +
+        "votes either way. Read the thread with list_thread_items (same topic_id), which withholds " +
+        "such votes' choices and reasons.",
+      pollIds.map((id) => ({ id })),
     );
   }
 

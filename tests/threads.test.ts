@@ -1799,6 +1799,45 @@ describe("getThreadMarkdown — the vote-visibility guard", () => {
     expect(fetchCallsTo("/markdown")).toHaveLength(0);
   });
 
+  // Security review F-15: v0.0.16 judged only the polls that arrived, so
+  // a vote whose poll was missing from every items page contributed
+  // nothing and the document — votes and reasons included — was fetched.
+  it("a vote whose poll is on NO items page cannot be judged: refused naming the poll id, /markdown never fetched (v0.0.16 fetched it)", async () => {
+    await primeOwnIdentity();
+    // Thread 701 again, but the items page carries the stance without its poll.
+    mockFetchRoutes({
+      "/b2/threads/701": { status: 200, body: discussionShow({ active_polls_count: 1 }) },
+      "/b2/threads/701/items": {
+        status: 200,
+        body: pollThreadItemsBody({
+          discussions: undefined,
+          polls: [],
+          stances: [voterStanceRow()],
+        }),
+      },
+      "/b2/threads/701/markdown": MARKDOWN,
+    });
+    const { getThreadMarkdown } = await import("../src/tools/threads.js");
+    const { VisibilityRefusalError } = await import("../src/loomio/visibility.js");
+    const err = await getThreadMarkdown({ topic_id: 701 }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(VisibilityRefusalError);
+    expect((err as Error).message).toMatch(
+      /votes on poll\(s\) 301 that Loomio's item pages did not include/,
+    );
+    expect((err as InstanceType<typeof VisibilityRefusalError>).polls.map((p) => p.id)).toEqual([
+      301,
+    ]);
+    expect(fetchCallsTo("/markdown")).toHaveLength(0);
+    // list_thread_items takes the same default: the vote's choice and
+    // reason are withheld (its poll cannot be judged either).
+    const { listThreadItems } = await import("../src/tools/threads.js");
+    const items = await listThreadItems({ topic_id: 701 });
+    for (const st of items.stances) {
+      expect(st).not.toHaveProperty("reason");
+      expect(st).not.toHaveProperty("option_scores");
+    }
+  });
+
   it("the same poll after the user voted (own stance found via the cached own id): allowed, 3 calls, 1 open poll checked", async () => {
     await primeOwnIdentity();
     discussionWithPoll(ITEM_POLL, [voterStanceRow(), ownStanceRow()]);

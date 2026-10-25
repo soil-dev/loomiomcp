@@ -23,7 +23,9 @@ the binary.
 | `LOOMIO_API_BASE_URL` | no | Loomio API root. Defaults to `https://www.loomio.com/api`; override for self-hosted instances, e.g. `https://loomio.example.org/api`. Override is gated to `https://` or loopback `http://`. The same value minus `/api` is the base of every `url` the tools return. |
 | `LOOMIO_MCP_READONLY` | no | Set to `1` to register only the 14 read tools: every `create_*` / `update_*` / `delete_*` / `manage_*` tool and every b3 tool is skipped, and the client refuses a write before any request is made. |
 | `LOOMIO_B3_API_KEY` | no | Opt-in for Loomio instance operators only. Enables the nine b3 tools: `deactivate_user`, `reactivate_user`, `get_user`, `list_users` and, on Loomio 3.13+, `list_instance_groups`, `list_instance_memberships`, `add_group_members`, `update_membership_roles`, `revoke_membership` (the reads return **email addresses** for any account and any group roster on the instance, and `add_group_members` sends invitation emails — single-tenant deployments only). Not registered in read-only mode. See [DEPLOY.md](DEPLOY.md) and [SECURITY.md](SECURITY.md) before setting on any shared deployment. |
+| `LOOMIO_MCP_GROUP_IDS` | no | Comma-separated group ids (e.g. `101,102`). When set, the connector serves only those groups: tools naming another group refuse before any call, and lists and searches are filtered to them. The b3 tools are not affected. See [DEPLOY.md](DEPLOY.md). |
 | `LOOMIO_MCP_LOG_VERBOSE` | no | Set to `1` to emit structured per-call JSON events to stderr. See [OPTIMIZATIONS.md](OPTIMIZATIONS.md). |
+| `LOOMIO_MCP_PRETTY_JSON` | no | Set to `1` to indent tool results (for a human reading a stdio session); compact JSON is the default because indentation only costs the model tokens. |
 
 ## Claude Desktop
 
@@ -43,7 +45,10 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
-For read-only mode add `"LOOMIO_MCP_READONLY": "1"`.
+For read-only mode add `"LOOMIO_MCP_READONLY": "1"`. This `env` block is
+the normal place for a stdio key: keep `claude_desktop_config.json`
+private (mode 0600, out of shared sync) and rotate the key if the file
+ever leaves your machine.
 
 ## Claude Code
 
@@ -51,8 +56,15 @@ For read-only mode add `"LOOMIO_MCP_READONLY": "1"`.
 claude mcp add loomio -- npx -y loomiomcp
 ```
 
-Set `LOOMIO_API_KEY` in your shell environment, or pass `-e
-LOOMIO_API_KEY=…`.
+The server inherits `LOOMIO_API_KEY` from the environment Claude Code
+starts in: `read -rs LOOMIO_API_KEY && export LOOMIO_API_KEY` (pasted,
+not echoed, not in history), then `claude`. `claude mcp add … -e
+LOOMIO_API_KEY=<key>` works too, but it types the key into a command
+line (shell history, process listings) on its way into Claude Code's MCP
+config — to keep the key in that config, write the `env` entry into the
+config file with an editor instead, and keep the file private. Never put
+the key in a permission allow-list (`.claude/settings*.json`) or paste
+it into a session.
 
 ## From source
 
@@ -61,7 +73,8 @@ git clone https://github.com/soil-dev/loomiomcp
 cd loomiomcp
 npm install
 npm run build
-LOOMIO_API_KEY=… node dist/index.js
+read -rs LOOMIO_API_KEY && export LOOMIO_API_KEY   # paste; not echoed, not in history
+node dist/index.js
 ```
 
 ## Remote (Cloud Run)
@@ -83,6 +96,8 @@ why). Read the message first; this table is the short version.
 
 | Symptom | Most likely cause |
 |---|---|
+| Startup refused: `LOOMIO_API_KEY contains characters a bearer credential cannot carry …` (or `LOOMIO_B3_API_KEY …`) | The value holds a line break, a space, a control or a non-ASCII character — usually a CRLF paste or a secret file with two lines. Re-copy the key as one line. The message never shows the value; one trailing newline is accepted. |
+| `… outside this connector's group allow-list` | `LOOMIO_MCP_GROUP_IDS` is set and does not list that group. `list_groups` shows the groups that are served; ask the operator to add the id. |
 | Startup line `[loomiomcp] WARNING: Loomio rejected the connector's API key …` on stderr | The key was **rotated** — Loomio regenerates a user's key when that user's password changes (and rotated every key once in 3.3.1). Copy the current key from the user's API access page (`/profile/api_access`) into `LOOMIO_API_KEY` and restart. The server keeps running so every tool call fails with the same explanation, and `check_connection` reports `key_status: "rejected"`. |
 | Every b2 tool call: `403 … "You are not authorized to access this page." … UNAUTHENTICATED` | Same as above: no active Loomio user owns this key. Check with `GET /api/b2/groups` using the key (200 = valid). (The b3 tools keep working — they authenticate with a different secret; see the next row.) |
 | b3 tools only (`deactivate_user`, `reactivate_user`, `get_user`, `list_users`, and the 3.13+ `list_instance_groups`, `list_instance_memberships`, `add_group_members`, `update_membership_roles`, `revoke_membership`): `403 … Loomio's b3 Server API rejected the bearer secret` | `LOOMIO_B3_API_KEY` does not equal `ENV['B3_API_KEY']` on the Loomio server, or that variable is unset / 16 characters or shorter there. Unrelated to `LOOMIO_API_KEY`, password rotation and `/health` (which probes the b2 key); compare the two values with the instance operator and fix the deployment secret. |
@@ -98,7 +113,7 @@ why). Read the message first; this table is the short version.
 | `list_groups` returns `groups: []` with a valid key | The user is in no group. `check_connection` says so explicitly. Publicly visible groups remain readable by id (`get_group`, `list_discussions`, `list_polls`) and their threads appear in `list_threads` / `search_content`. |
 | `get_participation_report` / `get_user_activity`: a requested group appears in `groups_not_visible` | Loomio's report silently drops groups the connector's user is not a member of and echoes the effective set; the counts exclude those groups. Add the user to the group, or drop the id. |
 | `get_user_activity` throws "could not read Loomio's participation report for any of the requested groups" | Every report call failed (network / 5xx, or a rotated key — the message quotes the last error). The tool never returns zeros for a scan that counted nothing. |
-| `search_content` returns exactly 20 results with `capped: true` | Loomio's hard cap (`SearchQuery::RESULT_LIMIT`); there is no paging or total. Narrow the query, `types`, `group_id` or `author_id`. |
+| `search_content` returns 19 (a `query` search) or 20 results with `capped: true` | Loomio's hard cap (`SearchQuery::RESULT_LIMIT`, 20; a query search holds one back so a withheld hit cannot be inferred); there is no paging or total. Narrow the query, `types`, `group_id` or `author_id`. |
 | `create_discussion` / `create_poll` throws "Loomio created … not the requested group" | The misdirected-write guard: Loomio's echo disagreed with the request on where the record went. The record exists — review it with `get_discussion` / `get_poll` and discard it with `delete_*` if misplaced — and report the case; it means the write body was not read as intended by this Loomio version. |
 | `create_poll` refused at the schema: "needs at least N options" | Loomio has no default options through the API — a proposal without `options` would be saved unusable. Pass Loomio's option keys (`agree`, `abstain`, `disagree`, `block`, …). |
 | `422 … must be public` / `must be private` on `create_discussion` / `update_discussion` | The `private` value contradicts the group's `discussion_privacy_options`. Omit `private` to take the group's default. |

@@ -16,6 +16,12 @@ import {
   HEALTH_CACHE_TTL_MS,
 } from "../loomio/health.js";
 import {
+  assertGroupAllowed,
+  assertRecordGroupAllowed,
+  hasGroupAllowlist,
+  isGroupAllowed,
+} from "../loomio/group-scope.js";
+import {
   indexById,
   pick,
   type SlimUser,
@@ -51,7 +57,15 @@ import {
   stripHiddenStanceResults,
   VisibilityRefusalError,
 } from "../loomio/visibility.js";
-import { encodePathSegment, idOrKey, isoTimestamp, maxCharsSchema, positiveId } from "./_common.js";
+import {
+  encodePathSegment,
+  idOrKey,
+  isoTimestamp,
+  maxCharsSchema,
+  maybeCollapseNotVisible,
+  positiveId,
+  TEXT_MAX,
+} from "./_common.js";
 
 // ── Loomio 3.8's thread routes ──────────────────────────────────────────────
 //
@@ -306,6 +320,22 @@ function notFound(what: "discussion" | "poll", id: string | number): LoomioApiEr
 }
 
 /**
+ * A failed `GET /b2/discussions/{id}` / `GET /b2/polls/{id}`, re-said:
+ * in open-DCR mode a 404 and a "hidden" 403 become ONE message (nit 19,
+ * `maybeCollapseNotVisible`); elsewhere a 404 gets the precise
+ * `notFound` wording above and everything else passes through.
+ */
+function rethrowRecordNotFound(
+  err: unknown,
+  what: "discussion" | "poll",
+  id: string | number,
+): never {
+  maybeCollapseNotVisible(err, what, id);
+  if (err instanceof LoomioApiError && err.status === 404) throw notFound(what, id);
+  throw err;
+}
+
+/**
  * Resolve a thread reference to its `topic_id`, spending one call for a
  * discussion or poll reference and none for a topic id. The record read
  * along the way fills the header (type, key, title, group) so the tool
@@ -354,10 +384,7 @@ export async function resolveThread(
         readParams("compact"),
       );
     } catch (err) {
-      if (err instanceof LoomioApiError && err.status === 404) {
-        throw notFound("discussion", ref.discussion_id);
-      }
-      throw err;
+      rethrowRecordNotFound(err, "discussion", ref.discussion_id);
     }
     const d = body.discussions?.[0];
     if (!d || d.topic_id == null) {
@@ -413,8 +440,7 @@ async function showPollThread(pollRef: string | number): Promise<{
       readParams("thread_guard"),
     );
   } catch (err) {
-    if (err instanceof LoomioApiError && err.status === 404) throw notFound("poll", pollRef);
-    throw err;
+    rethrowRecordNotFound(err, "poll", pollRef);
   }
   const p = requestedPoll(body.polls ?? [], pollRef);
   if (!p || p.topic_id == null) {
@@ -446,12 +472,37 @@ const THREAD_NOT_VISIBLE =
   "private thread in a group the user has not joined look the same. Check the topic_id (it is the " +
   "thread id, not the discussion or poll id) and the user's membership.";
 
-/** Re-say a thread route's 404 in terms of what it means (see the module note). */
+/**
+ * Re-say a thread route's 404 in terms of what it means (see the module
+ * note). In open-DCR mode first collapse it into the one "absent or not
+ * served" text (nit 19): otherwise an unknown topic_id read "thread not
+ * found" while one in an unlisted group or a direct thread read "No
+ * thread … is visible", and the difference told an anonymous caller which
+ * topic ids exist (review round 1).
+ */
 function rethrowThreadNotFound(err: unknown, topicId: number): never {
+  maybeCollapseNotVisible(err, "thread", topicId);
   if (err instanceof LoomioApiError && err.status === 404) {
     throw new LoomioApiError(404, `topic_id ${topicId}: ${THREAD_NOT_VISIBLE}`);
   }
   throw err;
+}
+
+/**
+ * The caller's OWN reference, for an allow-list refusal (F-17 / nit 19).
+ * Refusing a `discussion_id` / `poll_id` with the RESOLVED topic_id ("No
+ * thread "702"") both told an unlisted record apart from a missing one
+ * (which reads "No discussion "999"") and disclosed the record's topic_id
+ * (review round 1); naming what the caller passed makes the two replies
+ * byte-identical.
+ */
+function callerThreadRef(
+  ref: ThreadRef,
+  topicId: number,
+): { what: "discussion" | "poll" | "thread"; ref: string | number } {
+  if (ref.discussion_id !== undefined) return { what: "discussion", ref: ref.discussion_id };
+  if (ref.poll_id !== undefined) return { what: "poll", ref: ref.poll_id };
+  return { what: "thread", ref: ref.topic_id ?? topicId };
 }
 
 // ── Item shaping ────────────────────────────────────────────────────────────
@@ -800,7 +851,8 @@ export const listThreadItemsSchema = z
     // costs ~240 chars in every session's tools/list, every returned item
     // carries its `kind`, and HOWTO.md "Tool reference" lists them all.
     kinds: z
-      .array(z.string().min(1))
+      .array(z.string().min(1).max(TEXT_MAX.kind))
+      .max(32)
       .optional()
       .describe("Item kinds to keep (e.g. new_comment, stance_created); 'other' = unlisted kinds."),
     limit: z
@@ -959,8 +1011,16 @@ export async function listThreadItems(
   const includeReactions = Boolean(input.include_reactions);
   const stripHtml = input.strip_html ?? true;
 
-  const { header: fromRef, calls } = await resolveThread(input);
+  // F-17: under a group allow-list the thread's group must be known
+  // BEFORE its items are read, so a bare `topic_id` pays one GET of the
+  // thread row (`lookupTopic`); a discussion / poll reference and a
+  // `known` record already carry it.
+  const { header: fromRef, calls } = await resolveThread(input, {
+    lookupTopic: hasGroupAllowlist() && known === undefined,
+  });
   const resolved = known && fromRef.type === null ? withKnownThread(fromRef, known) : fromRef;
+  const own = callerThreadRef(input, resolved.topic_id);
+  assertRecordGroupAllowed(resolved.group_id, own.what, own.ref);
   // Which side-loads to drop (see the module note): reactions need the
   // opening post's serializer; a known thread does not need the opening
   // post at all; the bare topic_id path needs it to fill the header.
@@ -1512,10 +1572,7 @@ async function loadThreadForGuard(ref: ThreadRef): Promise<GuardRead> {
         readParams("thread_guard"),
       );
     } catch (err) {
-      if (err instanceof LoomioApiError && err.status === 404) {
-        throw notFound("discussion", ref.discussion_id);
-      }
-      throw err;
+      rethrowRecordNotFound(err, "discussion", ref.discussion_id);
     }
     const d = body.discussions?.[0];
     if (!d || d.topic_id == null) {
@@ -1634,6 +1691,22 @@ async function guardThreadMarkdown(read: GuardRead): Promise<{ calls: number; ch
   if (pager.state.capped) {
     throw VisibilityRefusalError.unverified(topicId, pager.state.rows, pager.state.total);
   }
+  // A vote whose poll arrived on NO page (and was not cleared by the read)
+  // cannot be judged — and the export would print it (security review
+  // F-15). v0.0.16 judged `polls.values()` only, so such a stance
+  // contributed nothing and the document was fetched; list_thread_items
+  // treats the same stance as hidden (`visibilityOf`). Stock Loomio 3.13.1
+  // side-loads the poll with every stance item (StanceSerializer
+  // `has_one :poll`), so this fires only on a serializer change or
+  // regression upstream — exactly when the guard must fail closed.
+  const unjudged = [
+    ...new Set(
+      [...stances.values()]
+        .map((st) => st.poll_id)
+        .filter((id) => typeof id === "number" && !polls.has(id) && !cleared.has(id)),
+    ),
+  ];
+  if (unjudged.length > 0) throw VisibilityRefusalError.pollsMissing(topicId, unjudged);
   return { calls: pager.state.requests, checked: [...polls.values()].filter(isActivePoll).length };
 }
 
@@ -1692,6 +1765,10 @@ export async function getThreadMarkdown(
   const max = input.max_chars ?? DEFAULT_MARKDOWN_MAX_CHARS;
   const read = await loadThreadForGuard(input);
   const header = read.header;
+  // F-17: the read named the thread's group; an unlisted one (or none —
+  // a direct thread) is refused before the guard scan and the document.
+  const own = callerThreadRef(input, header.topic_id);
+  assertRecordGroupAllowed(header.group_id, own.what, own.ref);
   const legacy = await exportHonoursUntilVote();
   const guard = legacy.honours ? { calls: 0, checked: 0 } : await guardThreadMarkdown(read);
   let body: { markdown?: unknown };
@@ -1784,16 +1861,23 @@ export interface ThreadRow extends Pick<LoomioTopic, (typeof THREAD_ROW_FIELDS)[
 
 export interface ListThreadsResult {
   threads: ThreadRow[];
-  /** Loomio's `meta.total`: every thread visible to the connector's user, before paging and before the client-side filters. */
-  total: number;
+  /**
+   * Loomio's `meta.total`: every thread visible to the connector's user,
+   * before paging and before the client-side filters. Under
+   * LOOMIO_MCP_GROUP_IDS: the matching count when the walk reached the
+   * end, else null — never a figure that counts withheld threads.
+   */
+  total: number | null;
   returned: number;
   scope: {
     limit: number;
     offset: number;
     group_id: number | null;
     type: ThreadType | null;
-    /** Threads on the fetched page before the client-side filters. */
-    page_size: number;
+    /** Threads on the fetched page before the client-side filters; null under an allow-list. */
+    page_size: number | null;
+    /** The `offset` of the next page, or null when nothing further can match. */
+    next_offset: number | null;
     /** The `since` cutoff applied, or null. */
     since: string | null;
     /**
@@ -1804,6 +1888,8 @@ export interface ListThreadsResult {
     exhausted: boolean | null;
     /** With `since`: rows dropped because they carry no last_activity_at (undatable, never counted as exhausted). */
     undated_dropped: number;
+    /** Allow-list walk only: the scan limit ended the walk before the window filled. */
+    scan_capped?: true;
     note: string;
   };
 }
@@ -1815,6 +1901,16 @@ const THREADS_SCOPE_NOTE =
 const THREADS_FILTER_NOTE =
   " group_id / type were applied client-side to this page only: `returned` may be smaller than the " +
   "page and `total` still counts every visible thread; page further with offset to see more.";
+
+const THREADS_ALLOWLIST_SCOPE_NOTE =
+  "Threads of the groups this deployment serves (LOOMIO_MCP_GROUP_IDS), newest activity first. " +
+  "limit / offset count matching threads only (listed groups, then group_id / type / since); " +
+  "page with scope.next_offset until it is null. `total` is null unless this call reached the " +
+  "end of the set.";
+
+const THREADS_SCAN_CAPPED_NOTE =
+  " The scan stopped after its page limit before filling the window: narrow with since or " +
+  "group_id, or use list_discussions / list_polls for one group.";
 
 const THREADS_SINCE_NOTE =
   " since was applied client-side: rows older than the cutoff were dropped, rows without a " +
@@ -1864,9 +1960,38 @@ export function shapeThreadRow(
   return url ? { ...row, url } : row;
 }
 
-export async function listThreads(input: ListThreadsInput = {}): Promise<ListThreadsResult> {
-  const limit = input.limit ?? DEFAULT_THREADS_LIMIT;
-  const offset = input.offset ?? 0;
+/**
+ * Under LOOMIO_MCP_GROUP_IDS the connector pages Loomio's index itself:
+ * this many rows per upstream page, at most this many pages per call
+ * (10 Loomio calls, well inside the per-request budget of 120).
+ */
+export const THREADS_WALK_PAGE = MAX_THREADS_LIMIT;
+export const THREADS_WALK_MAX_PAGES = 10;
+
+/** The filters a row must pass to count, in every mode. */
+interface RowFilter {
+  groupId?: number;
+  type?: ThreadType;
+  sinceMs?: number;
+}
+
+/**
+ * Plain mode (no allow-list): one upstream page at the caller's
+ * `limit` / `offset`, filtered client-side. Every figure in the reply
+ * (`total`, `page_size`) is about threads the caller may see anyway.
+ */
+async function listThreadsPage(
+  limit: number,
+  offset: number,
+  f: RowFilter,
+): Promise<{
+  rows: ThreadRow[];
+  total: number;
+  pageSize: number;
+  undated: number;
+  exhausted: boolean | null;
+  nextOffset: number | null;
+}> {
   const body = await loomioGet<ThreadsResponse>("/b2/threads", {
     limit,
     offset,
@@ -1881,44 +2006,181 @@ export async function listThreads(input: ListThreadsInput = {}): Promise<ListThr
   // be dated, so it is dropped and counted rather than passed as "new";
   // and the exhaustion test looks at the page's last DATED row so a null
   // tail never claims the set is exhausted.
-  const sinceMs = input.since !== undefined ? Date.parse(input.since) : undefined;
   let undated = 0;
   const rows = page
     .map((t) => shapeThreadRow(t, body))
-    .filter((r) => input.group_id === undefined || r.group_id === input.group_id)
-    .filter((r) => input.type === undefined || r.type === input.type)
+    .filter((r) => f.groupId === undefined || r.group_id === f.groupId)
+    .filter((r) => f.type === undefined || r.type === f.type)
     .filter((r) => {
-      if (sinceMs === undefined) return true;
+      if (f.sinceMs === undefined) return true;
       if (r.last_activity_at == null) {
         undated += 1;
         return false;
       }
-      return Date.parse(r.last_activity_at) >= sinceMs;
+      return Date.parse(r.last_activity_at) >= f.sinceMs;
     });
   let exhausted: boolean | null = null;
-  if (sinceMs !== undefined) {
+  if (f.sinceMs !== undefined) {
     const lastDated = [...page].reverse().find((t) => t.last_activity_at != null)?.last_activity_at;
-    exhausted = page.length < limit || (lastDated != null && Date.parse(lastDated) < sinceMs);
+    exhausted = page.length < limit || (lastDated != null && Date.parse(lastDated) < f.sinceMs);
   }
-  const filtered = input.group_id !== undefined || input.type !== undefined;
-  const note =
-    THREADS_SCOPE_NOTE +
-    (filtered ? THREADS_FILTER_NOTE : "") +
-    (sinceMs !== undefined ? THREADS_SINCE_NOTE : "");
   return {
-    threads: rows,
+    rows,
     total: typeof body.meta?.total === "number" ? body.meta.total : page.length,
-    returned: rows.length,
+    pageSize: page.length,
+    undated,
+    exhausted,
+    nextOffset: page.length < limit || exhausted === true ? null : offset + page.length,
+  };
+}
+
+/**
+ * Allow-list mode (round-2 security finding on F-17). Filtering ONE
+ * upstream page leaked what the allow-list hides: Loomio's `meta.total`
+ * and the page length counted threads of unlisted groups and direct
+ * threads, and a `limit: 1` walk answered returned=0 exactly at each
+ * withheld thread's position in the activity order — bracketing when it
+ * was active. So here `limit` / `offset` count MATCHING rows only (listed
+ * groups ∩ group_id ∩ type ∩ since), the connector walks Loomio's index
+ * from the top to fill the window, and nothing in the reply is computed
+ * from rows it withheld: no `page_size`, `total` only when the walk
+ * reached the end (then it is the matching count), `next_offset` in the
+ * same matching-row units. Cost: ≤ THREADS_WALK_MAX_PAGES Loomio calls;
+ * a window past that scan reports `scan_capped` instead of guessing.
+ */
+async function listThreadsWalk(
+  limit: number,
+  offset: number,
+  f: RowFilter,
+): Promise<{
+  rows: ThreadRow[];
+  total: number | null;
+  undated: number;
+  exhausted: boolean | null;
+  nextOffset: number | null;
+  scanCapped: boolean;
+}> {
+  const rows: ThreadRow[] = [];
+  let matched = 0;
+  let undated = 0;
+  let upstreamOffset = 0;
+  let reachedEnd = false;
+  for (let n = 0; n < THREADS_WALK_MAX_PAGES && !reachedEnd; n += 1) {
+    const body = await loomioGet<ThreadsResponse>("/b2/threads", {
+      limit: THREADS_WALK_PAGE,
+      offset: upstreamOffset,
+      ...readParams("threads"),
+    });
+    const page = Array.isArray(body.threads) ? body.threads : [];
+    upstreamOffset += page.length;
+    if (page.length < THREADS_WALK_PAGE) reachedEnd = true;
+    for (const t of page) {
+      const r = shapeThreadRow(t, body);
+      if (!isGroupAllowed(r.group_id)) continue;
+      if (f.groupId !== undefined && r.group_id !== f.groupId) continue;
+      if (f.type !== undefined && r.type !== f.type) continue;
+      if (f.sinceMs !== undefined) {
+        if (r.last_activity_at == null) {
+          // Counted only for listed groups (filtered above), so the
+          // figure says nothing about withheld threads.
+          undated += 1;
+          continue;
+        }
+        if (Date.parse(r.last_activity_at) < f.sinceMs) {
+          // DESC order: every later row is older too, listed or not.
+          reachedEnd = true;
+          break;
+        }
+      }
+      matched += 1;
+      if (matched <= offset) continue;
+      if (rows.length === limit) {
+        // A (limit+1)-th match exists: more to page, end not reached.
+        return {
+          rows,
+          total: null,
+          undated,
+          exhausted: f.sinceMs !== undefined ? false : null,
+          nextOffset: offset + rows.length,
+          scanCapped: false,
+        };
+      }
+      rows.push(r);
+    }
+  }
+  if (!reachedEnd) {
+    return {
+      rows,
+      total: null,
+      undated,
+      exhausted: f.sinceMs !== undefined ? false : null,
+      nextOffset: rows.length > 0 ? offset + rows.length : null,
+      scanCapped: true,
+    };
+  }
+  return {
+    rows,
+    // The whole matching set was seen; with `since` it is the in-window count.
+    total: matched,
+    undated,
+    exhausted: f.sinceMs !== undefined ? true : null,
+    nextOffset: null,
+    scanCapped: false,
+  };
+}
+
+export async function listThreads(input: ListThreadsInput = {}): Promise<ListThreadsResult> {
+  // F-17: an unlisted group is refused; without `group_id` the walk below
+  // keeps listed groups only (Loomio's index has no group filter).
+  if (input.group_id !== undefined) assertGroupAllowed(input.group_id);
+  const limit = input.limit ?? DEFAULT_THREADS_LIMIT;
+  const offset = input.offset ?? 0;
+  const filter: RowFilter = {
+    ...(input.group_id !== undefined ? { groupId: input.group_id } : {}),
+    ...(input.type !== undefined ? { type: input.type } : {}),
+    ...(input.since !== undefined ? { sinceMs: Date.parse(input.since) } : {}),
+  };
+  const allowlist = hasGroupAllowlist();
+  const filtered = input.group_id !== undefined || input.type !== undefined;
+  const sinceNote = input.since !== undefined ? THREADS_SINCE_NOTE : "";
+  if (allowlist) {
+    const w = await listThreadsWalk(limit, offset, filter);
+    return {
+      threads: w.rows,
+      total: w.total,
+      returned: w.rows.length,
+      scope: {
+        limit,
+        offset,
+        group_id: input.group_id ?? null,
+        type: input.type ?? null,
+        page_size: null,
+        next_offset: w.nextOffset,
+        since: input.since ?? null,
+        exhausted: w.exhausted,
+        undated_dropped: w.undated,
+        ...(w.scanCapped ? { scan_capped: true as const } : {}),
+        note:
+          THREADS_ALLOWLIST_SCOPE_NOTE + (w.scanCapped ? THREADS_SCAN_CAPPED_NOTE : "") + sinceNote,
+      },
+    };
+  }
+  const p = await listThreadsPage(limit, offset, filter);
+  return {
+    threads: p.rows,
+    total: p.total,
+    returned: p.rows.length,
     scope: {
       limit,
       offset,
       group_id: input.group_id ?? null,
       type: input.type ?? null,
-      page_size: page.length,
+      page_size: p.pageSize,
+      next_offset: p.nextOffset,
       since: input.since ?? null,
-      exhausted,
-      undated_dropped: undated,
-      note,
+      exhausted: p.exhausted,
+      undated_dropped: p.undated,
+      note: THREADS_SCOPE_NOTE + (filtered ? THREADS_FILTER_NOTE : "") + sinceNote,
     },
   };
 }

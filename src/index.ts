@@ -1,18 +1,29 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isReadOnly } from "./loomio/client.js";
+import { groupAllowlistError } from "./loomio/group-scope.js";
 import { checkLoomioHealth, keyRejectedWarning } from "./loomio/health.js";
+import { secretConfigError } from "./loomio/secrets.js";
 import { createLoomioMcpServer } from "./server.js";
 
 // Fail fast on missing LOOMIO_API_KEY. Without this the server would
 // boot, register tools, and only error out on the first tool invocation
 // — a confusing UX in MCP-host UIs where the failure surfaces as "tool
 // errored" rather than "server failed to start." Matches the HTTP
-// entry's fail-fast pattern in src/http.ts.
+// entry's fail-fast pattern (src/http/runtime.ts).
 if (!process.env["LOOMIO_API_KEY"]) {
   console.error(
     "[loomiomcp] LOOMIO_API_KEY environment variable is not set. " +
       "Generate one in Loomio under your profile → API keys.",
   );
+  process.exit(1);
+}
+
+// Same startup refusals as the HTTP entry: a credential a bearer header
+// cannot carry (F-02; the message never quotes it) and a malformed group
+// allow-list (F-17).
+const startupProblem = secretConfigError() ?? groupAllowlistError();
+if (startupProblem) {
+  console.error(`[loomiomcp] ${startupProblem}`);
   process.exit(1);
 }
 

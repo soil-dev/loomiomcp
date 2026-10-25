@@ -171,13 +171,16 @@ describe("checkLoomioHealth verdicts", () => {
     expect(h.detail).toContain("HTTP 502");
   });
 
-  it("unreachable: network error, with the error message as detail (and reason network_error)", async () => {
+  it("unreachable: network error, with a FIXED transport text as detail (and reason network_error)", async () => {
     mockRoutes({ "/b2/groups": new Error("ECONNREFUSED"), "/v1/boot/version": VERSION_OK });
     const h = await checkLoomioHealth();
     expect(h.key_status).toBe("unreachable");
     expect(h.reason).toBe("network_error");
-    expect(h.detail).toContain("ECONNREFUSED");
-    // The transport error text reaches `detail` for the operator, not the log event.
+    // F-02: fetch's own message (which can quote a header value) is never
+    // relayed; the client maps it to a fixed text naming the class only.
+    expect(h.detail).toMatch(/Transport error while calling Loomio \(Error\)/);
+    expect(h.detail).not.toContain("ECONNREFUSED");
+    // Neither reaches the log event.
     const auth = stderrEvents().filter((e) => e["event"] === "loomio.auth");
     expect(auth[0]).toMatchObject({ reason: "network_error" });
     expect(JSON.stringify(auth)).not.toContain("ECONNREFUSED");

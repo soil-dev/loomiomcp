@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { csvParam, LoomioAuthError, loomioGet, readParams } from "../loomio/client.js";
+import { assertGroupsAllowed, groupAllowlist, isGroupAllowed } from "../loomio/group-scope.js";
+import { scrubSecrets } from "../loomio/secrets.js";
 import type { LoomioReportUserRow, ReportsUsersResponse, SearchResponse } from "../loomio/types.js";
+import { isUpstreamStop } from "../loomio/upstream.js";
 import { isoTimestamp, positiveId } from "./_common.js";
 import { type SearchHit, shapeSearchHits } from "./search.js";
 
@@ -437,7 +440,10 @@ async function reportForGroup(groupId: number, window: MonthWindow): Promise<Rep
     });
     return { group_id: groupId, ok: true, body };
   } catch (err) {
-    if (err instanceof LoomioAuthError) throw err;
+    // A spent upstream budget, a cancelled request or a full upstream queue
+    // (src/loomio/upstream.ts, F-01) is about the whole call, not this group:
+    // it stops the fan-out instead of being folded into a partial answer.
+    if (err instanceof LoomioAuthError || isUpstreamStop(err)) throw err;
     return { group_id: groupId, ok: false, error: err };
   }
 }
@@ -464,6 +470,8 @@ export function shapeSample(
 
 export async function getUserActivity(input: GetUserActivityInput): Promise<UserActivityResult> {
   const groupIds = [...new Set(input.group_ids)];
+  // F-17: every requested group must be listed — refused before any call.
+  assertGroupsAllowed(groupIds);
   const window = monthWindow(input.since, input.until);
   const windowed = input.since !== undefined || input.until !== undefined;
 
@@ -485,7 +493,9 @@ export async function getUserActivity(input: GetUserActivityInput): Promise<User
     .then((body) => ({ hits: shapeSearchHits(body) }))
     .catch((err: unknown) => ({
       hits: [],
-      error: err instanceof Error ? err.message : String(err),
+      // Relayed in the RESULT, which the tool-error scrub in registerTool
+      // never sees (security review F-02): scrubbed here.
+      error: scrubSecrets(err instanceof Error ? err.message : String(err)),
     }));
 
   const outcomes = await mapWithConcurrency(groupIds, REPORT_CONCURRENCY, (gid) =>
@@ -495,7 +505,7 @@ export async function getUserActivity(input: GetUserActivityInput): Promise<User
   const failed = outcomes.filter((o): o is Extract<ReportOutcome, { ok: false }> => !o.ok);
   if (failed.length === groupIds.length) {
     const last = failed[failed.length - 1]?.error;
-    const reason = last instanceof Error ? last.message : String(last);
+    const reason = scrubSecrets(last instanceof Error ? last.message : String(last));
     // Consume the search result so nothing is left in flight unobserved.
     await searchPromise;
     throw new Error(
@@ -540,10 +550,11 @@ export async function getUserActivity(input: GetUserActivityInput): Promise<User
   }
 
   const search = await searchPromise;
-  const inScope =
+  const inScope = (
     singleGroup !== undefined
       ? search.hits
-      : search.hits.filter((h) => h.group !== null && groupIds.includes(h.group.id));
+      : search.hits.filter((h) => h.group !== null && groupIds.includes(h.group.id))
+  ).filter((h) => isGroupAllowed(h.group?.id ?? null));
   const bounds = windowed
     ? { since: Date.parse(window.since_effective), until: Date.parse(window.until_effective) }
     : undefined;
@@ -774,6 +785,14 @@ export async function getParticipationReport(
 ): Promise<ParticipationReportResult> {
   const scope: "custom" | "my" = input.group_scope ?? "custom";
   const groupIds = [...new Set(input.group_ids ?? [])];
+  // F-17. `custom`: every requested group must be listed. `my`: the
+  // report is SENT as `custom` over the allow-list — Loomio aggregates
+  // rows across the groups it counts, so a client-side filter is
+  // impossible; it intersects the list with the user's memberships just
+  // as `my` would (subgroups the user can see but has not joined, which
+  // `my` would add, are not counted).
+  const allowlist = groupAllowlist();
+  if (scope === "custom") assertGroupsAllowed(groupIds);
   const endMonth = input.end_month ?? monthKey(Date.now());
   const startMonth = input.start_month ?? monthsBefore(endMonth, DEFAULT_REPORT_MONTHS - 1);
   if (startMonth > endMonth) {
@@ -784,8 +803,8 @@ export async function getParticipationReport(
   }
 
   const body = await fetchUsersReport({
-    scope,
-    group_ids: groupIds,
+    scope: scope === "my" && allowlist ? "custom" : scope,
+    group_ids: scope === "my" && allowlist ? [...allowlist] : groupIds,
     start_month: startMonth,
     end_month: endMonth,
     delegates_only: Boolean(input.delegates_only),

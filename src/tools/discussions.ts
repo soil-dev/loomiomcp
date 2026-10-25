@@ -9,26 +9,40 @@ import {
   readParams,
 } from "../loomio/client.js";
 import {
+  assertGroupAllowed,
+  assertRecordGroupAllowed,
+  hasGroupAllowlist,
+} from "../loomio/group-scope.js";
+import {
   discussionUrl,
   joinTopics,
-  omit,
+  pick,
   type SlimGroup,
   type SlimUser,
   slimGroup,
   slimUsers,
   stripBodyHtml,
+  TOPIC_JOIN_FIELDS,
   type TopicJoin,
   truncateBody,
 } from "../loomio/shape.js";
 import type { DiscussionsResponse, LoomioDiscussion } from "../loomio/types.js";
 import {
+  collapseGroupListError,
+  bodyText,
+  collapseNotVisible,
   DEFAULT_DESCRIPTION_MAX_CHARS,
+  emailAddress,
   encodePathSegment,
   formatFieldDescription,
   idOrKey,
+  type IdOrKey,
   maxCharsSchema,
+  messageText,
   positiveId,
   refuseHtmlWithoutFormat,
+  tagName,
+  titleText,
 } from "./_common.js";
 import {
   DEFAULT_BODY_MAX_CHARS,
@@ -60,12 +74,33 @@ import {
 // `description_format: "text"`, so a scan of fifty rows pays for words
 // rather than markup (see `stripBodyHtml` in src/loomio/shape.ts).
 
-const DISCUSSION_DROP = [
-  "attachments",
-  "link_previews",
-  "mentioned_usernames",
-  "content_locale",
-  "translation_id",
+/**
+ * The discussion fields relayed: an ALLOW-list (security review nit 12;
+ * v0.0.16 relayed the record minus a deny-list, so any attribute a
+ * Loomio upgrade added reached every caller unreviewed). It is
+ * DiscussionSerializer's attributes (unchanged 3.8.1 → 3.13.1) plus the
+ * association ids it embeds (`author_id`; `reaction_ids` on the write
+ * echoes, which keep reactions) MINUS what v0.0.16 already dropped —
+ * attachments (kept as a count), link_previews, mentioned_usernames,
+ * content_locale, translation_id — plus the topic counters `joinTopics`
+ * folds on. For a real reply the output is unchanged.
+ */
+export const DISCUSSION_FIELDS = [
+  "id",
+  "key",
+  "group_id",
+  "topic_id",
+  "title",
+  "description",
+  "description_format",
+  "discussion_template_id",
+  "author_id",
+  "created_at",
+  "updated_at",
+  "versions_count",
+  "discarded_at",
+  "reaction_ids",
+  ...TOPIC_JOIN_FIELDS,
 ] as const;
 
 export type ShapedDiscussion = Partial<LoomioDiscussion> &
@@ -85,7 +120,7 @@ export function shapeDiscussion(
   record: LoomioDiscussion & Partial<TopicJoin>,
   opts: { descriptionMaxChars: number; stripHtml?: boolean },
 ): ShapedDiscussion {
-  const base = omit(record, DISCUSSION_DROP);
+  const base: Record<string, unknown> = pick(record as Record<string, unknown>, DISCUSSION_FIELDS);
   const withCounts = Array.isArray(record.attachments)
     ? { ...base, attachments_count: record.attachments.length }
     : base;
@@ -163,10 +198,16 @@ export async function getDiscussion(
   input: z.infer<typeof getDiscussionSchema>,
   deps: GetDiscussionDeps = {},
 ): Promise<GetDiscussionResult> {
-  const body = await loomioGet<DiscussionsResponse>(
-    `/b2/discussions/${encodePathSegment(input.id_or_key)}`,
-    readParams("show"),
-  );
+  let body: DiscussionsResponse;
+  try {
+    body = await loomioGet<DiscussionsResponse>(
+      `/b2/discussions/${encodePathSegment(input.id_or_key)}`,
+      readParams("show"),
+    );
+  } catch (err) {
+    // nit 19: one "absent or hidden" message in open-DCR mode.
+    collapseNotVisible(err, "discussion", input.id_or_key);
+  }
   const record = body.discussions?.[0];
   if (!record) {
     throw new LoomioApiError(
@@ -175,6 +216,8 @@ export async function getDiscussion(
         "response shape is not the one Loomio 3.8.1 produces.",
     );
   }
+  // F-17: a thread in an unlisted group (or in none) is refused.
+  assertRecordGroupAllowed(record.group_id ?? null, "discussion", input.id_or_key);
   const [joined] = joinTopics([record], body.topics);
   const group =
     (body.groups ?? []).find((g) => g.id === record.group_id) ?? body.groups?.[0] ?? undefined;
@@ -261,6 +304,7 @@ export interface ListDiscussionsResult {
 export async function listDiscussions(
   input: z.infer<typeof listDiscussionsSchema>,
 ): Promise<ListDiscussionsResult> {
+  assertGroupAllowed(input.group_id);
   const status = input.status ?? "open";
   const max = input.description_max_chars ?? DEFAULT_DESCRIPTION_MAX_CHARS;
   const stripHtml = input.strip_html ?? true;
@@ -271,7 +315,8 @@ export async function listDiscussions(
     ...(input.limit !== undefined ? { limit: input.limit } : {}),
     ...(input.offset !== undefined ? { offset: input.offset } : {}),
     ...readParams("list"),
-  });
+    // nit 19: an unknown (404) and a hidden (403) group read alike in open-DCR mode.
+  }).catch((err: unknown) => collapseGroupListError(err, input.group_id));
   const discussions = joinTopics(body.discussions, body.topics).map((d) =>
     shapeDiscussion(d, { descriptionMaxChars: max, stripHtml }),
   );
@@ -330,9 +375,9 @@ export async function listDiscussions(
 
 export const createDiscussionSchema = z
   .object({
-    title: z.string().min(1),
+    title: titleText,
     group_id: positiveId,
-    description: z.string().optional(),
+    description: bodyText.optional(),
     description_format: z
       .enum(["md", "html"])
       .optional()
@@ -341,14 +386,14 @@ export const createDiscussionSchema = z
       .boolean()
       .optional()
       .describe("true = members only, false = public. Default: the group's setting."),
-    tags: z.array(z.string().min(1)).optional(),
+    tags: z.array(tagName).optional(),
     recipient_audience: z.enum(["group"]).optional().describe("'group' = notify the whole group."),
     recipient_user_ids: z.array(positiveId).optional().describe("User ids to notify."),
     recipient_emails: z
-      .array(z.string().email())
+      .array(emailAddress)
       .optional()
       .describe("Emails to notify; non-members become guests."),
-    recipient_message: z.string().optional().describe("Text for the notification."),
+    recipient_message: messageText.optional().describe("Text for the notification."),
     notify_recipients: z
       .boolean()
       .optional()
@@ -397,6 +442,7 @@ function shapeDiscussionWrite(body: DiscussionsResponse, where: string): Discuss
 export async function createDiscussion(
   input: z.infer<typeof createDiscussionSchema>,
 ): Promise<DiscussionWriteResult> {
+  assertGroupAllowed(input.group_id);
   const resp = await loomioPost<DiscussionsResponse>(
     "/b2/discussions",
     nestedBody("discussion", input),
@@ -462,11 +508,10 @@ const recipientFields = {
     .optional()
     .describe("User ids to add as readers and notify."),
   recipient_emails: z
-    .array(z.string().email())
+    .array(emailAddress)
     .optional()
     .describe("Emails to invite as readers; non-members become guests."),
-  recipient_message: z
-    .string()
+  recipient_message: messageText
     .optional()
     .describe("Notification text; records a visible 'edited' item."),
   notify_recipients: z
@@ -488,8 +533,8 @@ const DISCUSSION_UPDATE_FIELDS = [
 export const updateDiscussionSchema = z
   .object({
     id_or_key: idOrKey.describe("Discussion id or short key."),
-    title: z.string().min(1).optional(),
-    description: z.string().optional().describe("New body; REPLACES the whole description."),
+    title: titleText.optional(),
+    description: bodyText.optional().describe("New body; REPLACES the whole description."),
     description_format: z
       .enum(["md", "html"])
       .optional()
@@ -521,10 +566,32 @@ export const updateDiscussionSchema = z
     }
   });
 
+/**
+ * F-17 for writes addressed by record: with a group allow-list set, read
+ * the discussion first (one call, `compact`) and refuse one outside the
+ * list BEFORE anything is written — the write's echo would otherwise
+ * hand back the whole record of a thread the deployment does not serve.
+ * Free without an allow-list.
+ */
+export async function assertDiscussionInScope(ref: IdOrKey): Promise<void> {
+  if (!hasGroupAllowlist()) return;
+  let body: DiscussionsResponse;
+  try {
+    body = await loomioGet<DiscussionsResponse>(
+      `/b2/discussions/${encodePathSegment(ref)}`,
+      readParams("compact"),
+    );
+  } catch (err) {
+    collapseNotVisible(err, "discussion", ref);
+  }
+  assertRecordGroupAllowed(body.discussions?.[0]?.group_id ?? null, "discussion", ref);
+}
+
 export async function updateDiscussion(
   input: z.infer<typeof updateDiscussionSchema>,
 ): Promise<DiscussionWriteResult> {
   const { id_or_key, ...attrs } = input;
+  await assertDiscussionInScope(id_or_key);
   const path = `/b2/discussions/${encodePathSegment(id_or_key)}`;
   const resp = await loomioPatch<DiscussionsResponse>(path, nestedBody("discussion", attrs));
   return shapeDiscussionWrite(resp, `PATCH ${path}`);
@@ -557,6 +624,7 @@ export interface DeleteDiscussionResult extends DiscussionWriteResult {
 export async function deleteDiscussion(
   input: z.infer<typeof deleteDiscussionSchema>,
 ): Promise<DeleteDiscussionResult> {
+  await assertDiscussionInScope(input.id_or_key);
   const path = `/b2/discussions/${encodePathSegment(input.id_or_key)}`;
   const resp = await loomioDelete<DiscussionsResponse>(path);
   const shaped = shapeDiscussionWrite(resp, `DELETE ${path}`);

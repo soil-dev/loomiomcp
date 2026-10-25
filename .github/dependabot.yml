@@ -1,0 +1,43 @@
+# Dependency updates (security review nit 13). Three ecosystems, because
+# each is a separate way for third-party code into a release:
+#   - npm: package.json / package-lock.json (runtime and build tooling);
+#   - github-actions: the SHA-pinned actions in .github/workflows — the
+#     bump rewrites the SHA and its version comment together;
+#   - docker: the digest-pinned base image in Dockerfile.
+# Weekly, with minor + patch grouped into one PR per ecosystem so routine
+# drift is one review; majors arrive one PR each, because they are the
+# ones that change behaviour. `cooldown` holds a freshly published
+# version back for a week: most malicious releases are caught and pulled
+# within days, and nothing here needs a version on day one (security
+# advisories bypass it).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker-minor-patch:
+        update-types: [minor, patch]

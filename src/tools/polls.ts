@@ -11,8 +11,12 @@ import {
   readParams,
 } from "../loomio/client.js";
 import {
+  assertGroupAllowed,
+  assertRecordGroupAllowed,
+  hasGroupAllowlist,
+} from "../loomio/group-scope.js";
+import {
   joinTopics,
-  omit,
   pick,
   pollUrl,
   type SlimGroup,
@@ -20,6 +24,7 @@ import {
   slimGroup,
   slimUsers,
   stripBodyHtml,
+  TOPIC_JOIN_FIELDS,
   type TopicJoin,
   truncateBody,
 } from "../loomio/shape.js";
@@ -32,16 +37,25 @@ import type {
 } from "../loomio/types.js";
 import { type GatedPoll, gatePollResults, ownStanceFor } from "../loomio/visibility.js";
 import {
+  collapseGroupListError,
+  bodyText,
+  collapseNotVisible,
   DEFAULT_DESCRIPTION_MAX_CHARS,
+  emailAddress,
   encodePathSegment,
   formatFieldDescription,
   idOrKey,
+  type IdOrKey,
   isoTimestamp,
   maxCharsSchema,
+  messageText,
   POLL_TYPE_RULES,
   PollTypeEnum,
   positiveId,
+  promptText,
   refuseHtmlWithoutFormat,
+  tagName,
+  titleText,
 } from "./_common.js";
 import { resolveThread, type ThreadRef } from "./threads.js";
 
@@ -114,18 +128,89 @@ import { resolveThread, type ThreadRef } from "./threads.js";
 //   - `voter_has_access` (3.11.0, 8eb9236a4) is the web client's
 //     vote-button state for the connector's user: dropped.
 
-const POLL_DROP = [
-  "attachments",
-  "link_previews",
-  "mentioned_usernames",
-  "content_locale",
-  "result_columns",
-  "chart_type",
-  "chart_column",
-  "legacy_anonymous_vote_reasons_count",
-  "poll_option_name_format",
-  "limit_reason_length",
-  "voter_has_access",
+/**
+ * The poll fields relayed: an ALLOW-list (security review nit 12; v0.0.16
+ * relayed the record minus a deny-list, so any attribute a Loomio upgrade
+ * added reached every caller unreviewed). PollSerializer's attributes as
+ * of 3.13.1 (poll_serializer.rb:2-67) plus `voting_system` (3.8 / 3.9
+ * only; 3.10 removed it) and the association ids it embeds
+ * (`current_outcome_id`, `my_stance_id`, `poll_option_ids`,
+ * `reaction_ids` — the last on the write echoes, which keep reactions),
+ * MINUS what v0.0.16 already dropped: attachment metadata (kept as a
+ * count), link-preview cards, `mentioned_usernames`, `content_locale`,
+ * the chart / result-presentation knobs Loomio's Vue client reads
+ * (`result_columns`, `chart_type`, `chart_column`,
+ * `poll_option_name_format`, `limit_reason_length`,
+ * `legacy_anonymous_vote_reasons_count`) and `voter_has_access` (3.11+,
+ * the web client's vote-button state). Plus the topic counters
+ * `joinTopics` folds on and the gate's own pair. For a real reply the
+ * output is unchanged.
+ */
+export const POLL_FIELDS = [
+  "id",
+  "key",
+  "title",
+  "details",
+  "details_format",
+  "poll_type",
+  "author_id",
+  "group_id",
+  "topic_id",
+  "anonymous",
+  "anonymous_voter_eligible",
+  "anonymous_ballot_submitted",
+  "voting_system",
+  "agree_target",
+  "can_respond_maybe",
+  "created_at",
+  "opening_at",
+  "opened_at",
+  "closing_at",
+  "closed_at",
+  "discarded_at",
+  "discarded_by",
+  "hide_results",
+  "notify_on_open",
+  "notify_on_closing_soon",
+  "specified_voters_only",
+  "shuffle_options",
+  "show_none_of_the_above",
+  "stance_reason_required",
+  "reason_prompt",
+  "poll_option_names",
+  "cast_stances_pct",
+  "decided_voters_count",
+  "undecided_voters_count",
+  "voters_count",
+  "versions_count",
+  "results",
+  "stance_counts",
+  "total_score",
+  "stv_results",
+  "result_heading_keys",
+  "dots_per_person",
+  "max_score",
+  "min_score",
+  "minimum_stance_choices",
+  "maximum_stance_choices",
+  "meeting_duration",
+  "stv_seats",
+  "stv_method",
+  "stv_quota",
+  "poll_template_id",
+  "poll_template_key",
+  "quorum_pct",
+  "quorum_reached",
+  "quorum_count",
+  "quorum_votes_required",
+  "weighted_voting",
+  "current_outcome_id",
+  "my_stance_id",
+  "poll_option_ids",
+  "reaction_ids",
+  "results_visible",
+  "results_hidden_reason",
+  ...TOPIC_JOIN_FIELDS,
 ] as const;
 
 /** Meaningless when `quorum_pct` is null (the poll has no quorum); see the module note. */
@@ -222,7 +307,8 @@ export function shapePoll(
   const gated = gatePollResults(record, own);
   const list = opts.mode === "list";
   const weighted = record.weighted_voting === true;
-  const base = omit(gated, list ? [...POLL_DROP, ...LIST_POLL_DROP] : POLL_DROP);
+  const base: Record<string, unknown> = pick(gated as Record<string, unknown>, POLL_FIELDS);
+  if (list) for (const f of LIST_POLL_DROP) delete base[f];
   if (list) {
     for (const knob of LIST_POLL_NULLABLE_KNOBS) if (base[knob] == null) delete base[knob];
     if (base["weighted_voting"] === false) delete base["weighted_voting"];
@@ -290,10 +376,16 @@ export interface GetPollResult {
 }
 
 export async function getPoll(input: z.infer<typeof getPollSchema>): Promise<GetPollResult> {
-  const body = await loomioGet<PollsResponse>(
-    `/b2/polls/${encodePathSegment(input.id_or_key)}`,
-    readParams("show"),
-  );
+  let body: PollsResponse;
+  try {
+    body = await loomioGet<PollsResponse>(
+      `/b2/polls/${encodePathSegment(input.id_or_key)}`,
+      readParams("show"),
+    );
+  } catch (err) {
+    // nit 19: one "absent or hidden" message in open-DCR mode.
+    collapseNotVisible(err, "poll", input.id_or_key);
+  }
   const record = body.polls?.[0];
   if (!record) {
     throw new LoomioApiError(
@@ -302,6 +394,8 @@ export async function getPoll(input: z.infer<typeof getPollSchema>): Promise<Get
         "not the one Loomio 3.8.1 produces.",
     );
   }
+  // F-17: a poll in an unlisted group (or in none) is refused.
+  assertRecordGroupAllowed(record.group_id ?? null, "poll", input.id_or_key);
   const [joined] = joinTopics([record], body.topics);
   const group =
     (body.groups ?? []).find((g) => g.id === record.group_id) ?? body.groups?.[0] ?? undefined;
@@ -352,6 +446,7 @@ export interface ListPollsResult {
 }
 
 export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise<ListPollsResult> {
+  assertGroupAllowed(input.group_id);
   const status = input.status ?? "active";
   const max = input.description_max_chars ?? DEFAULT_DESCRIPTION_MAX_CHARS;
   const stripHtml = input.strip_html ?? true;
@@ -361,7 +456,8 @@ export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise
     ...(input.limit !== undefined ? { limit: input.limit } : {}),
     ...(input.offset !== undefined ? { offset: input.offset } : {}),
     ...readParams("list"),
-  });
+    // nit 19: an unknown (404) and a hidden (403) group read alike in open-DCR mode.
+  }).catch((err: unknown) => collapseGroupListError(err, input.group_id));
   const side = sideLoadsOf(body);
   const polls = joinTopics(body.polls, body.topics).map((p) =>
     shapePoll(p, side, { detailsMaxChars: max, stripHtml, mode: "list" }),
@@ -480,7 +576,7 @@ const StanceReasonRequiredEnum = z.enum([
  * in HOWTO.md "Tool reference".
  */
 const pollSettingFields = {
-  details: z.string().optional(),
+  details: bodyText.optional(),
   details_format: z.enum(["md", "html"]).optional().describe(formatFieldDescription("details")),
   // Update-safe wording: on PATCH an omitted closing_at leaves the
   // deadline alone, so the shared text must not say "required"; the
@@ -507,7 +603,7 @@ const pollSettingFields = {
   stance_reason_required: StanceReasonRequiredEnum.optional().describe(
     "Default 'optional'; anonymous polls force 'disabled'.",
   ),
-  reason_prompt: z.string().optional().describe("Prompt above the reason box."),
+  reason_prompt: promptText.optional().describe("Prompt above the reason box."),
   show_none_of_the_above: z
     .boolean()
     .optional()
@@ -553,10 +649,10 @@ const pollRecipientFields = {
     .describe("'group' = every member (needs announce permission)."),
   recipient_user_ids: z.array(positiveId).optional().describe("User ids to invite / notify."),
   recipient_emails: z
-    .array(z.string().email())
+    .array(emailAddress)
     .optional()
     .describe("Emails to invite; non-members become guests."),
-  recipient_message: z.string().optional().describe("Text for the notification."),
+  recipient_message: messageText.optional().describe("Text for the notification."),
   notify_recipients: z
     .boolean()
     .optional()
@@ -584,7 +680,7 @@ function splitRecipients<T extends Record<string, unknown>>(
 
 export const createPollSchema = z
   .object({
-    title: z.string().min(1),
+    title: titleText,
     poll_type: PollTypeEnum.describe(
       "'question' has no options; 'meeting' options are ISO-8601 times; 'stv' takes stv_seats.",
     ),
@@ -598,14 +694,14 @@ export const createPollSchema = z
       .optional()
       .describe("Thread id (`topic_id` on any thread row); no extra call."),
     options: z
-      .array(z.string().min(1))
+      .array(promptText.min(1))
       .optional()
       .describe("Option names in order. REQUIRED except 'question'; ranked_choice/stv need 2+."),
     anonymous: z
       .boolean()
       .optional()
       .describe("Permanent. Needs closing_at; not for count, question, meeting."),
-    tags: z.array(z.string().min(1)).optional().describe("Tags for a standalone poll's thread."),
+    tags: z.array(tagName).optional().describe("Tags for a standalone poll's thread."),
     ...pollSettingFields,
     // Create-only override of the shared field: a poll saved without
     // closing_at is a draft nobody is asked to vote on.
@@ -756,6 +852,8 @@ export async function createPoll(input: CreatePollInput): Promise<CreatePollResu
   // created. `loomioPost` would refuse too, but only after that GET.
   if (isReadOnly()) throw new LoomioReadOnlyError("POST");
   const { group_id, discussion_id, topic_id, ...attrs } = input;
+  // F-17: an unlisted group is refused before anything is read or written.
+  if (group_id !== undefined) assertGroupAllowed(group_id);
 
   // Where the poll goes. A discussion reference costs one compact GET
   // (the same resolver the thread tools use) and yields the thread id
@@ -768,15 +866,31 @@ export async function createPoll(input: CreatePollInput): Promise<CreatePollResu
   // holds on that path too — Loomio derives the group from the thread
   // and would otherwise create a correctly placed poll that the
   // post-write guard below then reports as misdirected.
+  // Under a group allow-list a bare `topic_id` pays the same GET, so the
+  // thread's group is checked before the poll is attached to it (F-17).
   let attachTopicId: number | undefined = topic_id;
   const ref: ThreadRef | undefined =
     discussion_id !== undefined
       ? { discussion_id }
-      : topic_id !== undefined && group_id !== undefined
+      : topic_id !== undefined && (group_id !== undefined || hasGroupAllowlist())
         ? { topic_id }
         : undefined;
   if (ref) {
-    const { header } = await resolveThread(ref, { lookupTopic: true });
+    let header: Awaited<ReturnType<typeof resolveThread>>["header"];
+    try {
+      ({ header } = await resolveThread(ref, { lookupTopic: true }));
+    } catch (err) {
+      collapseNotVisible(
+        err,
+        discussion_id !== undefined ? "discussion" : "thread",
+        discussion_id ?? topic_id ?? "",
+      );
+    }
+    assertRecordGroupAllowed(
+      header.group_id,
+      discussion_id !== undefined ? "discussion" : "thread",
+      discussion_id ?? header.topic_id,
+    );
     attachTopicId = header.topic_id;
     if (group_id !== undefined && header.group_id !== null && header.group_id !== group_id) {
       const named =
@@ -896,9 +1010,9 @@ export async function createPoll(input: CreatePollInput): Promise<CreatePollResu
 export const updatePollSchema = z
   .object({
     id_or_key: idOrKey.describe("Poll id or short key."),
-    title: z.string().min(1).optional(),
+    title: titleText.optional(),
     options: z
-      .array(z.string().min(1))
+      .array(promptText.min(1))
       .min(1)
       .optional()
       .describe(
@@ -960,7 +1074,7 @@ export async function updatePoll(
   // names and send the union so the documented ADD semantics hold.
   let optionsSent: string[] | undefined;
   if (options !== undefined) {
-    const current = await loomioGet<PollsResponse>(path, readParams("compact"));
+    const current = await readPollForWrite(id_or_key);
     const record = current.polls?.[0];
     if (!record || !Array.isArray(record.poll_option_names)) {
       throw new LoomioApiError(
@@ -971,6 +1085,8 @@ export async function updatePoll(
       );
     }
     optionsSent = mergePollOptions(record.poll_option_names, options);
+  } else if (hasGroupAllowlist()) {
+    await readPollForWrite(id_or_key);
   }
 
   const body = optionsSent ? { ...attrs, options: optionsSent } : attrs;
@@ -1000,9 +1116,31 @@ export interface DeletePollResult extends PollWriteResult {
   note: string;
 }
 
+/**
+ * The compact pre-read a poll write makes: always when `options` must be
+ * merged, and — with a group allow-list set — on every update / delete,
+ * so a poll in an unlisted group is refused BEFORE it is written (F-17;
+ * the write's echo would otherwise hand back the whole record).
+ */
+async function readPollForWrite(ref: IdOrKey): Promise<PollsResponse> {
+  let body: PollsResponse;
+  try {
+    body = await loomioGet<PollsResponse>(
+      `/b2/polls/${encodePathSegment(ref)}`,
+      readParams("compact"),
+    );
+  } catch (err) {
+    collapseNotVisible(err, "poll", ref);
+  }
+  // A no-op without an allow-list.
+  assertRecordGroupAllowed(body.polls?.[0]?.group_id ?? null, "poll", ref);
+  return body;
+}
+
 export async function deletePoll(
   input: z.infer<typeof deletePollSchema>,
 ): Promise<DeletePollResult> {
+  if (hasGroupAllowlist()) await readPollForWrite(input.id_or_key);
   const path = `/b2/polls/${encodePathSegment(input.id_or_key)}`;
   const resp = await loomioDelete<PollsResponse>(path);
   const shaped = shapePollWrite(resp, `DELETE ${path}`);

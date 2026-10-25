@@ -13,11 +13,13 @@
  *
  *   - insecure-auto-approve (opt-in, for local / private-network use):
  *     Required env: MCP_OAUTH_INSECURE_AUTO_APPROVE=1.
+ *     Optional: MCP_OAUTH_REDIRECT_HOSTS (extra https redirect hosts for
+ *     self-registered clients; src/auth/redirect-policy.ts).
  *
  * Required env in all modes:
  *   LOOMIO_API_KEY        Loomio API key (sent as an Authorization: Bearer header)
  *   PUBLIC_BASE_URL       Public origin where this server is reachable
- *   MCP_OAUTH_SIGNING_KEY HMAC key for OAuth tokens (>=16 chars; stable
+ *   MCP_OAUTH_SIGNING_KEY HMAC key for OAuth tokens (>=32 chars; stable
  *                         across instances)
  *
  * Endpoints besides the OAuth set and POST /mcp:
@@ -27,9 +29,21 @@
  *
  * Optional env:
  *   PORT                  Listen port (default 8080; Cloud Run injects)
+ *   MCP_HTTP_BIND         Listen address. Default: the loopback host of a
+ *                         loopback PUBLIC_BASE_URL, else all interfaces.
+ *                         A non-loopback bind forfeits the localhost
+ *                         waivers (src/http/config.ts resolveBind, F-10).
  *   LOOMIO_MCP_READONLY   Same semantics as the stdio server
- *   MCP_HTTP_JSON_LIMIT   Body size cap for inbound JSON (default '1mb')
- *   MCP_HTTP_TRUST_PROXY  Number of proxy hops to trust (default 1).
+ *   MCP_HTTP_JSON_LIMIT   Body size cap for POST /mcp (default '256kb')
+ *   MCP_HTTP_TRUST_PROXY  Number of proxy hops to trust (default 0; set 1
+ *                         behind exactly one appending proxy, e.g. Cloud Run).
+ *   MCP_HTTP_UPSTREAM_BUDGET       Loomio calls one POST /mcp may start (default 120; 0 = off).
+ *   MCP_HTTP_UPSTREAM_CONCURRENCY  Concurrent Loomio calls per process (default 16).
+ *   MCP_DAILY_TOOL_CALLS / MCP_DAILY_RESULT_BYTES  Open-DCR per-source daily
+ *                         quotas (default 5000 / 500000000; 0 = off).
+ *   MCP_SHARED_EGRESS_CIDRS  Ranges many users share (hosted Claude's
+ *                         egress): keyed per client as well for the daily
+ *                         quotas and the upstream share (src/http/shared-egress.ts).
  *   LOOMIO_MCP_LOG_VERBOSE  Set to 1 / true / yes / on to emit structured events.
  *   LOOMIO_B3_API_KEY     Server-instance admin secret. When set (and not
  *                         read-only), registers the nine b3 tools: user
@@ -42,89 +56,29 @@
  *                         PUBLIC_BASE_URL (b3ExposureError).
  */
 
-import { isReadOnly } from "./loomio/client.js";
+import type { AddressInfo } from "node:net";
+import { buildHttpRuntime } from "./http/runtime.js";
 import { checkLoomioHealth, keyRejectedWarning } from "./loomio/health.js";
-import { OAuthProvider, StatelessClientsStore, FixedClientStore } from "./auth/provider.js";
-import {
-  b3ExposureError,
-  b3ExposureWarning,
-  resolveBaseConfig,
-  selectMode,
-} from "./http/config.js";
-import { createApp } from "./http/app.js";
 
 function fatal(message: string): never {
   console.error(`[loomiomcp] FATAL: ${message}`);
   process.exit(1);
 }
 
-if (!process.env["LOOMIO_API_KEY"]) {
-  fatal(
-    "LOOMIO_API_KEY environment variable is not set. " +
-      "Generate one in Loomio under your profile → API keys.",
-  );
-}
+// Every startup decision — the refusals of F-02 / F-09 / F-17, the
+// open-DCR mode switch, the startup lines — lives in buildHttpRuntime
+// (src/http/runtime.ts) so tests can pin it; this file only listens,
+// prints and probes.
+const runtime = buildHttpRuntime(process.env);
+if ("fatal" in runtime) fatal(runtime.fatal);
+const { server, port, bind } = runtime;
 
-const baseResult = resolveBaseConfig();
-if ("error" in baseResult) fatal(baseResult.error);
-const { publicBaseUrl, signingKey, port, jsonLimit, trustProxy } = baseResult.ok;
-
-const modeResult = selectMode(process.env, publicBaseUrl);
-if ("error" in modeResult) fatal(modeResult.error);
-const mode = modeResult.ok;
-
-// The b3 secret on an open-DCR public deployment would give every
-// self-registered client the instance-admin tools (see b3ExposureError).
-const b3Exposure = b3ExposureError(process.env, mode, publicBaseUrl);
-if (b3Exposure) fatal(b3Exposure);
-
-const issuerUrl = new URL(publicBaseUrl);
-const mcpResourceUrl = new URL("/mcp", issuerUrl);
-
-const oauthProvider =
-  mode.kind === "static-client"
-    ? new OAuthProvider({
-        clientsStore: new FixedClientStore({
-          clientId: mode.clientId,
-          clientSecret: mode.clientSecret,
-          redirectUris: mode.redirectUris,
-          clientName: "loomiomcp pre-registered client",
-        }),
-        signingKey,
-        resourceUrl: mcpResourceUrl,
-      })
-    : new OAuthProvider({
-        // Stateless open-DCR store: registered clients survive restarts,
-        // scale-to-zero, redeploys, and multi-instance routing, so callers
-        // aren't forced to re-authenticate when the process recycles.
-        clientsStore: new StatelessClientsStore(signingKey),
-        signingKey,
-        resourceUrl: mcpResourceUrl,
-      });
-
-const app = createApp({
-  oauthProvider,
-  issuerUrl,
-  jsonLimit,
-  allowedOrigins: baseResult.ok.allowedOrigins,
-  trustProxy,
-});
-
-app.listen(port, () => {
-  const readMode = isReadOnly() ? "read-only" : "read-write";
-  const authLabel = mode.kind === "static-client" ? "static-client" : "INSECURE_AUTO_APPROVE";
-  console.log(
-    `[loomiomcp] HTTP server listening on :${port} | mode=${readMode} | auth=${authLabel} | issuer=${issuerUrl}`,
-  );
-  if (mode.kind === "insecure-auto-approve") {
-    console.warn(
-      "[loomiomcp] WARNING: auth mode is INSECURE_AUTO_APPROVE. " +
-        "Anyone who can reach this URL can register a client and use the configured Loomio API key. " +
-        "Suitable only for local development or private-network deployments.",
-    );
+const onListening = (): void => {
+  console.log(runtime.listeningLine(server.address() as AddressInfo | null));
+  for (const line of runtime.startupLines) {
+    if (line.level === "warn") console.warn(line.text);
+    else console.log(line.text);
   }
-  const b3Warning = b3ExposureWarning(process.env, mode);
-  if (b3Warning) console.warn(`[loomiomcp] WARNING: ${b3Warning}`);
 
   // Probe the Loomio key once we are listening — non-blocking, and the
   // server keeps serving whatever the verdict. A rejected key must be
@@ -152,4 +106,12 @@ app.listen(port, () => {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[loomiomcp] WARNING: key-health probe failed at startup: ${message}`);
     });
+};
+
+// `bind.host` undefined = every interface (a non-loopback PUBLIC_BASE_URL
+// with no MCP_HTTP_BIND, e.g. Cloud Run) — see resolveBind (F-10).
+server.on("error", (err: NodeJS.ErrnoException) => {
+  fatal(`cannot listen on ${bind.host ?? "*"}:${port} (${err.code ?? err.name}).`);
 });
+if (bind.host === undefined) server.listen(port, onListening);
+else server.listen(port, bind.host, onListening);

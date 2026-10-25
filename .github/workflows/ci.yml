@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# Third-party actions are pinned by full commit SHA, not by a movable tag:
+# whoever can push a tag in an action's repository could otherwise change
+# what runs here (security review nit 13). The comment names the release
+# the SHA was resolved from; Dependabot (.github/dependabot.yml) proposes
+# the bumps and rewrites both together. `persist-credentials: false`: CI
+# never pushes, so the checkout token is not left in .git/config for the
+# steps (and dependency scripts) that follow.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,8 +25,10 @@ jobs:
         node-version: ["22", "24"]
     name: node ${{ matrix.node-version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm

@@ -28,7 +28,7 @@ needs, within a per-call page cap, flagging a walk the cap stopped.
 | `get_discussion` | 1 (2 with `include_items`, +1 per further 500 embedded items, ≤ 3; the items requests exclude `discussion`, so the opening post is not sent twice) | `exclude_types=parent membership reaction translation` (keeps `topics`, `groups`) | full text |
 | `list_polls` | 1 | list profile | `description_max_chars` (caps `details`), results gated; rows drop `results[]` / `stv_results` (per-voter ids and scores, 30–40 % of a visible poll) and null type knobs — `stance_counts` + `total_score` stay |
 | `get_poll` | 1 | show profile | full text, results gated, full `results[]` |
-| `list_threads` | 1 (`GET /b2/threads`) | `exclude_types=topic group parent membership reaction translation` (compact minus `tag`) | `limit` ≤ 100; no bodies |
+| `list_threads` | 1 (`GET /b2/threads`); under `LOOMIO_MCP_GROUP_IDS` 1–10 (it walks the index in pages of 100 so nothing it returns counts a withheld thread) | `exclude_types=topic group parent membership reaction translation` (compact minus `tag`) | `limit` ≤ 100; no bodies |
 | `list_thread_items` | 1 per 500 items of the window by `topic_id` (≤ 2), +1 with `discussion_id` / `poll_id`; with `kinds` 1 per 500 items of the whole thread (≤ 10); always 1 (+1) before 3.11.1 | `compact=1` for a bare `topic_id`; compact plus `discussion` when the thread's record is already known; compact minus `reaction` with `include_reactions` | Loomio ≥ 3.11.1 serves exactly the `offset` / `limit` window (a second page only when the first was used up without a budget cut); older Loomio returns the whole thread, sliced here (`server_paged: false`); a `max_total_chars` reply budget (default 120000 shaped characters — `limit` × `body_max_chars` alone would allow ~900 KB; `truncated_by_budget` + `next_offset` continue); `body_max_chars` (default 4000); side-loads narrowed to the returned items; polls carry `poll_options[]` so `option_scores` are readable without a `get_poll` |
 | `get_thread_markdown` | 2 on any reference (the vote-visibility guard's thread read + the document), +1 per 500 items when the guard scans (≤ 10: any thread holding more than its opening item; the scan stops early only to refuse) | guard read: `compact=1` by `topic_id`, `thread_guard` (compact minus `topic`) on the discussion / poll show; scan: `items_known_thread` | `max_chars` (default 60000) |
 | `search_content` | 1 | `compact=1` | Loomio's 20-result cap; snippets ≤ 400 chars; the `polls` side-load is read only to gate Stance snippets, never relayed |
@@ -116,22 +116,31 @@ and the twice-emitted poll settings.
 
 Three per-call event types that give visibility into runtime
 behaviour, emitted as single-line JSON to stderr and gated on
-`LOOMIO_MCP_LOG_VERBOSE=1` — plus two **forced** key-health events that
-bypass the gate, because a rotated Loomio key is exactly the failure an
-operator needs to see without having turned verbose logging on.
+`LOOMIO_MCP_LOG_VERBOSE=1` — plus **forced** events that bypass the
+gate: the two key-health events, because a rotated Loomio key is
+exactly the failure an operator needs to see without having turned
+verbose logging on, and since v0.0.17 the two exposure events, because
+a group coordinator changing what the connector serves is the other,
+and a rate-limited transport-failure event, because the error a caller
+sees for it is deliberately fixed text.
 
 | Event | Fires | Fields |
 |---|---|---|
-| `tool.call` | Once per tool invocation | `tool`, `clientId?`, `argFields` (field names only — never values), `durationMs`, `outcome` (`success` / `error`) |
+| `tool.call` | Once per tool invocation | `tool`, `clientId?` (a 16-character SHA-256 tag of the OAuth client_id, never the id itself — in open-DCR mode that is registrant-chosen text), `argFields` (field names only — never values), `durationMs`, `outcome` (`success` / `error`) |
 | `loomio.request` | Once per outbound Loomio API call | `method`, `path` (redacted: numeric IDs, string keys, handles and identity uids → placeholders, query stripped), `status`, `durationMs`, `responseBytes` (from `Content-Length`; 0 when the response was chunked) |
-| `tool.chain` | Once per `/mcp` POST request (HTTP transport only) | `clientId?`, `tools` (sequence of tool names), `toolCount`, `loomioCalls`, `durationMs` |
+| `tool.chain` | Once per `/mcp` POST request (HTTP transport only) | `clientId?` (the same tag), `tools` (sequence of tool names), `toolCount`, `loomioCalls`, `batchSize?` (message count when the POST body was a JSON-RPC array), `durationMs` |
 | `loomio.auth` (**forced**) | On every change of the key-health verdict, including the first probe (startup, `/health`, `check_connection`, or a tool consulting it) | `key_status` (`valid` / `rejected` / `unreachable`), `loomio_version`, `reason?` — a closed vocabulary: `unauthenticated_body`, `waf`, `unrecognised_403`, `http_<status>`, `timeout`, `network_error`, `config_error`. Never the key, never the probe's free-text `detail` (that may quote an upstream body or error message and goes only to the startup stderr warning) |
 | `loomio.version_drift` (**forced**, once per process) | When the instance's Loomio `major.minor` differs from `TESTED_LOOMIO_VERSION` | `level: "warning"`, `loomio_version`, `tested_loomio_version`, `message` |
+| `loomio.groups_changed` (**forced**) | When a health probe's groups index differs from the previous probe's in the same process (the first probe is the baseline): member groups added or removed, an own admin flag gained or lost, a group's `group_privacy` / `is_visible_to_public` changed, or the total moved | `added`, `removed`, `admin_gained`, `admin_lost`, `privacy_changed` (group ids), `total_before`, `total_after` — ids and counts only, never names |
+| `upstream.transport_error` (**forced**, at most once per 10 s) | When a Loomio request fails below HTTP (DNS, TLS, reset, or a request undici refused to build) | `name` (the error class), `code?` (e.g. `ECONNREFUSED`), `kind` (`config` / `network`) — never the error message, which can quote a header or the host |
+| `loomio.admin_scope` (**forced**) | When the API user's set of group-admin memberships becomes non-empty or changes (once per new set per process; also from `check_connection`'s complete index) | `level: "warning"`, `admin_group_ids`, `message` |
 
 All of them are wired through `src/log.ts`; the key-health pair comes
-from `src/loomio/health.ts`. Alert on `loomio.auth` with
+from `src/loomio/health.ts`, the exposure pair from
+`src/loomio/group-watch.ts`. Alert on `loomio.auth` with
 `key_status != "valid"` as a second signal next to the `/health` uptime
-check (DEPLOY.md). The aggregate `tool.chain`
+check, and on any `loomio.groups_changed` / `loomio.admin_scope`
+(DEPLOY.md). The aggregate `tool.chain`
 event uses an `AsyncLocalStorage` request context (set up by
 `withRequestContext` in `src/http/transport.ts`) so the same `/mcp`
 request's tool calls and outbound API calls land in one summary line.
@@ -415,7 +424,8 @@ gcloud logging read \
   | sort | uniq -c | sort -rn | head -20
 ```
 
-OAuth clientIds are stable per registered MCP client, so this is
+OAuth clientIds are stable per registered MCP client, and so is their
+logged tag (since v0.0.17 a digest, not the id), so this is
 "who's using the connector this week". Useful for capacity planning
 and for spotting a single misbehaving client driving anomalous load.
 

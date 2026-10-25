@@ -1,7 +1,80 @@
 import { z } from "zod";
+import { isOpenDcr } from "../deployment.js";
+import { LoomioApiError, LoomioAuthError } from "../loomio/client.js";
+import { notVisibleMessage } from "../loomio/group-scope.js";
+import { checkLoomioHealth } from "../loomio/health.js";
+import { getFreshKeyStatus } from "../loomio/health-cache.js";
 
 /** Strictly positive integer — Loomio uses these for every numeric id. */
 export const positiveId = z.number().int().positive();
+
+// ── Length caps on free text (security review nit 16) ──────────────────────
+//
+// v0.0.16 bounded no string input: a 200 KB "short key" travelled into a
+// URL and cost one upstream 431, a 10 000-element `kinds` array was
+// filtered against every item, and a multi-megabyte `query` went to
+// Loomio's full-text search verbatim. Every caller-supplied string now
+// has a ceiling, chosen so no legitimate value comes near it:
+//
+//   keys / handles 128   Loomio keys are 8 chars, handles a few dozen
+//   query          512   a search, not a document
+//   tag            128   per tag name
+//   kinds           64   per kind name (the catalogue's longest is 29)
+//   title          500   Loomio validates discussions at 150
+//   body       100 000   Loomio's own default `max_message_length`
+//                        (LMO_MAX_MESSAGE_LENGTH) for descriptions,
+//                        details, comments and outcomes
+//   e-mail         254   RFC 5321's path limit
+//   timestamps      64   an ISO-8601 instant is ~30
+//
+// How a ceiling reaches tools/list differs, because the catalogue is a
+// per-session tax every client pays before its first call (pinned in
+// tests/server.test.ts). The READ inputs a caller probes with — query,
+// search tag, kinds, timestamps — carry a real `.max()`, advertised as
+// `maxLength`. A key's ceiling rides in its REGEX (`{1,128}`): the
+// pattern is already in every schema that takes a key, so the bound
+// costs six bytes instead of sixteen. The WRITE fields (titles, bodies,
+// tags, e-mails, prompts, option names) go through `capped`: the same
+// refusal, with a message naming the limit, but no `maxLength` per field
+// — some thirty of them across the write tools would cost ~500 bytes of
+// every session for limits no model writes near (the HTTP entry's
+// 256 KB body cap bounds them as well).
+export const TEXT_MAX = {
+  key: 128,
+  query: 512,
+  tag: 128,
+  kind: 64,
+  title: 500,
+  prompt: 1_000,
+  message: 10_000,
+  body: 100_000,
+  email: 254,
+  timestamp: 64,
+} as const;
+
+/**
+ * `schema` refusing values longer than `max` characters, checked but not
+ * advertised (see above). A refinement, so it composes with `.min()`,
+ * `.optional()` and `.describe()` like `.max()` would.
+ */
+export function capped<T extends z.ZodString>(schema: T, max: number): T {
+  return schema.refine((v) => v.length <= max, {
+    message: `must be at most ${max} characters.`,
+  }) as T;
+}
+
+/** A required title (discussion, poll; Loomio validates discussions at 150). */
+export const titleText = capped(z.string().min(1), TEXT_MAX.title);
+/** A rich-text body (description, details, comment). */
+export const bodyText = capped(z.string(), TEXT_MAX.body);
+/** One tag name on a write (search's `tag` filter carries an advertised `.max()`). */
+export const tagName = capped(z.string().min(1), TEXT_MAX.tag);
+/** One e-mail address. */
+export const emailAddress = capped(z.string().email(), TEXT_MAX.email);
+/** A notification text (`recipient_message`). */
+export const messageText = capped(z.string(), TEXT_MAX.message);
+/** A short prompt or poll option name. */
+export const promptText = capped(z.string(), TEXT_MAX.prompt);
 
 /**
  * Loomio identifiers are either numeric ids or short string keys
@@ -9,7 +82,10 @@ export const positiveId = z.number().int().positive();
  */
 export const loomioKey = z
   .string()
-  .regex(/^[A-Za-z0-9_-]+$/, "Loomio short keys may only contain letters, numbers, _ and -.");
+  .regex(
+    /^[A-Za-z0-9_-]{1,128}$/,
+    "Loomio short keys may only contain letters, numbers, _ and - (1-128 characters).",
+  );
 
 export const idOrKey = z.union([loomioKey, positiveId]);
 
@@ -24,6 +100,7 @@ export type IdOrKey = z.infer<typeof idOrKey>;
  */
 export const isoTimestamp = z
   .string()
+  .max(TEXT_MAX.timestamp)
   .refine((v) => !Number.isNaN(Date.parse(v)), {
     message: "must be a parseable ISO-8601 timestamp (e.g. 2026-01-31 or 2026-01-31T00:00:00Z).",
   })
@@ -35,6 +112,85 @@ export function encodePathSegment(value: IdOrKey): string {
     throw new Error("id_or_key must be a non-empty Loomio id or short key.");
   }
   return encodeURIComponent(raw);
+}
+
+/**
+ * Re-say "hidden" and "not found" as ONE message in open-DCR mode
+ * (security review nit 19), then rethrow.
+ *
+ * WHY. Loomio's record shows answer an unknown id with 404 and an id
+ * that exists but is hidden from the API user with 403 "Not authorized
+ * to show …" — and the connector's own messages explained the
+ * difference ("this identifier is wrong rather than restricted"). Walked
+ * over sequential ids, that tells an anonymous open-DCR caller which
+ * private groups, discussions and polls EXIST. Loomio's web UI has the
+ * same oracle, so on a static-client deployment (one known client) the
+ * precise wording stays: it is the better diagnostic. Only a record
+ * refusal is collapsed — a 403 about the KEY (`unauthenticated`, `waf`,
+ * …) says the same for every id and keeps its own explanation.
+ */
+export function collapseNotVisible(
+  err: unknown,
+  what: "group" | "discussion" | "poll" | "thread",
+  ref: string | number,
+): never {
+  maybeCollapseNotVisible(err, what, ref);
+  throw err;
+}
+
+/**
+ * The throwing half of `collapseNotVisible` alone: throws the collapsed
+ * 404 when it applies and RETURNS otherwise, for callers that go on to
+ * word the error precisely outside open-DCR mode.
+ */
+export function maybeCollapseNotVisible(
+  err: unknown,
+  what: "group" | "discussion" | "poll" | "thread",
+  ref: string | number,
+): void {
+  if (isOpenDcr() && isHiddenOrMissing(err)) {
+    throw new LoomioApiError(404, notVisibleMessage(what, ref));
+  }
+}
+
+function isHiddenOrMissing(err: unknown): boolean {
+  if (err instanceof LoomioApiError && err.status === 404) return true;
+  return err instanceof LoomioAuthError && err.status === 403 && err.kind === "not_authorized";
+}
+
+/**
+ * nit 19 for the group-keyed LISTS (round-2 finding): list_discussions,
+ * list_polls and list_memberships rebuilt the existence oracle that
+ * get_group no longer gives. Loomio 3.13.1's `records_visible_in_group`
+ * (b2 discussions/polls index) runs `Group.find` — 404 for an unknown id
+ * — and then a bare `raise CanCan::AccessDenied` — the GENERIC 403 body,
+ * which the client classifies `unauthenticated` — for a hidden group.
+ * In open-DCR mode both now read `notVisibleMessage("group", id)`.
+ *
+ * The generic body on these two routes is ALSO what a dead key gets, so
+ * a 403 is collapsed only while the key is not known to be rejected:
+ * the fresh probe verdict, else one probe (cached 60 s, so a walk over
+ * ids costs at most two extra Loomio calls a minute). A dead key says
+ * the same for every id — no oracle — and keeps its own diagnosis.
+ * Rethrows anything else unchanged.
+ */
+export async function collapseGroupListError(err: unknown, groupId: number): Promise<never> {
+  if (isOpenDcr()) {
+    const missing = err instanceof LoomioApiError && err.status === 404;
+    const forbidden =
+      err instanceof LoomioAuthError &&
+      err.status === 403 &&
+      (err.kind === "not_authorized" || err.kind === "unauthenticated");
+    if (missing || (forbidden && (await keyNotRejected()))) {
+      throw new LoomioApiError(404, notVisibleMessage("group", groupId));
+    }
+  }
+  throw err;
+}
+
+async function keyNotRejected(): Promise<boolean> {
+  const status = getFreshKeyStatus() ?? (await checkLoomioHealth()).key_status;
+  return status !== "rejected";
 }
 
 /**

@@ -10,15 +10,22 @@ import {
   readParams,
 } from "../loomio/client.js";
 import {
+  CHECK_CONNECTION_PROBE_MAX_AGE_MS,
   checkLoomioHealth,
   getCachedGroupsIndex,
   keyRejectedWarning,
   type LoomioHealth,
 } from "../loomio/health.js";
+import { adminGroupIds, lastGroupsChange, noteAdminScope } from "../loomio/group-watch.js";
+import {
+  assertGroupAllowed,
+  assertRecordGroupAllowed,
+  filterGroupsIndex,
+  hasGroupAllowlist,
+} from "../loomio/group-scope.js";
 import {
   groupUrl,
   indexById,
-  omit,
   pick,
   type SlimGroup,
   slimGroup,
@@ -26,8 +33,9 @@ import {
   type SlimUser,
 } from "../loomio/shape.js";
 import type { GroupsIndexResponse, LoomioGroup, LoomioMembership } from "../loomio/types.js";
+import { isUpstreamStop } from "../loomio/upstream.js";
 import { TESTED_LOOMIO_VERSION, VERSION } from "../version.js";
-import { encodePathSegment, idOrKeyOrHandle } from "./_common.js";
+import { encodePathSegment, idOrKeyOrHandle, maybeCollapseNotVisible } from "./_common.js";
 
 // ── GET /b2/groups — what the index is and is not ──────────────────────────
 //
@@ -80,32 +88,84 @@ import { encodePathSegment, idOrKeyOrHandle } from "./_common.js";
 // parses.
 
 /**
- * The group fields worth dropping even from a "full" record: binary
- * attachment metadata, link-preview cards (image urls, hostnames,
- * copied descriptions), cover/logo image urls, `tag_ids` (dangling once
- * the `tags` root is excluded), and the billing block. GroupSerializer
- * emits `subscription` {plan, state, active, max_members, max_threads,
- * allow_subgroups, renews_at, expires_at, members_count} whenever the
- * API user holds an active membership in the group's organisation
- * (`include_subscription?`) — it is a serializer ATTRIBUTE, so no
- * `exclude_types` profile can drop it. That is the organisation's Loomio
- * plan, seat caps and renewal dates: nothing a caller asks a group for,
- * and on an open-DCR deployment it would reach every anonymous caller
- * for every member group. `enabled` (kept) already says whether the
- * subscription is active. `new_host` (a migration hint from `info`) and
- * `discarded_by` (a user id on a discarded group) are noise too.
+ * The group fields get_group relays: an ALLOW-list (security review
+ * nit 12). Through v0.0.16 the show was the record minus a deny-list,
+ * so every attribute a Loomio upgrade added reached every caller
+ * unreviewed (the review's stub relayed an invented `info` field). The
+ * list is GroupSerializer's 3.13.1 attributes (group_serializer.rb:2-54)
+ * plus the two association ids it embeds (`parent_id`,
+ * `current_user_membership_id`), MINUS what v0.0.16 already dropped —
+ * so for a real 3.13.1 reply the output is unchanged:
+ *
+ *   dropped  attachments, link_previews (preview cards), cover_url,
+ *            logo_url, has_custom_cover_photo (images), tag_ids (dangling
+ *            once the `tags` root is excluded), token (the group's
+ *            invitation token), subscription (the organisation's plan,
+ *            seat caps and renewal dates — GroupSerializer emits it
+ *            whenever the API user holds an active membership in the
+ *            organisation, and `enabled`, kept, already says whether it
+ *            is active), new_host (a migration hint), discarded_by (a
+ *            user id on a discarded group).
+ *
+ * A field Loomio adds later stays out until someone adds it here
+ * (tests/tools-hardening.test.ts pins both directions against the fixture).
  */
-const GROUP_SHOW_DROP = [
-  "attachments",
-  "link_previews",
-  "cover_url",
-  "logo_url",
-  "has_custom_cover_photo",
-  "tag_ids",
-  "token",
-  "subscription",
-  "new_host",
-  "discarded_by",
+export const GROUP_SHOW_FIELDS = [
+  "id",
+  "key",
+  "handle",
+  "name",
+  "full_name",
+  "content_locale",
+  "description",
+  "description_format",
+  "created_at",
+  "creator_id",
+  "parent_id",
+  "current_user_membership_id",
+  "members_can_add_members",
+  "members_can_add_guests",
+  "members_can_announce",
+  "members_can_create_subgroups",
+  "members_can_create_tags",
+  "members_can_start_discussions",
+  "non_members_can_start_discussions",
+  "members_can_edit_discussions",
+  "members_can_edit_comments",
+  "members_can_delete_comments",
+  "members_can_raise_motions",
+  "members_can_create_templates",
+  "admins_can_edit_user_content",
+  "polls_count",
+  "poll_templates_count",
+  "discussions_count",
+  "group_privacy",
+  "listed_in_explore",
+  "memberships_count",
+  "pending_memberships_count",
+  "accepted_memberships_count",
+  "membership_granted_upon",
+  "discussion_privacy_options",
+  "admin_memberships_count",
+  "discarded_at",
+  "enabled",
+  "is_visible_to_public",
+  "is_visible_to_parent_members",
+  "parent_members_can_see_discussions",
+  "org_members_count",
+  "subgroups_count",
+  "categorize_poll_templates",
+  "category",
+  "request_to_join_prompt",
+  "current_user_followed",
+  // Loomio 3.8 – 3.10 only (src/loomio/types.ts, "≤ 3.10"): v0.0.16 relayed
+  // them through its deny-list and HOWTO.md promises them on those
+  // versions; `pick` skips a key a 3.11+ server does not send, so 3.13.1
+  // output is unchanged (review round 1, as polls keep `voting_system`).
+  "closed_polls_count",
+  "delegates_count",
+  "discussion_templates_count",
+  "org_discussions_count",
 ] as const;
 
 export interface GroupMembership {
@@ -281,6 +341,11 @@ function urlOf(group: LoomioGroup): { url?: string } {
   return url ? { url } : {};
 }
 
+/** Appended to list_groups / check_connection notes when LOOMIO_MCP_GROUP_IDS is set. */
+export const GROUP_ALLOWLIST_NOTE =
+  "This deployment serves only the groups its operator listed (LOOMIO_MCP_GROUP_IDS): other groups " +
+  "of the connector's user are not shown and every tool refuses them.";
+
 export async function listGroups(
   _input: z.infer<typeof listGroupsSchema> = {},
 ): Promise<ListGroupsResult> {
@@ -289,7 +354,11 @@ export async function listGroups(
     readParams("groups"),
     { root: "groups", maxPages: MAX_GROUP_PAGES },
   );
-  return shapeGroupsIndex(body, state);
+  // F-17: the operator's allow-list, applied before shaping so totals and
+  // counts describe only the listed groups.
+  const shaped = shapeGroupsIndex(filterGroupsIndex(body), state);
+  if (hasGroupAllowlist()) shaped.scope.note += ` ${GROUP_ALLOWLIST_NOTE}`;
+  return shaped;
 }
 
 // ── get_group ───────────────────────────────────────────────────────────────
@@ -319,11 +388,18 @@ export interface GetGroupResult {
 }
 
 export async function getGroup(input: z.infer<typeof getGroupSchema>): Promise<GetGroupResult> {
-  const segment = encodePathSegment(input.id_or_key_or_handle);
+  const ref = input.id_or_key_or_handle;
+  // F-17: a numeric id outside the allow-list is refused before the
+  // request; a key or handle is judged on the record below.
+  if (typeof ref === "number") assertGroupAllowed(ref);
+  const segment = encodePathSegment(ref);
   let body: GroupsIndexResponse;
   try {
     body = await loomioGet<GroupsIndexResponse>(`/b2/groups/${segment}`, readParams("groups"));
   } catch (err) {
+    // nit 19: in open-DCR mode "hidden" (403) and "no such group" (404)
+    // read the same; elsewhere the precise wording below stays.
+    maybeCollapseNotVisible(err, "group", ref);
     if (err instanceof LoomioApiError && err.status === 404) {
       throw new LoomioApiError(
         404,
@@ -342,11 +418,12 @@ export async function getGroup(input: z.infer<typeof getGroupSchema>): Promise<G
         "response shape is not the one Loomio 3.8.1 produces.",
     );
   }
+  assertRecordGroupAllowed(group.id, "group", ref);
   const membership = ownMembershipsByGroup([group], body.memberships).get(group.id);
   const parent =
     group.parent_id != null ? indexById(body.parent_groups).get(group.parent_id) : undefined;
   return {
-    group: omit(group, GROUP_SHOW_DROP),
+    group: pick(group as Record<string, unknown>, GROUP_SHOW_FIELDS) as GetGroupResult["group"],
     member: Boolean(membership),
     membership: membership ? membershipSummary(membership) : null,
     parent: parent
@@ -485,7 +562,8 @@ export function shapeConnectionGroups(body: GroupsIndexResponse): {
 export async function checkConnection(
   _input: z.infer<typeof checkConnectionSchema> = {},
 ): Promise<CheckConnectionResult> {
-  const health = await checkLoomioHealth({ force: true });
+  // A probe up to 10 s old is reused (not `force`): see health.ts.
+  const health = await checkLoomioHealth({ maxAgeMs: CHECK_CONNECTION_PROBE_MAX_AGE_MS });
   const notes: string[] = [];
   let index: GroupsIndexResponse | undefined;
   let partial = false;
@@ -510,20 +588,36 @@ export async function checkConnection(
     notes.push(UNREACHABLE_NOTE);
   }
 
+  // The identity comes from the whole index (any own membership row names
+  // the user); the groups shown, and their total, from the allow-listed
+  // part only (F-17) — so the reply describes exactly what the tools serve.
+  const empty = { user: null, groups: [] as ConnectionGroup[], groups_total: 0 };
+  const whole = index ? shapeConnectionGroups(index) : empty;
   const shaped = index
-    ? shapeConnectionGroups(index)
-    : { user: null, groups: [] as ConnectionGroup[], groups_total: 0 };
+    ? { ...shapeConnectionGroups(filterGroupsIndex(index)), user: whole.user }
+    : empty;
+  // F-04: an admin membership anywhere is a posture the operator must
+  // know about (Loomio then serialises member e-mails on those rosters):
+  // a forced `loomio.admin_scope` event, from the COMPLETE index — the
+  // probe only sees its first page.
+  if (index) noteAdminScope(adminGroupIds(index), "complete");
 
   if (health.key_status === "valid") {
     if (partial) {
       const listed = Array.isArray(index?.groups) ? index.groups.length : 0;
       notes.push(
-        `Only the first ${listed} of ${shaped.groups_total} member groups are listed ` +
+        `Only the first ${listed} of ${whole.groups_total} member groups are listed ` +
           "(groups_partial): Loomio pages its groups index and the connector could not read the " +
           "rest in this call. list_groups pages through the full list; retry it or this tool.",
       );
     }
-    if (shaped.groups_total === 0) {
+    if (whole.groups_total > 0 && shaped.groups_total === 0) {
+      notes.push(
+        "None of the connector user's groups is in this deployment's group allow-list " +
+          "(LOOMIO_MCP_GROUP_IDS), so every group-scoped tool refuses until the operator lists one.",
+      );
+    }
+    if (whole.groups_total === 0) {
       notes.push(
         "The API key is valid but the connector's user belongs to no group, so every group-scoped " +
           "tool will answer empty or 403 until a group admin adds the user. Publicly visible groups " +
@@ -548,6 +642,26 @@ export async function checkConnection(
       notes.push(
         `${parents} parent group(s) are listed for navigation only (member_state "parent"): the user is ` +
           "not a member; they are readable only if publicly visible.",
+      );
+    }
+    const admin = shaped.groups.filter((g) => g.admin).length;
+    if (admin > 0) {
+      notes.push(
+        `The connector's user is a group ADMIN in ${admin} group(s) (admin: true). Loomio then sends ` +
+          "member e-mail addresses on those rosters; the connector withholds them in read-only mode " +
+          "and on its own row, but a writable deployment relays them. Keep the user a plain member " +
+          "unless it must manage memberships.",
+      );
+    }
+    if (hasGroupAllowlist()) notes.push(GROUP_ALLOWLIST_NOTE);
+    const change = lastGroupsChange();
+    if (change) {
+      // No ids: under an allow-list they could name unlisted groups. The
+      // forced `loomio.groups_changed` log event carries them.
+      notes.push(
+        `The health probe saw the connector user's groups change at ${change.at} (a group joined or ` +
+          "left, an admin role gained or lost, or a group's privacy changed). Coordinators make such " +
+          "changes in Loomio without telling the operator; check that the exposure is still intended.",
       );
     }
   }
@@ -633,7 +747,10 @@ async function completeGroupsIndex(
       maxPages: MAX_GROUP_PAGES,
     });
     return { index: mergePageBodies([probe, rest.body], "groups"), partial: rest.state.capped };
-  } catch {
+  } catch (err) {
+    // F-01: budget / cancellation / a full upstream queue end the call; only
+    // a Loomio failure on the later pages degrades to the first page.
+    if (isUpstreamStop(err)) throw err;
     return { index: probe, partial: true };
   }
 }
