@@ -8,7 +8,8 @@ import {
   pollResultsVisible,
   type ResultsVisibility,
 } from "../loomio/visibility.js";
-import { positiveId } from "./_common.js";
+import { assertGroupAllowed, hasGroupAllowlist, isGroupAllowed } from "../loomio/group-scope.js";
+import { positiveId, TEXT_MAX } from "./_common.js";
 
 // ── GET /b2/search (Loomio 3.8.1) ───────────────────────────────────────────
 //
@@ -97,9 +98,33 @@ import { positiveId } from "./_common.js";
 // Loomio's own web search has the same property — it shows the member
 // the full reason — so nothing is widened; but SECURITY.md promises that
 // no tool reads what another withholds, so in query mode such hits are
-// DROPPED from the results and counted in `scope.hidden_stance_hits_dropped`.
+// DROPPED from the results — silently. v0.0.16 counted them in
+// `scope.hidden_stance_hits_dropped` and computed `capped` BEFORE the
+// drop, and either number answered the same yes/no per prefix (security
+// review F-03: the reason prefix "reserve" was recovered in 74 calls
+// without ever seeing a snippet). So there is no count, and `capped`
+// is computed from what is RETURNED. One more step closes the single-drop
+// case at Loomio's 20-result cap (review round 1): when a drop is
+// possible (query mode, or a group allow-list) the reply holds at most
+// 19 rows and `capped` means "19 rows returned". Otherwise 20 visible
+// matches gave 20 rows and capped:true while 19 visible + 1 withheld gave
+// 19 rows and capped:false — a caller who knew of 20 visible matches
+// learned that a withheld item matched. Now both read 19 / true, and a
+// result made only of withheld hits still reads like an empty one. The
+// residual: TWO or more withheld hits in Loomio's first 20 shorten the
+// page visibly to a caller who knows of 20+ visible matches (SECURITY.md
+// "Accepted risks"). The price: one row less on a capped query, and
+// `capped` reads true for exactly 19 matches, false when Loomio had more
+// behind 2+ dropped hits; the scope note says so.
 // Author-only mode has no probe term: there the hit stays, snippet
 // withheld, so "what did X vote on recently" still lists the vote.
+//
+// Group allow-list (LOOMIO_MCP_GROUP_IDS, src/loomio/group-scope.ts):
+// a `group_id` outside it is refused before the request; without one,
+// hits in unlisted groups (and hits with no group) are dropped the same
+// silent way — Loomio's search takes one group or none, so the filter
+// can only be client-side, and a count would be an oracle over the
+// unlisted groups' content.
 
 export const SEARCHABLE_TYPES = ["Discussion", "Comment", "Poll", "Stance", "Outcome"] as const;
 export type SearchableType = (typeof SEARCHABLE_TYPES)[number];
@@ -119,6 +144,7 @@ export const searchContentSchema = z
       .string()
       .trim()
       .min(1)
+      .max(TEXT_MAX.query)
       .optional()
       .describe("Full-text query (prefix match; `!word` excludes)."),
     author_id: positiveId
@@ -133,6 +159,7 @@ export const searchContentSchema = z
     tag: z
       .string()
       .min(1)
+      .max(TEXT_MAX.tag)
       .optional()
       .describe(
         "Only items tagged with this exact name (Loomio < 3.13: every item of a tagged thread).",
@@ -192,12 +219,14 @@ export interface SearchHit {
 export interface SearchContentResult {
   results: SearchHit[];
   returned: number;
-  /** True when Loomio's 20-result cap was reached: there may be more matches than shown — narrow the search. */
+  /**
+   * True when 20 hits are RETURNED (Loomio's cap): there are probably
+   * more — narrow the search. Computed after the connector's own
+   * filters, so it can also read false when Loomio had more matches.
+   */
   capped: boolean;
   mode: "query" | "author" | "query+author";
   scope: {
-    /** `query` mode only: Stance hits removed because their poll hides results from the connector's user (see the note). */
-    hidden_stance_hits_dropped: number;
     query: string | null;
     author_id: number | null;
     group_id: number | null;
@@ -210,18 +239,22 @@ export interface SearchContentResult {
 }
 
 const SEARCH_SCOPE_NOTE =
-  "Loomio returns at most 20 results and has no paging or total: `capped: true` means the match set " +
-  "is larger than shown — add types/group_id/author_id or a sharper query. Scope is everything the " +
+  "Loomio returns at most 20 results and has no paging or total; a query search shows at most 19. " +
+  "`capped: true` means the match set may be larger than shown — add types/group_id/author_id or a " +
+  "sharper query. Scope is everything the " +
   "connector's user can see (member groups plus public threads of public groups); private content in " +
   "other groups is silently absent. Query terms match as prefixes, `!term` excludes; close-spelling " +
   "matches depend on the instance's search vocabulary. `id` is the record id of the hit; open it with " +
   "get_discussion / get_poll, or the thread with list_thread_items(topic_id) via the discussion. A " +
-  "Stance hit on a poll whose results are hidden from the connector's user (hide_results until_vote " +
-  "and it has not voted; until_closed and still open) is DROPPED from a query search — its presence " +
-  "alone would confirm the term occurs in the withheld reason — and counted in " +
-  "hidden_stance_hits_dropped; in author-only mode it stays with `snippet: null` and " +
-  "`snippet_hidden_reason`. Never use search to probe hidden vote reasons. `group." +
-  "full_name` is Loomio's 'Parent - Subgroup' form; join on `group.id`, not on the name.";
+  "vote whose poll hides results from the connector's user (hide_results until_vote and it has not " +
+  "voted; until_closed and still open) is silently absent from a query search, uncounted, so " +
+  "`capped` may read false although Loomio had more; in author-only mode it is listed with " +
+  "`snippet: null` and `snippet_hidden_reason`. `group.full_name` is Loomio's 'Parent - Subgroup' " +
+  "form; join on `group.id`, not on the name.";
+
+/** Appended when the operator's group allow-list (LOOMIO_MCP_GROUP_IDS) filtered the hits. */
+const SEARCH_ALLOWLIST_NOTE =
+  " This deployment serves only its listed groups: hits elsewhere are silently absent, uncounted.";
 
 /** Appended when `tag` was given: Loomio 3.13 changed what it matches (see the module note). */
 const SEARCH_TAG_NOTE =
@@ -310,6 +343,8 @@ export function shapeSearchHits(body: SearchResponse): SearchHit[] {
 }
 
 export async function searchContent(input: SearchContentInput): Promise<SearchContentResult> {
+  // F-17: an unlisted group is refused before the request.
+  if (input.group_id !== undefined) assertGroupAllowed(input.group_id);
   const hasQuery = input.query !== undefined;
   const order: SearchOrder = hasQuery ? (input.order ?? DEFAULT_SEARCH_ORDER) : "authored_at_desc";
   const body = await loomioGet<SearchResponse>("/b2/search", {
@@ -325,23 +360,36 @@ export async function searchContent(input: SearchContentInput): Promise<SearchCo
   });
   const hits = shapeSearchHits(body);
   // Query mode: a hidden Stance hit's existence is itself the leak (see
-  // the module note), so the row goes, not just its snippet. Author mode
-  // keeps it with the snippet withheld.
-  const results = hasQuery ? hits.filter((h) => h.snippet_hidden_reason === undefined) : hits;
+  // the module note), so the row goes, not just its snippet — and
+  // nothing in the reply may count it. Author mode keeps it with the
+  // snippet withheld. Hits outside the group allow-list go the same
+  // silent way (F-17); `isGroupAllowed` passes everything without one.
+  const kept = hits.filter(
+    (h) =>
+      (!hasQuery || h.snippet_hidden_reason === undefined) && isGroupAllowed(h.group?.id ?? null),
+  );
+  // Where a drop is possible, one slot of Loomio's 20 is held back so a
+  // single dropped hit cannot be told from a 20th visible one (module
+  // note). Decided from the INPUT and the deployment, never the data.
+  const cap = hasQuery || hasGroupAllowlist() ? SEARCH_RESULT_CAP - 1 : SEARCH_RESULT_CAP;
+  const results = kept.slice(0, cap);
   return {
     results,
     returned: results.length,
-    capped: hits.length >= SEARCH_RESULT_CAP,
+    // From what is returned, never from what Loomio sent (module note).
+    capped: results.length >= cap,
     mode: hasQuery ? (input.author_id !== undefined ? "query+author" : "query") : "author",
     scope: {
-      hidden_stance_hits_dropped: hits.length - results.length,
       query: input.query ?? null,
       author_id: input.author_id ?? null,
       group_id: input.group_id ?? null,
       types: input.types ?? null,
       tag: input.tag ?? null,
       order,
-      note: input.tag !== undefined ? SEARCH_SCOPE_NOTE + SEARCH_TAG_NOTE : SEARCH_SCOPE_NOTE,
+      note:
+        SEARCH_SCOPE_NOTE +
+        (input.tag !== undefined ? SEARCH_TAG_NOTE : "") +
+        (hasGroupAllowlist() ? SEARCH_ALLOWLIST_NOTE : ""),
     },
   };
 }

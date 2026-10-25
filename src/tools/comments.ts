@@ -4,12 +4,26 @@ import {
   LoomioApiError,
   LoomioAuthError,
   loomioDelete,
+  loomioGet,
   loomioPatch,
   loomioPost,
+  readParams,
 } from "../loomio/client.js";
+import {
+  assertRecordGroupAllowed,
+  GroupScopeError,
+  hasGroupAllowlist,
+} from "../loomio/group-scope.js";
 import { type SlimUser, slimUsers } from "../loomio/shape.js";
-import type { LoomioComment, LoomioSideLoads } from "../loomio/types.js";
-import { formatFieldDescription, idOrKey, positiveId, refuseHtmlWithoutFormat } from "./_common.js";
+import type { LoomioComment, LoomioSideLoads, PollsResponse } from "../loomio/types.js";
+import {
+  bodyText,
+  collapseNotVisible,
+  formatFieldDescription,
+  idOrKey,
+  positiveId,
+  refuseHtmlWithoutFormat,
+} from "./_common.js";
 import { resolveThread, type ShapedComment, shapeComment } from "./threads.js";
 
 // ── Comment writes: FLAT JSON, and why ──────────────────────────────────────
@@ -88,6 +102,16 @@ import { resolveThread, type ShapedComment, shapeComment } from "./threads.js";
 // resolves a key with the same one compact GET the thread tools use
 // (`resolveThread`'s discussion branch → the record's numeric `id`),
 // before the POST. A numeric id costs nothing extra.
+//
+// Group allow-list (LOOMIO_MCP_GROUP_IDS, security review F-17). A
+// write must be placed in a listed group BEFORE it is sent, and a
+// comment's group is only knowable through its parent: a discussion
+// (`discussion_id`, or parent_type 'Discussion') or a poll (parent_type
+// 'Poll') costs one compact GET and is checked; a reply to a Comment,
+// Stance or Outcome, and update_comment / delete_comment (addressed by
+// comment id), cannot be placed — Loomio's b2 API has no read route for
+// those records — so under an allow-list they are REFUSED (fail closed).
+// Without an allow-list nothing here costs a call.
 
 const ParentTypeEnum = z.enum(["Discussion", "Comment", "Poll", "Stance", "Outcome"]);
 
@@ -100,7 +124,7 @@ export const createCommentSchema = z
       .optional()
       .describe("Comment, Poll, Stance or Outcome id to reply to (needs parent_type)."),
     parent_type: ParentTypeEnum.optional().describe("Type of parent_id; required with it."),
-    body: z.string().min(1),
+    body: bodyText.min(1),
     body_format: z.enum(["md", "html"]).optional().describe(formatFieldDescription("body")),
   })
   .superRefine((input, ctx) => {
@@ -164,8 +188,10 @@ export async function createComment(
   // A short key must become the numeric id before the POST (see the
   // module note); the resolver's 404 wording ("no such id or key") is
   // reused as is.
-  let discussionId: number | undefined;
-  if (typeof input.discussion_id === "string") {
+  // Under a group allow-list the check above already resolved (and
+  // judged) the discussion; otherwise a key costs the one GET here.
+  let discussionId = await assertCommentTargetInScope(input);
+  if (discussionId === undefined && typeof input.discussion_id === "string") {
     const { header } = await resolveThread({ discussion_id: input.discussion_id });
     if (header.id == null) {
       throw new LoomioApiError(
@@ -175,8 +201,8 @@ export async function createComment(
       );
     }
     discussionId = header.id;
-  } else {
-    discussionId = input.discussion_id;
+  } else if (discussionId === undefined) {
+    discussionId = typeof input.discussion_id === "number" ? input.discussion_id : undefined;
   }
   // Exactly the five schema keys (see the module note: from Loomio 3.12
   // any other top-level key answers 400). zod has already stripped
@@ -195,6 +221,53 @@ export async function createComment(
     explainCreateRefusal(err, input.parent_type);
   }
   return shapeCommentWrite(resp, "POST /b2/comments");
+}
+
+/** The allow-list refusal for a comment write whose group cannot be read (module note). */
+function unplaceable(what: string): GroupScopeError {
+  return new GroupScopeError(
+    `${what} cannot be checked against this connector's group allow-list (LOOMIO_MCP_GROUP_IDS): ` +
+      "Loomio's API has no read for a comment, vote or outcome that would name its group, so the " +
+      "write is refused. Comment on the discussion (discussion_id) or the poll (parent_type 'Poll') " +
+      "instead, or edit the comment in Loomio.",
+  );
+}
+
+/**
+ * F-17 for create_comment (module note): with an allow-list set, read the
+ * parent discussion or poll and refuse one outside the list before the
+ * POST. The explicit parent wins over `discussion_id`, as in Loomio.
+ * Returns the discussion's numeric id when it resolved `discussion_id`
+ * itself, so the caller does not read the same record twice.
+ */
+async function assertCommentTargetInScope(
+  input: z.infer<typeof createCommentSchema>,
+): Promise<number | undefined> {
+  if (!hasGroupAllowlist()) return undefined;
+  const type = input.parent_id !== undefined ? input.parent_type : "Discussion";
+  const ref = input.parent_id ?? input.discussion_id;
+  if (ref === undefined) return undefined;
+  if (type === "Discussion") {
+    let header: Awaited<ReturnType<typeof resolveThread>>["header"];
+    try {
+      ({ header } = await resolveThread({ discussion_id: ref }));
+    } catch (err) {
+      collapseNotVisible(err, "discussion", ref);
+    }
+    assertRecordGroupAllowed(header.group_id, "discussion", ref);
+    return input.parent_id === undefined ? (header.id ?? undefined) : undefined;
+  }
+  if (type === "Poll") {
+    let body: PollsResponse;
+    try {
+      body = await loomioGet<PollsResponse>(`/b2/polls/${ref}`, readParams("compact"));
+    } catch (err) {
+      collapseNotVisible(err, "poll", ref);
+    }
+    assertRecordGroupAllowed(body.polls?.[0]?.group_id ?? null, "poll", ref);
+    return undefined;
+  }
+  throw unplaceable(`A reply to a ${type ?? "record"}`);
 }
 
 /**
@@ -255,7 +328,7 @@ function explainCreateRefusal(err: unknown, parentType: string | undefined): nev
 
 export const updateCommentSchema = z.object({
   id: positiveId,
-  body: z.string().min(1).describe("New body; REPLACES the whole text."),
+  body: bodyText.min(1).describe("New body; REPLACES the whole text."),
   body_format: z
     .enum(["md", "html"])
     .optional()
@@ -266,6 +339,7 @@ export async function updateComment(
   input: z.infer<typeof updateCommentSchema>,
 ): Promise<CommentWriteResult> {
   const { id, ...attrs } = input;
+  if (hasGroupAllowlist()) throw unplaceable("A comment edit");
   const path = `/b2/comments/${id}`;
   const resp = await loomioPatch<CommentsResponse>(path, flatBody(attrs));
   return shapeCommentWrite(resp, `PATCH ${path}`);
@@ -297,6 +371,7 @@ export interface DeleteCommentResult extends CommentWriteResult {
 export async function deleteComment(
   input: z.infer<typeof deleteCommentSchema>,
 ): Promise<DeleteCommentResult> {
+  if (hasGroupAllowlist()) throw unplaceable("A comment deletion");
   const path = `/b2/comments/${input.id}`;
   const resp = await loomioDelete<CommentsResponse>(path);
   const shaped = shapeCommentWrite(resp, `DELETE ${path}`);

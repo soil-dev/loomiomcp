@@ -38,7 +38,15 @@
  *               unreachable — from the key-health probe, src/loomio/health.ts);
  *               version_drift (FORCED, once: the instance's Loomio
  *               major.minor differs from the version this connector was
- *               tested against)
+ *               tested against); groups_changed (FORCED: the probe saw
+ *               the API user's group set, an own admin flag or a group's
+ *               privacy change since the previous probe); admin_scope
+ *               (FORCED: the API user holds a group-admin membership —
+ *               its rosters then carry e-mail addresses upstream)
+ *   upstream.* — transport_error (FORCED, at most one per 10 s: a fetch
+ *               failed below HTTP — DNS, TLS, reset. Carries the error
+ *               `name` and its `code` only, never the message, which
+ *               may quote the configured host or a credential)
  *
  * Adding new areas follows the same shape: pick a verb, populate the
  * relevant fields, call logEvent. **Privacy invariants** (load-bearing
@@ -52,6 +60,8 @@
  *     for `:id` placeholders, and the query string is dropped. The API
  *     key travels in an `Authorization` header, and headers are never
  *     logged.
+ *   - Client ids are logged as `clientIdTag()` digests, never verbatim:
+ *     in open-DCR mode a client_id carries registrant-chosen text.
  *   - No request / response bodies, ever. This includes the FORCED
  *     events: `loomio.auth` carries a closed-vocabulary `reason` code
  *     (src/loomio/health-cache.ts `HealthReason`), never the probe's
@@ -61,6 +71,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { readBool } from "./env.js";
 
 /** True when verbose event logging is opted in via env. */
@@ -170,7 +181,26 @@ export function redactPath(path: string): string {
 }
 
 /**
- * Per-`/mcp`-request context for the `tool.chain` aggregate event.
+ * The value logged for a client: a 16-character base64url tag of
+ * SHA-256(client_id), never the client_id itself.
+ *
+ * WHY (security review F-13). In open-DCR mode the client_id IS the
+ * registrant's signed metadata blob — `client_name` and `redirect_uris`
+ * chosen by whoever called /register, up to ~11 KB in v0.0.16 — so
+ * logging it verbatim let any caller put free text of its choosing on
+ * every `tool.call` / `tool.chain` line and multiply log volume ~20×.
+ * The only consumers (usage-report.sh, the OPTIMIZATIONS.md recipes)
+ * count DISTINCT values, which a stable digest preserves; 96 bits keep
+ * collisions irrelevant at any realistic client count. The field keeps
+ * its name so existing queries still group by it.
+ */
+export function clientIdTag(clientId: string): string {
+  return createHash("sha256").update(clientId, "utf8").digest("base64url").slice(0, 16);
+}
+
+/**
+ * Per-`/mcp`-request context: the `tool.chain` aggregate, the upstream
+ * budget and the disconnect signal.
  *
  * Lives in an `AsyncLocalStorage` so the chain accumulator is
  * implicit — every `tool.call` and `loomio.request` event lands in
@@ -179,15 +209,52 @@ export function redactPath(path: string): string {
  * `/mcp` handler in `src/http/transport.ts`; read at the end to emit
  * the aggregate event.
  *
+ * The same store carries the per-request controls of the security
+ * review's F-01 (src/loomio/upstream.ts reads them on every outbound
+ * call): `upstreamBudget` caps how many Loomio requests ONE HTTP
+ * request may start — a JSON-RPC batch shares one budget, so 100 ×
+ * get_user_activity can no longer turn one limiter token into 5,100
+ * upstream calls — and `signal` aborts when the HTTP client goes away,
+ * so a disconnected request stops fanning out instead of running to
+ * completion. `quotaKey` (open-DCR only) is the source-IP bucket of the
+ * per-day quotas (F-16).
+ *
  * Not active under the stdio transport — stdio is a long-lived
  * connection, not a series of discrete requests, so there's no
- * natural "chain end" to emit on. `tool.call` and `loomio.request`
- * still fire on stdio; `tool.chain` does not.
+ * natural "chain end" to emit on, no per-request budget and no
+ * disconnect to observe. `tool.call` and `loomio.request` still fire on
+ * stdio; `tool.chain` does not.
  */
 export interface RequestContext {
+  /** The authenticated client_id (raw; only `clientIdTag` of it is ever logged). */
   clientId?: string;
   tools: string[];
+  /** Upstream requests that completed (one per `loomio.request` event). */
   loomioCalls: number;
+  /** Upstream requests STARTED — what the budget counts (a request is charged before it is sent). */
+  upstreamStarted: number;
+  /** Max upstream requests this HTTP request may start; undefined or 0 = no cap. */
+  upstreamBudget?: number;
+  /** Aborted when the HTTP response closes before the work finished (client disconnect). */
+  signal?: AbortSignal;
+  /** Source key for the per-day quotas; set only in open-DCR mode. */
+  quotaKey?: string;
+  /**
+   * Source key of every HTTP request (any mode): the upstream
+   * semaphore's fairness and the rate window's per-source share key on it
+   * (src/loomio/upstream.ts). The address key — or, for an address in
+   * MCP_SHARED_EGRESS_CIDRS, `${address}|${clientIdTag}`.
+   */
+  sourceKey?: string;
+  /**
+   * Set only when the source is a shared egress address
+   * (src/http/shared-egress.ts): the ADDRESS key, on which the aggregate
+   * caps (the address's upstream share, 20× the daily quotas) are kept
+   * while `sourceKey` / `quotaKey` carry the per-client key.
+   */
+  sharedEgressKey?: string;
+  /** Number of JSON-RPC messages when the POST body was a batch array. */
+  batchSize?: number;
   startedAt: number;
 }
 
@@ -207,13 +274,14 @@ const requestContext = new AsyncLocalStorage<RequestContext>();
  * diagnosing tool errors.
  */
 export function withRequestContext<T>(
-  initial: Omit<RequestContext, "tools" | "loomioCalls" | "startedAt">,
+  initial: Omit<RequestContext, "tools" | "loomioCalls" | "upstreamStarted" | "startedAt">,
   fn: () => Promise<T>,
 ): Promise<T> {
   const ctx: RequestContext = {
     ...initial,
     tools: [],
     loomioCalls: 0,
+    upstreamStarted: 0,
     startedAt: Date.now(),
   };
   return requestContext.run(ctx, async () => {
@@ -221,10 +289,13 @@ export function withRequestContext<T>(
       return await fn();
     } finally {
       logEvent("tool.chain", {
-        ...(ctx.clientId ? { clientId: ctx.clientId } : {}),
+        ...(ctx.clientId ? { clientId: clientIdTag(ctx.clientId) } : {}),
         tools: ctx.tools,
         toolCount: ctx.tools.length,
         loomioCalls: ctx.loomioCalls,
+        // F-01 (e): how often clients actually send JSON-RPC arrays, so
+        // the batch policy can be revisited on data.
+        ...(ctx.batchSize !== undefined ? { batchSize: ctx.batchSize } : {}),
         durationMs: Date.now() - ctx.startedAt,
       });
     }

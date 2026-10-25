@@ -71,7 +71,18 @@ export interface HealthzBody {
   checked_at: string;
 }
 
-/** Project a probe result onto the public response body — the ONLY fields /health ever returns. */
+/**
+ * Project a probe result onto the public response body — the ONLY fields
+ * /health ever returns.
+ *
+ * `loomio_version` stays on this anonymous page deliberately (security
+ * review nit 20): Loomio itself serves the same string to anyone, without
+ * a credential, at `GET /api/v1/boot/version` (the very call the probe
+ * makes), so withholding it here would hide nothing an attacker who knows
+ * the instance cannot fetch directly — while the Loomio hostname, which
+ * would tell an anonymous caller WHICH instance this is, is never shown.
+ * It is what an operator's uptime check reads to notice an upgrade.
+ */
 export function healthzBody(health: LoomioHealth): HealthzBody {
   return {
     status: health.key_status === "valid" ? "ok" : "degraded",

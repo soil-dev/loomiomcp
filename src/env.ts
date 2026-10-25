@@ -32,3 +32,19 @@ export function readPositiveInt(name: string, fallback: number, min = 1): number
   if (!Number.isFinite(n) || n < min) return fallback;
   return Math.floor(n);
 }
+
+/**
+ * Parse a non-negative integer env var where `0` is meaningful ("off",
+ * for the daily quotas and the upstream budget). Unset, empty or
+ * malformed → `fallback`; never throws, because these are read on hot
+ * paths. `src/http/config.ts` validates the same knobs at startup and
+ * refuses a malformed value loudly, so a typo cannot silently fall back
+ * on a deployment that went through `resolveBaseConfig`.
+ */
+export function readNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  if (!/^\d+$/.test(raw.trim())) return fallback;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) ? n : fallback;
+}

@@ -9,8 +9,8 @@ to expect back. Ids, keys and names are illustrative.
 
 > Check the Loomio connection.
 
-`check_connection({})` — one forced key-health probe, and no other call
-up to 50 member groups (Loomio ≥ 3.11.1 puts only the first 50 in the
+`check_connection({})` — one key-health probe (a cached one up to 10 s
+old is reused), and no other call up to 50 member groups (Loomio ≥ 3.11.1 puts only the first 50 in the
 probe's reply; beyond that the rest is read in pages of 500).
 Returns `key_status` (`valid` / `rejected` / `unreachable`), the account
 the API key belongs to (`user`), its groups with `member_state`
@@ -44,7 +44,8 @@ by id (`get_group`, `list_discussions`, `list_polls`), and they appear in
 record including the `members_can_*` permission flags, `member` /
 `membership`, `parent`, `url`. A group that exists but is hidden from
 the user answers a 403 the connector explains as "hidden group"; an
-unknown id or handle is 404.
+unknown id or handle is 404 (an open-DCR deployment says "not visible"
+for both).
 
 ## What's new?
 
@@ -55,8 +56,8 @@ listing every thread the user can see across all groups, newest
 activity first, with `items_count`, `replies_count`, `last_activity_at`,
 `tags` and a `url` per row, and `total` for the whole visible set.
 Loomio's route has no date filter, so `since` is applied client-side to
-the newest-first rows: page with `offset` until `scope.exhausted` is
-true (the page's last dated row already predates the cutoff), and
+the newest-first rows: page with `offset` = `scope.next_offset` until
+`scope.exhausted` is true (the page's last dated row already predates the cutoff), and
 threads with no `last_activity_at` are dropped and counted in
 `scope.undated_dropped`. Optional `group_id` / `type` filter the fetched
 page client-side too, so for one group's threads prefer
@@ -122,8 +123,8 @@ comments, which costs a read of the thread from its start.
 
 `search_content({query: "budget", types: ["Discussion"], order:
 "relevance"})` — full-text across everything visible, at most **20**
-results (Loomio's cap; `capped: true` means there are more — narrow the
-query, group or types). Each hit has a `snippet` with `**match**`
+results (Loomio's cap; a query search shows at most 19; `capped: true`
+means there may be more — narrow the query, group or types). Each hit has a `snippet` with `**match**`
 emphasis, `discussion_key` / `poll_key` and a deep-link `url`; open it
 with `get_discussion` and read it with `get_thread_markdown`.
 
@@ -192,9 +193,10 @@ members" use `get_participation_report` instead — one call for everyone.
 usernames, roles (`admin` / `delegate`, `title`) and join state — for any
 group the connector's user is a member of. Member email addresses appear
 only as `user_email` on a membership row, and only when that user is an
-**admin (coordinator)** of the group (or invited the member); `users[]`
-never carry emails (Loomio adds the connector account's own there, and
-the connector removes it). If the result is an empty list with a `scope.note`, the
+**admin (coordinator)** of the group (or invited the member) — never on
+a read-only deployment, and never on the connector account's own row;
+`users[]` never carry emails (Loomio adds the connector account's own
+there, and the connector removes it). If the result is an empty list with a `scope.note`, the
 connector's user is not a member of that group: Loomio answers an empty
 list, not 403, in that case. A real group always has at least its
 creator, so never read an empty roster as "the group has no members".
@@ -384,9 +386,14 @@ tool once:
 
 ```
 npm run build
-LOOMIO_API_KEY=… LOOMIO_API_BASE_URL=https://loomio.example.org/api \
+read -rs LOOMIO_API_KEY && export LOOMIO_API_KEY   # paste the key; not echoed, not in history
+LOOMIO_API_BASE_URL=https://loomio.example.org/api \
   READ_GROUP_ID=17 node scripts/live-test.mjs
 ```
+
+Do not type the key itself into the command line: a shell history, a
+process listing or an AI agent's command log keeps it (CONTRIBUTING.md
+"Public-repo hygiene").
 
 It prints one line per tool — ok / error, what came back (counts,
 totals, truncation flags) and the reply size — and a summary. With
@@ -408,8 +415,9 @@ about 17 KB for the 14 read-only tools, 44 KB for the 33 with the b3
 secret), paid before the first question. Each description says what a tool
 returns and costs, which sibling to prefer, and the one caveat that
 changes behaviour. Everything else — field-by-field outputs, permission
-rules, Loomio's counting rules, the exact 403 / 404 texts — lives here,
-one subsection per tool. Ids and names are illustrative.
+rules, Loomio's counting rules, the exact 403 / 404 texts (static-client
+and stdio wording; open-DCR deployments collapse them, see *Shared
+conventions*) — lives here, one subsection per tool. Ids and names are illustrative.
 
 ### Shared conventions
 
@@ -503,10 +511,24 @@ connector says "Loomio returned 403"* above). Per tool the message
 Loomio sends is listed below; `"Not authorized to <action> <Model>."`
 always means the key is fine and the user lacks that permission.
 
+**Open-DCR deployments word "hidden" and "missing" alike.** The per-tool
+403 / 404 texts below are what a static-client or stdio deployment
+says. On an open-DCR deployment (`MCP_OAUTH_INSECURE_AUTO_APPROVE`) a
+hidden record, a missing one and a record outside
+`LOOMIO_MCP_GROUP_IDS` all read `No <kind> "<ref>" is visible to this
+connector: it does not exist, or it is not served here …` — for
+`get_group`, `get_discussion`, `get_poll`, the thread tools, and the
+group-keyed lists `list_discussions` / `list_polls` (whose hidden-group
+answer is otherwise the generic 403). `list_memberships` there answers
+an unknown group with the same empty roster a hidden one gets. Anonymous
+callers walking ids can then not map which hidden records exist
+(SECURITY.md). A rejected API key keeps its own message everywhere.
+
 ### check_connection
 
 - **Inputs:** none.
-- **Cost:** one forced key-health probe — the authenticated
+- **Cost:** one key-health probe (a cached one up to 10 s old is reused,
+  costing nothing) — the authenticated
   `GET /b2/groups` plus the public version lookup the HTTP `/health`
   route also uses; the probe's groups body is reused. On Loomio ≥
   3.11.1 that body is the index's first page (50 groups), so a user in
@@ -533,8 +555,12 @@ always means the key is fine and the user lacks that permission.
   them all, and a note says "Only the first N of M member groups are
   listed"), `notes[]` in fixed wording
   (rejected-key remediation, valid key but no groups, pending
-  invitations, non-member parents, partial list, version drift,
-  readonly / b3 flags).
+  invitations, non-member parents, partial list, a group-ADMIN
+  membership — Loomio then sends member e-mails on those rosters —, a
+  group allow-list in force or excluding every group, the groups having
+  changed since an earlier probe in this process, version drift,
+  readonly / b3 flags). With `LOOMIO_MCP_GROUP_IDS` set, `groups[]`
+  holds only the listed groups.
 - **Caveats:** never returns key material or upstream error text. Use it
   before a long task, after a 403 or an unexpected empty list. A
   continuation failure never fails the call: the key verdict is still
@@ -608,7 +634,8 @@ always means the key is fine and the user lacks that permission.
   `members_can_start_discussions`, `members_can_raise_motions`,
   `members_can_add_members`, `members_can_edit_comments` before a write.
   403 `"Not authorized to show Group."` = the group exists and is hidden
-  from this user; an unknown identifier is 404.
+  from this user; an unknown identifier is 404 (open-DCR deployments
+  answer both "not visible", see *Shared conventions*).
 
 ### get_discussion
 
@@ -642,7 +669,8 @@ always means the key is fine and the user lacks that permission.
   only when `group.discussion_privacy_options` is `public_only` or
   `private_only` (a `public_or_private` group leaves it unknown), or
   from the `private` you passed on create / update. 403 `"Not
-  authorized to show Discussion."`; unknown id or key 404.
+  authorized to show Discussion."`; unknown id or key 404 (open-DCR:
+  both "not visible").
 
 ### list_discussions
 
@@ -755,7 +783,8 @@ always means the key is fine and the user lacks that permission.
   and for a poll inside a discussion it is that discussion's topic_id —
   pass it to `list_thread_items` / `get_thread_markdown`. Anonymous
   polls have no stances on the b2 API: the tallies (when visible) are
-  all there is. 403 `"Not authorized to show Poll."`; unknown 404.
+  all there is. 403 `"Not authorized to show Poll."`; unknown 404
+  (open-DCR: both "not visible").
 
 ### list_polls
 
@@ -910,7 +939,17 @@ always means the key is fine and the user lacks that permission.
   with no `last_activity_at` are dropped and counted in
   `scope.undated_dropped`, and `scope.exhausted` turns true when the
   page's last dated row already predates the cutoff (or the page was
-  short) — page with `offset` until then.
+  short) — page with `offset` until then. `scope.next_offset` is the
+  `offset` of the next page (null at the end).
+- **Under `LOOMIO_MCP_GROUP_IDS`** the connector walks Loomio's index
+  itself (100 rows per call, at most 10 calls) and `limit` / `offset`
+  count MATCHING threads only — listed groups, then `group_id` / `type`
+  / `since` — so nothing in the reply counts a withheld thread: `total`
+  is null unless the walk reached the end (then the matching count),
+  `scope.page_size` is null, `scope.next_offset` continues in the same
+  units, and `scope.scan_capped: true` says the walk stopped at its
+  10-call limit before filling the window (narrow with `since` or
+  `group_id`).
 
 ### list_thread_items
 
@@ -1099,17 +1138,21 @@ always means the key is fine and the user lacks that permission.
   poll's thread, where the hit has a `poll_key` and no `discussion_key`
   — and on a poll or vote inside a discussion; null on a standalone
   poll's own hit and on a vote in a standalone poll's thread), `url`;
-  `returned`, `capped`, `mode`, `scope` (`hidden_stance_hits_dropped`).
+  `returned`, `capped` (computed from the hits returned), `mode`, `scope`.
 - **Caveats:** Loomio's hard limits — at most 20 results, no paging, no
-  total; `capped: true` means more matches exist, so narrow the search
-  rather than assume completeness. Vote reasons follow the visibility
+  total; a `query` search (or any search under a group allow-list) shows
+  at most 19, holding one back so a single withheld hit cannot be
+  inferred; `capped: true` means more matches may exist, so narrow the
+  search rather than assume completeness. Vote reasons follow the visibility
   rule, and stricter: a Stance hit on a poll whose results are hidden
   from the connector's user is DROPPED from a `query` search (with a
   term to probe, the hit's mere existence would confirm the term occurs
-  in the withheld reason) and counted in
-  `scope.hidden_stance_hits_dropped`; in author-only mode it stays with
-  `snippet: null` + `snippet_hidden_reason`. Private content in groups
-  the user has not joined is silently absent.
+  in the withheld reason) — silently: nothing counts it, and `capped`
+  is computed from the hits returned, so it can read false while Loomio
+  had more. In author-only mode the hit stays with `snippet: null` +
+  `snippet_hidden_reason`. Private content in groups the user has not
+  joined is silently absent, and so are hits outside a configured
+  `LOOMIO_MCP_GROUP_IDS` allow-list.
 
 ### get_participation_report
 
@@ -1188,14 +1231,17 @@ always means the key is fine and the user lacks that permission.
   title, inviter_id, created_at, accepted_at (null = invited, not yet
   accepted), `weight` (Loomio 3.10+: the member's vote weight as a
   decimal string, on the connector user's own row and on rows of groups
-  it administers), user_email — only when Loomio sent it}, `users[]`
+  it administers), user_email — only when Loomio sent it, and never in
+  read-only mode or on the connector user's own row}, `users[]`
   {id, name, username — never email}, `total` (Loomio's exact roster
   size), `returned`, `scope`.
 - **Caveats — who sees what:** any member can read the roster; no admin
   role is needed. Member email addresses arrive as `user_email` on the
   membership row only for groups where the connector's user is an admin
   (coordinator), and for members it invited itself — other rosters come
-  back without emails, silently. Loomio also puts the connector
+  back without emails, silently. The connector drops them all on a
+  read-only deployment, and its own row's always; `check_connection`
+  notes an admin membership. Loomio also puts the connector
   account's OWN email on its `users[]` row; the connector removes it.
   If the connector's user is NOT a member (or the group is hidden from
   it), Loomio answers 200 with an EMPTY list rather than 403 and

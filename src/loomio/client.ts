@@ -1,9 +1,18 @@
 import { fetch, type Response } from "undici";
 import { readBool } from "../env.js";
-import { logEvent, redactPath } from "../log.js";
+import { getRequestContext, logEvent, redactPath } from "../log.js";
 import { VERSION } from "../version.js";
 import { getFreshKeyStatus, type LoomioHealth } from "./health-cache.js";
+import { readSecret } from "./secrets.js";
 import type { LoomioSideLoads } from "./types.js";
+import {
+  UpstreamCancelledError,
+  acquireUpstreamSlot,
+  callerSignals,
+  chargeUpstreamBudget,
+  chargeUpstreamRate,
+  recordUpstreamRate,
+} from "./upstream.js";
 
 const DEFAULT_BASE_URL = "https://www.loomio.com/api";
 
@@ -130,8 +139,23 @@ export class LoomioApiError extends Error {
   }
 }
 
+/**
+ * Read a credential through `readSecret` (src/loomio/secrets.ts), which
+ * refuses a value a bearer header cannot carry with a FIXED message that
+ * never quotes it (security review F-02). Both failures are
+ * configuration errors: a `LoomioAuthError` without an HTTP status,
+ * which the health probe files under `config_error`.
+ */
+function readCredential(name: "LOOMIO_API_KEY" | "LOOMIO_B3_API_KEY"): string | undefined {
+  try {
+    return readSecret(name);
+  } catch (err) {
+    throw new LoomioAuthError(err instanceof Error ? err.message : `${name} is not usable.`);
+  }
+}
+
 function getApiKey(): string {
-  const key = process.env["LOOMIO_API_KEY"];
+  const key = readCredential("LOOMIO_API_KEY");
   if (!key) {
     throw new LoomioAuthError(
       "LOOMIO_API_KEY environment variable is not set. " +
@@ -142,7 +166,7 @@ function getApiKey(): string {
 }
 
 function getB3ApiKey(): string {
-  const key = process.env["LOOMIO_B3_API_KEY"];
+  const key = readCredential("LOOMIO_B3_API_KEY");
   if (!key) {
     throw new LoomioAuthError(
       "LOOMIO_B3_API_KEY environment variable is not set. " +
@@ -191,14 +215,21 @@ interface LoomioErrorBody {
  * text and lets each classifier decide how to parse it. Returns "" when
  * the body is unreadable (already consumed, aborted, …).
  */
-async function readErrorText(res: Response, timeoutMs: number): Promise<string> {
+async function readErrorText(start: FetchResult): Promise<string> {
   try {
-    return (await res.text()).trim();
+    return clip((await readBodyText(start)).trim(), ERROR_BODY_READ_MAX);
   } catch (err) {
-    if (isAbortError(err)) timeoutError(timeoutMs);
+    if (isAbortError(err)) abortError(start);
     return "";
   }
 }
+
+/**
+ * How much of an ERROR body is kept before classification. Every echo is
+ * clipped to 200 characters anyway; this bounds the string the
+ * classifiers parse, so a multi-megabyte proxy page cannot be.
+ */
+const ERROR_BODY_READ_MAX = 64 * 1024;
 
 function tryParseJson(text: string): LoomioErrorBody | undefined {
   try {
@@ -273,38 +304,212 @@ interface FetchResult {
   cleanup: () => void;
   /** The deadline this request runs under, so a body-read abort reports the same figure as a connect abort. */
   timeoutMs: number;
+  /** Why the request's signal fired, if it did: the deadline, or the caller going away. */
+  abortCause: () => "timeout" | "cancelled" | undefined;
 }
 
 /**
- * Run `fetch` with a hard timeout (`timeoutMs`, default
- * `REQUEST_TIMEOUT_MS`). Any AbortError surfaced from either the
- * request itself or the subsequent body read maps to a single 504
- * `LoomioApiError` naming that deadline. Caller owns calling
- * `cleanup()` after the response is consumed so a long-running body
- * read can keep holding the timer; if the timer fires, the body read
- * also aborts.
+ * The single outbound fetch: deadline, cancellation, budget, process
+ * semaphore and transport-error mapping (security review F-01 / F-02).
+ *
+ *   - Deadline: `timeoutMs` (default `REQUEST_TIMEOUT_MS`), covering
+ *     the wait for a slot, the response and the body read.
+ *   - Cancellation: the caller-side signals (the HTTP request's
+ *     disconnect and the SDK's per-call signal, src/loomio/upstream.ts)
+ *     join the deadline through `AbortSignal.any`. A request already
+ *     cancelled is never sent.
+ *   - Budget: one unit of the HTTP request's `upstreamBudget` is charged
+ *     BEFORE sending, so a JSON-RPC batch cannot multiply it.
+ *   - Rate: one unit of the process's 5-minute window
+ *     (`MCP_HTTP_UPSTREAM_PER_5MIN`) and of the source's half of it,
+ *     charged once the slot is held (only requests actually sent count).
+ *   - Semaphore: one of the process's `MCP_HTTP_UPSTREAM_CONCURRENCY`
+ *     slots, served fairly across sources, held until `cleanup()` (after
+ *     the body was consumed).
+ *   - Transport errors: anything fetch throws that is not an abort —
+ *     DNS, TLS, reset, and undici's `TypeError`s, whose messages can
+ *     quote the request's headers — becomes a fixed
+ *     `LoomioTransportError` naming only the error class and code. The
+ *     original message never reaches a caller or a log.
+ *
+ * `detached` (the health probe only) skips the caller signals, the
+ * budget, the rate refusal (it is counted, never refused) and the
+ * semaphore: see the module note of upstream.ts.
  */
 async function fetchWithTimeout(
   url: string,
   options: Parameters<typeof fetch>[1],
   timeoutMs: number = REQUEST_TIMEOUT_MS,
+  detached = false,
 ): Promise<FetchResult> {
-  const hasCallerSignal = !!options && (options as { signal?: AbortSignal }).signal !== undefined;
-  const controller = hasCallerSignal ? undefined : new AbortController();
-  const timer = controller && setTimeout(() => controller.abort(), timeoutMs);
-  timer?.unref();
+  const callers = detached ? [] : callerSignals();
+  if (callers.some((sig) => sig.aborted)) throw new UpstreamCancelledError();
+  if (detached) {
+    // The probe is never refused, but Loomio counts it like any request.
+    recordUpstreamRate();
+  } else {
+    chargeUpstreamBudget();
+  }
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), timeoutMs);
+  timer.unref();
+  const signal =
+    callers.length > 0 ? AbortSignal.any([deadline.signal, ...callers]) : deadline.signal;
+  const abortCause = (): "timeout" | "cancelled" | undefined =>
+    callers.some((sig) => sig.aborted)
+      ? "cancelled"
+      : deadline.signal.aborted
+        ? "timeout"
+        : undefined;
+  let release = (): void => {};
+  if (!detached) {
+    try {
+      release = await acquireUpstreamSlot(signal, getRequestContext()?.sourceKey);
+      // The rate window counts requests SENT, so it is charged only once a
+      // slot is held: a call refused busy or cancelled while queued never
+      // spends anyone's share of Loomio's throttle.
+      chargeUpstreamRate();
+    } catch (err) {
+      release();
+      clearTimeout(timer);
+      if (err instanceof UpstreamCancelledError && abortCause() === "timeout")
+        timeoutError(timeoutMs);
+      throw err;
+    }
+  }
   const cleanup = () => {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
+    release();
   };
-  const opts = controller ? { ...(options ?? {}), signal: controller.signal } : (options ?? {});
   try {
-    const res = await fetch(url, opts);
-    return { res, cleanup, timeoutMs };
+    const res = await fetch(url, { ...(options ?? {}), signal });
+    return { res, cleanup, timeoutMs, abortCause };
   } catch (err) {
     cleanup();
-    if (isAbortError(err)) timeoutError(timeoutMs);
-    throw err;
+    if (isAbortError(err) || abortCause() !== undefined) {
+      if (abortCause() === "cancelled") throw new UpstreamCancelledError();
+      timeoutError(timeoutMs);
+    }
+    throw transportError(err);
   }
+}
+
+/** Map a body-read abort to the right error: the caller went away, or the deadline fired. */
+function abortError(start: Pick<FetchResult, "abortCause" | "timeoutMs">): never {
+  if (start.abortCause() === "cancelled") throw new UpstreamCancelledError();
+  timeoutError(start.timeoutMs);
+}
+
+/**
+ * A fetch that failed below HTTP. `kind: "config"` when the failure is
+ * about what the connector tried to send (undici refused to build the
+ * request: an unusable header value or URL) — a configuration error the
+ * probe reports as `config_error`; `"network"` for everything on the
+ * wire. The message is fixed: class name and error code only.
+ */
+export class LoomioTransportError extends LoomioApiError {
+  constructor(
+    message: string,
+    public readonly kind: "config" | "network",
+  ) {
+    super(502, message);
+    this.name = "LoomioTransportError";
+  }
+}
+
+const TRANSPORT_LOG_INTERVAL_MS = 10_000;
+let lastTransportLog = 0;
+
+function transportError(err: unknown): LoomioTransportError {
+  // The class name is echoed, so only a plain identifier is: an Error
+  // subclass could carry anything in `name`.
+  const rawName = err instanceof Error ? err.name : typeof err;
+  const name = /^[A-Za-z]{1,40}$/.test(rawName) ? rawName : "Error";
+  const cause = err instanceof Error ? (err as { cause?: unknown }).cause : undefined;
+  const rawCode =
+    (cause && typeof cause === "object" ? (cause as { code?: unknown }).code : undefined) ??
+    (err && typeof err === "object" ? (err as { code?: unknown }).code : undefined);
+  // Error codes are short identifiers (ENOTFOUND, UND_ERR_SOCKET); anything
+  // else is not echoed.
+  const code =
+    typeof rawCode === "string" && /^[A-Z0-9_]{2,40}$/.test(rawCode) ? rawCode : undefined;
+  const message = err instanceof Error ? err.message : "";
+  const kind =
+    name === "TypeError" && /header|cannot be constructed|invalid url/i.test(message)
+      ? "config"
+      : "network";
+  const now = Date.now();
+  if (now - lastTransportLog >= TRANSPORT_LOG_INTERVAL_MS) {
+    lastTransportLog = now;
+    logEvent(
+      "upstream.transport_error",
+      { name, ...(code ? { code } : {}), kind },
+      { force: true },
+    );
+  }
+  const label = code ? `${name} ${code}` : name;
+  return new LoomioTransportError(
+    kind === "config"
+      ? `Transport error while calling Loomio (${label}): the request could not be built — check ` +
+          "LOOMIO_API_BASE_URL and the configured API key(s) for stray characters."
+      : `Transport error while calling Loomio (${label}): no HTTP response (DNS, TLS, connection ` +
+          "reset or similar). Retry after a short wait; if it persists, check that Loomio is up.",
+    kind,
+  );
+}
+
+/**
+ * Hard ceiling on one upstream response body (security review nit 11).
+ * Loomio's largest legitimate reply — a 500-item page with HTML bodies —
+ * is a few MB; 64 MB means a broken or hostile upstream cannot make one
+ * read hold unbounded memory. Over it, the read stops and the call fails.
+ */
+export const MAX_UPSTREAM_BODY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Read a response body as text under `MAX_UPSTREAM_BODY_BYTES`: a
+ * declared `Content-Length` over it is refused unread, and a streamed
+ * body is cut as soon as it passes the ceiling. Responses without a
+ * readable stream (test doubles) fall back to `text()` and are checked
+ * after the fact.
+ */
+async function readBodyText(start: Pick<FetchResult, "res">): Promise<string> {
+  const { res } = start;
+  const declared = Number(res.headers?.get?.("content-length") ?? Number.NaN);
+  if (Number.isFinite(declared) && declared > MAX_UPSTREAM_BODY_BYTES) bodyTooLarge();
+  const stream = (res as { body?: { getReader?: () => unknown } | null }).body;
+  if (!stream || typeof stream.getReader !== "function") {
+    const text = await res.text();
+    if (text.length > MAX_UPSTREAM_BODY_BYTES) bodyTooLarge();
+    return text;
+  }
+  const reader = stream.getReader() as {
+    read: () => Promise<{ done: boolean; value?: Uint8Array }>;
+    cancel: () => Promise<void>;
+    releaseLock: () => void;
+  };
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value?.byteLength ?? 0;
+    if (received > MAX_UPSTREAM_BODY_BYTES) {
+      await reader.cancel().catch(() => {});
+      bodyTooLarge();
+    }
+    if (value) text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+function bodyTooLarge(): never {
+  throw new LoomioApiError(
+    502,
+    `Loomio's response exceeded the connector's ${MAX_UPSTREAM_BODY_BYTES / (1024 * 1024)} MB ` +
+      "ceiling on one upstream body and was not read. Narrow the request (smaller limit or window).",
+  );
 }
 
 // ── 403 classification ──────────────────────────────────────────────────────
@@ -757,12 +962,12 @@ function rateLimitedMessage(text: string, res: Response, where: string): string 
   const json = tryParseJson(text);
   const flash = json?.flash?.error;
   if (typeof flash === "string" && flash) {
-    return `Loomio refused the request (HTTP 429 for ${where}): ${flash}`;
+    return `Loomio refused the request (HTTP 429 for ${where}): ${clip(flash)}`;
   }
-  const retryAfter = res.headers.get("retry-after");
+  const retryAfter = usableRetryAfter(res.headers.get("retry-after"));
   const wait = retryAfter
     ? `Retry after ${retryAfter}${/^\d+$/.test(retryAfter) ? " seconds" : ""} (Retry-After header).`
-    : "No Retry-After header was sent; wait a few minutes before retrying.";
+    : "No usable Retry-After header was sent; wait a few minutes before retrying.";
   return (
     `Loomio rate limit hit (HTTP 429 for ${where}). Loomio's Rack::Attack throttle caps requests ` +
     "per client IP over a 5-minute window (900 by default; instances may raise it). " +
@@ -770,6 +975,25 @@ function rateLimitedMessage(text: string, res: Response, where: string): string 
     "cause: narrow the group set, or space calls out." +
     (text && !json ? ` Loomio said: ${clip(text)}` : "")
   );
+}
+
+/**
+ * The Retry-After value worth echoing: delta-seconds (at most six
+ * digits) or an HTTP-date, else nothing. v0.0.16 echoed the header
+ * verbatim, so an intermediary's 6 KB header became a 6 KB tool error
+ * (security review nit 10).
+ */
+function usableRetryAfter(raw: string | null): string | undefined {
+  const value = raw?.trim();
+  if (!value) return undefined;
+  if (/^\d{1,6}$/.test(value)) return value;
+  if (
+    value.length <= 40 &&
+    /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(value)
+  ) {
+    return value;
+  }
+  return undefined;
 }
 
 /**
@@ -826,14 +1050,10 @@ function pathHintFor(url: string): string {
   }
 }
 
-async function throwForStatus(
-  res: Response,
-  url: string,
-  method: string | undefined,
-  timeoutMs: number,
-): Promise<void> {
+async function throwForStatus(start: RequestStart): Promise<void> {
+  const { res, url, method } = start;
   if (res.ok) return;
-  const text = await readErrorText(res, timeoutMs);
+  const text = await readErrorText(start);
   const where = pathHintFor(url);
 
   if (res.status === 403) {
@@ -882,14 +1102,15 @@ async function throwForStatus(
  *     received (clipped) instead of a bare parse error.
  */
 async function handleResponse<T>(start: RequestStart): Promise<T> {
-  const { res, url, method, timeoutMs } = start;
-  await throwForStatus(res, url, method, timeoutMs);
+  const { res, url } = start;
+  await throwForStatus(start);
   let text: string;
   try {
-    text = await res.text();
+    text = await readBodyText(start);
   } catch (err) {
-    if (isAbortError(err)) timeoutError(timeoutMs);
-    throw err;
+    if (err instanceof LoomioApiError) throw err;
+    if (isAbortError(err) || start.abortCause() !== undefined) abortError(start);
+    throw transportError(err);
   }
   if (text.trim() === "") return {} as T;
   try {
@@ -1091,10 +1312,11 @@ async function doFetch(
   url: string,
   options: Parameters<typeof fetch>[1],
   timeoutMs?: number,
+  detached = false,
 ): Promise<RequestStart> {
   const startedAt = Date.now();
   const method = (options?.method as string | undefined) ?? "GET";
-  const first = await fetchWithTimeout(url, options, timeoutMs);
+  const first = await fetchWithTimeout(url, options, timeoutMs, detached);
   return { ...first, startedAt, method, url };
 }
 
@@ -1382,13 +1604,21 @@ export interface RawResponse {
  */
 export interface RawGetOptions {
   timeoutMs?: number;
+  /**
+   * The health probe: skip the caller's cancellation signal, the
+   * per-request upstream budget and the process semaphore
+   * (src/loomio/upstream.ts explains why a probe must never be charged,
+   * starved or cancelled by somebody else's request).
+   */
+  probe?: boolean;
 }
 
-async function drainText(res: Response): Promise<string> {
+async function drainText(start: RequestStart): Promise<string> {
   try {
-    return await res.text();
+    return await readBodyText(start);
   } catch {
-    // Body already consumed / unreadable — callers only need what they can get.
+    // Body already consumed / unreadable / over the ceiling — callers
+    // only need what they can get.
     return "";
   }
 }
@@ -1413,11 +1643,16 @@ export async function loomioGetRaw(
   opts: RawGetOptions = {},
 ): Promise<RawResponse> {
   const url = buildUrl(path, params);
-  const start = await doFetch(url, { headers: authHeaders(B2_AUTH) }, opts.timeoutMs);
+  const start = await doFetch(
+    url,
+    { headers: authHeaders(B2_AUTH) },
+    opts.timeoutMs,
+    opts.probe === true,
+  );
   try {
     return await consumeBody(start, async () => ({
       status: start.res.status,
-      text: await drainText(start.res),
+      text: await drainText(start),
     }));
   } finally {
     start.cleanup();
@@ -1449,11 +1684,11 @@ export async function loomioGetPublic(
   opts: RawGetOptions = {},
 ): Promise<RawResponse> {
   const url = buildUrl(path, params);
-  const start = await doFetch(url, { headers: baseHeaders() }, opts.timeoutMs);
+  const start = await doFetch(url, { headers: baseHeaders() }, opts.timeoutMs, opts.probe === true);
   try {
     return await consumeBody(start, async () => ({
       status: start.res.status,
-      text: await drainText(start.res),
+      text: await drainText(start),
     }));
   } finally {
     start.cleanup();

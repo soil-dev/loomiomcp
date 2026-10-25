@@ -779,7 +779,14 @@ GET /b2/threads/{topic_id}/markdown    {markdown: ThreadMarkdownService.render(t
   never side-loads the moved-in poll, while the export renders its
   votes — the scan finds it. The b2 polls index lists standalone polls
   only (`records_visible_in_group`), so a thread's polls can only be
-  found through its items.
+  found through its items. Every stance item arrives with its poll in
+  the page's `polls` root (`StanceSerializer has_one :poll, root:
+  :polls`, stance_serializer.rb:26; the guard's exclude profile keeps
+  `poll`, and `exclude_types` is honoured per serializer,
+  application_serializer.rb:65-69), so on stock 3.13.1 the guard always
+  sees the poll of every vote it walks; since 0.0.17 a vote whose poll
+  is on no page refuses ("could not verify") instead of passing — the
+  shape a serializer change upstream would produce.
 
 ## Search (`Api::B2::SearchController` < `Api::V1::SearchController`)
 
@@ -846,7 +853,11 @@ sets `prefix: true, negation: true` — so a hit's presence confirms that
 the term occurs in the withheld reason, prefix by prefix. Loomio's own
 web search shows the member the full reason, so the connector widens
 nothing, but it drops such hits from `query` searches (kept in
-author-only mode, where there is no term to probe) and counts them.
+author-only mode, where there is no term to probe) and, since 0.0.17,
+leaves no count of them: 0.0.16's `scope.hidden_stance_hits_dropped`,
+and its `capped` computed before the drop, each answered the same yes /
+no per prefix (with `types: ['Stance']`, `author_id` and `!term`
+negation, a hidden reason's first word fell out in 74 calls).
 
 ## Participation report (`GET /b2/reports`, Loomio ≥ 3.7.0)
 
@@ -921,7 +932,10 @@ Loomio 3.8.1, `Api::B2::MembershipsController`, `MembershipQuery`,
   `membership_email_group_ids`) or the caller invited that member
   (`MembershipSerializer#include_user_email?`). A plain member gets the
   roster **without** emails — silently, no error (test: "group admin can
-  list member email addresses").
+  list member email addresses"). The connector relays the field only on
+  a writable deployment and never on the API user's own row (0.0.17):
+  one coordinator promoting the bot, or one old invitation sent as the
+  bot, would otherwise publish addresses through a read-only connector.
 - A **non-member is not refused**: the query scopes to the caller's own
   groups, finds nothing, and the controller answers `200` with
   `memberships: []` (tests: "non-member cannot list a private group's

@@ -7,8 +7,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { z, ZodRawShape } from "zod";
+import { chargeDailyToolCall, recordDailyResultBytes } from "../daily-quota.js";
 import { readBool } from "../env.js";
-import { getRequestContext, logEvent } from "../log.js";
+import { clientIdTag, getRequestContext, logEvent } from "../log.js";
+import { scrubSecrets } from "../loomio/secrets.js";
+import { withToolCallSignal } from "../loomio/upstream.js";
 
 /**
  * Prefixes that identify a tool as read-only by naming convention.
@@ -127,7 +130,9 @@ function emitToolCall(opts: {
 }): void {
   logEvent("tool.call", {
     tool: opts.tool,
-    ...(opts.clientId ? { clientId: opts.clientId } : {}),
+    // A digest, never the client_id: in open-DCR mode the id is the
+    // registrant's own signed metadata (security review F-13, src/log.ts).
+    ...(opts.clientId ? { clientId: clientIdTag(opts.clientId) } : {}),
     argFields: opts.argFields,
     durationMs: Date.now() - opts.startedAt,
     outcome: opts.outcome,
@@ -148,12 +153,67 @@ export function serializeToolResult(result: unknown): string {
     : JSON.stringify(result);
 }
 
-function wrapAsText(result: unknown): {
+/**
+ * Absolute ceiling on ONE tool reply, in UTF-8 bytes of the serialised
+ * result (security review nit 11). Each tool bounds its own output —
+ * page sizes, `*_max_chars`, `max_total_chars` — but the caller can lift
+ * those (`limit: 1000, body_max_chars: -1, max_total_chars: -1`), and the
+ * review read two 50 MB pages into a ~100 MB reply. 4 MB is far above
+ * any default reply (list_thread_items' default budget is 120 000
+ * characters) and well inside what an MCP client will hold; past it the
+ * call fails with a clear error instead of shipping the bytes. The
+ * upstream side has its own ceiling (`MAX_UPSTREAM_BODY_BYTES`, 64 MB,
+ * src/loomio/client.ts).
+ */
+export const MAX_TOOL_REPLY_BYTES = 4 * 1024 * 1024;
+
+export class ToolReplyTooLargeError extends Error {
+  constructor(tool: string, bytes: number) {
+    super(
+      `${tool}'s reply would be ${(bytes / (1024 * 1024)).toFixed(1)} MB, over the connector's ` +
+        `${MAX_TOOL_REPLY_BYTES / (1024 * 1024)} MB ceiling on one tool reply, so nothing was ` +
+        "returned. Ask for less: a smaller limit, a *_max_chars / max_total_chars cap instead of -1, " +
+        "or a narrower window, and page with offset.",
+    );
+    this.name = "ToolReplyTooLargeError";
+  }
+}
+
+function wrapAsText(
+  tool: string,
+  result: unknown,
+): {
   content: Array<{ type: "text"; text: string }>;
 } {
+  const text = serializeToolResult(result);
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > MAX_TOOL_REPLY_BYTES) throw new ToolReplyTooLargeError(tool, bytes);
+  // F-16: what this source took home today (open-DCR mode only).
+  recordDailyResultBytes(bytes);
   return {
-    content: [{ type: "text", text: serializeToolResult(result) }],
+    content: [{ type: "text", text }],
   };
+}
+
+/**
+ * Last-resort scrub of a tool error before the SDK turns its message into
+ * the `isError` result every caller sees (security review F-02): any
+ * occurrence of a configured Loomio credential becomes `[redacted]`. The
+ * client already maps transport failures to fixed texts; this covers
+ * whatever path a future change forgets.
+ */
+function scrubError(err: unknown): unknown {
+  if (err instanceof Error) {
+    const clean = scrubSecrets(err.message);
+    if (clean !== err.message) err.message = clean;
+  }
+  return err;
+}
+
+/** The part of the SDK's per-call `extra` this layer uses. */
+interface ToolCallExtra {
+  /** Aborted when the client cancels the call or the transport closes (HTTP client gone). */
+  signal?: AbortSignal;
 }
 
 export function registerTool<Schema extends z.ZodObject<ZodRawShape>>(
@@ -170,23 +230,33 @@ export function registerTool<Schema extends z.ZodObject<ZodRawShape>>(
       inputSchema: Schema;
       annotations?: ToolAnnotations;
     },
-    callback: (input: z.infer<Schema>) => Promise<CallToolResult>,
+    callback: (input: z.infer<Schema>, extra?: ToolCallExtra) => Promise<CallToolResult>,
   ) => void;
 
   registerWithSchema(
     name,
     { description, inputSchema: schema, annotations: inferAnnotations(name) },
-    async (input) => {
+    async (input, extra) => {
       const startedAt = Date.now();
       const argFields = argFieldNames(input);
       const clientId = getRequestContext()?.clientId;
       try {
-        const result = await handler(input);
+        // F-16: refused before any work once the source spent today's quota.
+        chargeDailyToolCall();
+        // F-01 (b): the SDK aborts `extra.signal` on notifications/cancelled
+        // and when the transport closes (the HTTP client went away). v0.0.16
+        // dropped `extra`, so a disconnected batch ran every upstream call
+        // to completion; now every Loomio request this handler makes joins
+        // the signal (src/loomio/upstream.ts) and later ones are never sent.
+        const result = await withToolCallSignal(extra?.signal, () => handler(input));
+        // Serialised (and size-checked) BEFORE the success is logged: an
+        // over-ceiling reply is an error outcome.
+        const reply = wrapAsText(name, result);
         emitToolCall({ tool: name, clientId, argFields, startedAt, outcome: "success" });
-        return wrapAsText(result);
+        return reply;
       } catch (err) {
         emitToolCall({ tool: name, clientId, argFields, startedAt, outcome: "error" });
-        throw err;
+        throw scrubError(err);
       }
     },
   );

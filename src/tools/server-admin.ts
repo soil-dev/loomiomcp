@@ -8,7 +8,7 @@ import {
   nestedBody,
 } from "../loomio/client.js";
 import { pick } from "../loomio/shape.js";
-import { positiveId } from "./_common.js";
+import { emailAddress, positiveId } from "./_common.js";
 
 // ── b3 provisioning: groups and memberships (Loomio ≥ 3.13.0) ──────────────
 //
@@ -424,7 +424,7 @@ export async function listInstanceMemberships(
 export const addGroupMembersSchema = z.strictObject({
   group_id: positiveId.describe("Group id (list_instance_groups)."),
   emails: z
-    .array(z.string().email())
+    .array(emailAddress)
     .min(1)
     .max(MAX_ADD_EMAILS)
     .describe("1-50 addresses; Loomio trims, lowercases and dedupes them."),

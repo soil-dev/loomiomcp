@@ -24,6 +24,6 @@
  * live b3 capture exists, because the reference deployment holds no b3
  * secret.
  */
-export const VERSION = "0.0.16";
+export const VERSION = "0.0.17";
 
 export const TESTED_LOOMIO_VERSION = "3.13.1";

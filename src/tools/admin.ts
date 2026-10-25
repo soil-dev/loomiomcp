@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { loomioGetB3, loomioPostB3 } from "../loomio/client.js";
-import { positiveId } from "./_common.js";
+import { encodePathSegment, positiveId } from "./_common.js";
 
 // ── deactivate_user / reactivate_user (b3 admin) ────────────────────────────
 //
@@ -135,17 +135,38 @@ export interface B3UsersIndexResponse {
   users: B3User[];
 }
 
+/**
+ * The two identity-route segments (security review nit 9). v0.0.16 sent
+ * them through `encodeURIComponent`, which leaves `.` alone, so `.` and
+ * `..` segments were resolved away by the URL parser and the request
+ * went to another b3 route (`identity_type: ".."` reached `/b3/users/…`)
+ * — the same gate and credential, no new data, but a path the tool
+ * never meant to call. Now both must be ONE Rails
+ * route segment: Rails' default segment pattern excludes `/`, `.` and
+ * `?` (and a `.` would be read as a format anyway — the caveat above),
+ * so those are refused outright, as are `#`, `%`, whitespace and
+ * control characters; what passes is then `encodePathSegment`-ed.
+ * Provider names are identifiers (`saml`, `google`, `oauth`).
+ */
+const IDENTITY_TYPE_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const IDENTITY_UID_RE = /^(?:(?![/.?#%\\])[\x21-\x7e]){1,128}$/;
+
 export const getUserSchema = z
   .object({
     id: positiveId.optional().describe("User id. Pass this OR identity_type + uid."),
     identity_type: z
       .string()
-      .min(1)
+      .refine((v) => IDENTITY_TYPE_RE.test(v), {
+        message: "identity_type is a provider name: letters, digits, _ and - (1-64).",
+      })
       .optional()
       .describe("Provider of a linked identity, e.g. 'saml'. Requires uid."),
     uid: z
       .string()
-      .min(1)
+      .refine((v) => IDENTITY_UID_RE.test(v), {
+        message:
+          "uid: 1-128 printable ASCII characters, none of / . ? # % \\ (one URL path segment).",
+      })
       .optional()
       .describe("The identity's uid. One containing '.' cannot be resolved; use id instead."),
   })
@@ -181,10 +202,11 @@ export async function getUser(input: GetUserInput): Promise<GetUserResult> {
     const body = await loomioGetB3<B3UserShowResponse>(`/b3/users/${input.id}`);
     return { user: body.user, resolved_by: "id" };
   }
-  // Both segments are caller strings; encode them so a uid with "/" or
-  // "?" cannot rewrite the path. The schema has already required both.
-  const type = encodeURIComponent(input.identity_type ?? "");
-  const uid = encodeURIComponent(input.uid ?? "");
+  // Both segments are caller strings: the schema restricted them to one
+  // route segment each (IDENTITY_*_RE) and they are encoded on top, so
+  // neither can rewrite the path.
+  const type = encodePathSegment(input.identity_type ?? "");
+  const uid = encodePathSegment(input.uid ?? "");
   const body = await loomioGetB3<B3UserShowResponse>(`/b3/users/identity/${type}/${uid}`);
   return { user: body.user, resolved_by: "identity" };
 }

@@ -1,8 +1,11 @@
 import { z } from "zod";
-import { loomioGet, loomioPost, readParams } from "../loomio/client.js";
+import { isOpenDcr } from "../deployment.js";
+import { isReadOnly, LoomioApiError, loomioGet, loomioPost, readParams } from "../loomio/client.js";
+import { assertGroupAllowed } from "../loomio/group-scope.js";
+import { cachedOwnUserId } from "../loomio/health.js";
 import { pick, type SlimUser, slimUsers } from "../loomio/shape.js";
 import type { LoomioMembership, MembershipsResponse } from "../loomio/types.js";
-import { positiveId } from "./_common.js";
+import { emailAddress, positiveId } from "./_common.js";
 
 // ── list_memberships ────────────────────────────────────────────────────────
 //
@@ -53,7 +56,29 @@ import { positiveId } from "./_common.js";
 // 403s (rotated key, WAF) are classified by the HTTP client
 // (`classifyForbidden` in src/loomio/client.ts); nothing here needs to
 // probe or re-explain them.
-
+//
+// WHEN `user_email` IS RELAYED (security review F-04). Loomio 3.13.1
+// serialises it for a row when the API user INVITED that member, or the
+// group is in the API user's adminable groups
+// (memberships_controller.rb:49-54, membership_serializer.rb:25-30). In
+// v0.0.16 the connector relayed it wherever Loomio sent it, so one
+// coordinator action (promote the bot) or one historical invitation sent
+// as the bot turned a roster into an e-mail list — on an open-DCR
+// deployment, for any anonymous caller — with nothing tying it to the
+// deployment's posture. Now:
+//   - read-only mode (LOOMIO_MCP_READONLY) drops `user_email` from EVERY
+//     row: the only legitimate consumer, manage_memberships with
+//     remove_absent, is not even registered there;
+//   - every mode drops it from the API user's OWN row (it is the
+//     connector account's mailbox, like the `users[].email` below).
+//     The own row is recognised by the user the response itself names
+//     with an e-mail (AuthorSerializer sends `email` only for
+//     `current_user_id`) or the id the health probe learned;
+//   - check_connection notes, and the probe logs a forced
+//     `loomio.admin_scope` event, whenever the API user holds a
+//     group-admin membership (src/loomio/group-watch.ts).
+// A writable deployment that administers groups still sees member
+// e-mails on those rosters — that is what remove_absent needs.
 export const listMembershipsSchema = z.object({
   group_id: positiveId.describe("Group id (a non-member gets an empty list, not 403)."),
   limit: z.number().int().min(1).max(200).optional().describe("Page size, 1-200. Default 50."),
@@ -102,17 +127,69 @@ export const EMPTY_ROSTER_NOTE =
   "Empty list: the connector's user is not a member of this group (or the group is hidden from it). " +
   "Loomio returns an empty list, not 403, in that case.";
 
+/**
+ * The open-DCR wording (nit 19, round 2): Loomio answers an unknown
+ * group_id 404 but a hidden one an EMPTY 200, so in open-DCR mode the
+ * 404 is answered with this same empty roster — the two cases cannot be
+ * told apart — and the note names both readings.
+ */
+export const EMPTY_ROSTER_NOTE_OPEN_DCR =
+  "Empty list: the connector's user is not a member of this group, the group is hidden from it, " +
+  "or no such group exists. Loomio returns an empty list, not 403, for a group it hides.";
+
+/**
+ * The API user's own id(s) as far as this response and the probe can
+ * tell: the `users[]` rows Loomio gave an `email` (AuthorSerializer
+ * emits it for the current user only) plus the health probe's cached
+ * identity. A set, so a disagreement errs towards stripping more.
+ */
+function ownUserIds(body: MembershipsResponse): Set<number> {
+  const ids = new Set<number>();
+  for (const u of Array.isArray(body.users) ? body.users : []) {
+    if (typeof u?.id === "number" && typeof (u as { email?: unknown }).email === "string") {
+      ids.add(u.id);
+    }
+  }
+  const cached = cachedOwnUserId();
+  if (cached !== undefined) ids.add(cached);
+  return ids;
+}
+
+/** One roster row as relayed: the fields above, minus `user_email` where F-04 withholds it. */
+export function shapeMembershipRow(
+  row: LoomioMembership,
+  opts: { readOnly: boolean; ownIds: ReadonlySet<number> },
+): ShapedMembership {
+  const out = pick(row, MEMBERSHIP_FIELDS);
+  if (opts.readOnly || (typeof row.user_id === "number" && opts.ownIds.has(row.user_id))) {
+    delete (out as { user_email?: unknown }).user_email;
+  }
+  return out;
+}
+
 export async function listMemberships(
   input: z.infer<typeof listMembershipsSchema>,
 ): Promise<ListMembershipsResult> {
-  const body = await loomioGet<MembershipsResponse>("/b2/memberships", {
-    group_id: input.group_id,
-    ...(input.limit !== undefined ? { limit: input.limit } : {}),
-    ...(input.offset !== undefined ? { offset: input.offset } : {}),
-    ...readParams("compact"),
-  });
+  // F-17: an unlisted group is refused before the request.
+  assertGroupAllowed(input.group_id);
+  let body: MembershipsResponse;
+  try {
+    body = await loomioGet<MembershipsResponse>("/b2/memberships", {
+      group_id: input.group_id,
+      ...(input.limit !== undefined ? { limit: input.limit } : {}),
+      ...(input.offset !== undefined ? { offset: input.offset } : {}),
+      ...readParams("compact"),
+    });
+  } catch (err) {
+    // nit 19, round 2: `Group.find` 404s an unknown id, while a hidden
+    // group is an empty 200 — an existence oracle over sequential ids.
+    // In open-DCR mode the 404 gets the hidden group's answer verbatim.
+    if (!(isOpenDcr() && err instanceof LoomioApiError && err.status === 404)) throw err;
+    body = { memberships: [], users: [], meta: { root: "memberships", total: 0 } };
+  }
+  const shapeOpts = { readOnly: isReadOnly(), ownIds: ownUserIds(body) };
   const memberships = (Array.isArray(body.memberships) ? body.memberships : []).map((m) =>
-    pick(m, MEMBERSHIP_FIELDS),
+    shapeMembershipRow(m, shapeOpts),
   );
   const out: ListMembershipsResult = {
     memberships,
@@ -128,7 +205,8 @@ export async function listMemberships(
   const offsetNote = input.offset
     ? ` (With offset=${input.offset} it can also simply be a page past the end of the roster.)`
     : "";
-  return { ...out, scope: { note: `${EMPTY_ROSTER_NOTE}${offsetNote}` } };
+  const note = isOpenDcr() ? EMPTY_ROSTER_NOTE_OPEN_DCR : EMPTY_ROSTER_NOTE;
+  return { ...out, scope: { note: `${note}${offsetNote}` } };
 }
 
 // ── manage_memberships ──────────────────────────────────────────────────────
@@ -170,7 +248,7 @@ export async function listMemberships(
 export const manageMembershipsSchema = z.object({
   group_id: positiveId.describe("Group id; the connector's user must be its admin."),
   emails: z
-    .array(z.string().email())
+    .array(emailAddress)
     .min(1)
     .describe("Addresses to ensure are members; new ones are invited."),
   remove_absent: z
@@ -189,6 +267,7 @@ export interface ManageMembershipsResponse {
 }
 
 export async function manageMemberships(input: z.infer<typeof manageMembershipsSchema>) {
+  assertGroupAllowed(input.group_id);
   const body: Record<string, unknown> = { group_id: input.group_id, emails: input.emails };
   // Integer 1, or nothing — never the JSON boolean. See WIRE FORMAT above.
   if (input.remove_absent) body["remove_absent"] = 1;

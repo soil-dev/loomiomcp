@@ -3,8 +3,20 @@ dist
 .git
 .github
 .claude
-.env
-*.log
 tests
 README.md
 LICENSE
+
+# Secrets and operator-local files never enter the build context
+# (security review nit 14): every .env flavour, npm credentials, and the
+# gitignored local overrides / live-test scripts, which carry instance
+# ids and read real credentials. The Dockerfile copies
+# scripts/build-icon.mjs alone, but a context that never holds them
+# cannot leak them through a later COPY either.
+.env
+.env.*
+.npmrc
+*.local.*
+scripts/live-test*
+*.log
+coverage

@@ -531,7 +531,7 @@ describe("429 (rate limited)", () => {
     const { listDiscussions } = await import("../src/tools/discussions.js");
     const err = await listDiscussions({ group_id: 7 }).catch((e) => e);
     expect(err.status).toBe(429);
-    expect(err.message).toMatch(/No Retry-After header/);
+    expect(err.message).toMatch(/No usable Retry-After header/);
   });
 
   it("Loomio's JSON invitation throttle body is surfaced verbatim", async () => {

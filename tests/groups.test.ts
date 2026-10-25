@@ -501,6 +501,54 @@ describe("getGroup", () => {
 });
 
 describe("checkConnection", () => {
+  it("reuses a probe up to 10 s old — repeated calls cost no Loomio request (round-1 F-01; v0.0.16 forced one per call)", async () => {
+    // Round 2: no test pinned the reuse, so reverting to `{ force: true }`
+    // (two uncharged Loomio requests per call, outside the per-request
+    // budget and the queue) left the suite green.
+    const { CHECK_CONNECTION_PROBE_MAX_AGE_MS, HEALTH_CACHE_TTL_MS } = await import(
+      "../src/loomio/health.js"
+    );
+    expect(CHECK_CONNECTION_PROBE_MAX_AGE_MS).toBe(10_000);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.parse("2026-10-25T10:00:00Z");
+      vi.setSystemTime(t0);
+      mockFetchRoutes({
+        "/b2/groups": { status: 200, body: groupsIndexBody() },
+        "/v1/boot/version": VERSION_OK,
+      });
+      const { checkConnection } = await import("../src/tools/groups.js");
+      const pairs = () => [
+        fetchCallsTo("/v1/boot/version").length,
+        fetchCallsTo("/b2/groups").length,
+      ];
+      const first = await checkConnection({});
+      vi.setSystemTime(t0 + 4_000);
+      await checkConnection({});
+      vi.setSystemTime(t0 + CHECK_CONNECTION_PROBE_MAX_AGE_MS - 1);
+      const third = await checkConnection({});
+      expect(pairs()).toEqual([1, 1]);
+      expect(third.checked_at).toBe(first.checked_at); // the reused probe's time
+
+      // Older than 10 s (though inside the 60 s cache): one new pair.
+      vi.setSystemTime(t0 + CHECK_CONNECTION_PROBE_MAX_AGE_MS + 1);
+      const fourth = await checkConnection({});
+      expect(pairs()).toEqual([2, 2]);
+      expect(fourth.checked_at).not.toBe(first.checked_at);
+
+      // A /health-style read inside the 60 s TTL still uses the cache, and
+      // check_connection never asks for more than the TTL allows.
+      const { checkLoomioHealth } = await import("../src/loomio/health.js");
+      vi.setSystemTime(t0 + CHECK_CONNECTION_PROBE_MAX_AGE_MS + 5_000);
+      await checkLoomioHealth();
+      await checkConnection({});
+      expect(pairs()).toEqual([2, 2]);
+      expect(HEALTH_CACHE_TTL_MS).toBeGreaterThan(CHECK_CONNECTION_PROBE_MAX_AGE_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("costs one request pair: the forced health probe's groups body is reused, not re-fetched", async () => {
     mockFetchRoutes({
       "/b2/groups": { status: 200, body: groupsIndexBody() },

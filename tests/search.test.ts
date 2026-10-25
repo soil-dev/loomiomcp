@@ -201,21 +201,26 @@ describe("searchContent — result shaping", () => {
   // apply the same rule. In QUERY mode a withheld snippet is not enough:
   // the hit's existence would confirm the term occurs in the hidden
   // reason (a word-by-word oracle with types: ['Stance'] + author_id), so
-  // the row is dropped and counted; author-only mode has no probe term
-  // and keeps the row with the snippet withheld.
+  // the row is dropped; author-only mode has no probe term and keeps the
+  // row with the snippet withheld. Security review F-03: v0.0.16 COUNTED
+  // the dropped rows (`scope.hidden_stance_hits_dropped`) and computed
+  // `capped` before the drop — either number answered the same yes/no
+  // per prefix, so neither exists now: a dropped hit leaves no trace.
   describe("vote reasons follow the poll's visibility rule for the connector's user", () => {
     type Result = Awaited<ReturnType<typeof import("../src/tools/search.js")["searchContent"]>>;
     const stanceHit = (results: Result) => results.results.find((h) => h.type === "Stance");
 
-    it("QUERY mode, open until_vote poll, user has not voted: the Stance hit is DROPPED and counted, nothing of it reaches the caller", async () => {
+    it("QUERY mode, open until_vote poll, user has not voted: the Stance hit is DROPPED, uncounted — nothing of it reaches the caller", async () => {
       mockFetch(200, searchBody({ polls: [pollRow({ hide_results: "until_vote" })] }));
       const { searchContent } = await import("../src/tools/search.js");
       const r = await searchContent({ query: "budget" });
       expect(stanceHit(r)).toBeUndefined();
       expect(r.results.map((h) => h.type)).toEqual(["Discussion", "Comment", "Poll"]);
       expect(r.returned).toBe(3);
-      expect(r.scope.hidden_stance_hits_dropped).toBe(1);
+      // F-03: no counter of any name (v0.0.16: hidden_stance_hits_dropped 1).
+      expect(r.scope).not.toHaveProperty("hidden_stance_hits_dropped");
       const text = JSON.stringify(r);
+      expect(text).not.toMatch(/dropped/i);
       expect(text).not.toContain("reserve figure");
       // Not even the voter, the poll or the vote id: the row's presence is the leak.
       expect(text).not.toContain("polKEY01");
@@ -225,8 +230,27 @@ describe("searchContent — result shaping", () => {
         expect(other.snippet).not.toBeNull();
         expect(other).not.toHaveProperty("snippet_hidden_reason");
       }
-      expect(r.scope.note).toMatch(/DROPPED from a query search/);
-      expect(r.scope.note).toMatch(/hidden_stance_hits_dropped/);
+      expect(r.scope.note).toMatch(/silently absent from a query search, uncounted/);
+    });
+
+    it("F-03 oracle closed: 'reserve' (in the hidden reason) and 'zebra' (not) give byte-identical replies", async () => {
+      const { searchContent } = await import("../src/tools/search.js");
+      // Loomio matches the term in the hidden reason: one Stance row.
+      mockFetch(
+        200,
+        searchBody({
+          polls: [pollRow({ hide_results: "until_vote" })],
+          search_results: [SEARCH_ROWS[2]!],
+        }),
+      );
+      const hit = await searchContent({ query: "reserve", author_id: 503, types: ["Stance"] });
+      // Loomio matches nothing.
+      mockFetch(200, searchBody({ polls: [], search_results: [] }));
+      const miss = await searchContent({ query: "zebra", author_id: 503, types: ["Stance"] });
+      const strip = (r: Result) => ({ ...r, scope: { ...r.scope, query: null } });
+      expect(JSON.stringify(strip(hit))).toBe(JSON.stringify(strip(miss)));
+      expect(hit.returned).toBe(0);
+      expect(hit.capped).toBe(false);
     });
 
     it("query + author_id (the sharpest probe) drops the hit too", async () => {
@@ -235,10 +259,10 @@ describe("searchContent — result shaping", () => {
       const r = await searchContent({ query: "reserve", author_id: 503, types: ["Stance"] });
       expect(r.mode).toBe("query+author");
       expect(stanceHit(r)).toBeUndefined();
-      expect(r.scope.hidden_stance_hits_dropped).toBe(1);
+      expect(r.scope).not.toHaveProperty("hidden_stance_hits_dropped");
     });
 
-    it("`capped` reflects Loomio's row count, not the rows left after the drop", async () => {
+    it("`capped` is computed from the rows RETURNED, so 20 dropped rows read like an empty result (v0.0.16: capped true)", async () => {
       const stance = SEARCH_ROWS[2]!;
       const rows = Array.from({ length: 20 }, (_, i) =>
         searchResultRow({ ...stance, id: 300000 + i, searchable_id: 1000 + i }),
@@ -251,8 +275,8 @@ describe("searchContent — result shaping", () => {
       const r = await searchContent({ query: "budget", types: ["Stance"] });
       expect(r.results).toEqual([]);
       expect(r.returned).toBe(0);
-      expect(r.capped).toBe(true);
-      expect(r.scope.hidden_stance_hits_dropped).toBe(20);
+      expect(r.capped).toBe(false);
+      expect(r.scope).not.toHaveProperty("hidden_stance_hits_dropped");
     });
 
     it("open until_vote poll, the user HAS voted (my_stance in the stances root): reason shown", async () => {
@@ -267,7 +291,6 @@ describe("searchContent — result shaping", () => {
       const r = await searchContent({ query: "budget" });
       expect(stanceHit(r)!.snippet).toBe("**Budget** reserve figure");
       expect(stanceHit(r)).not.toHaveProperty("snippet_hidden_reason");
-      expect(r.scope.hidden_stance_hits_dropped).toBe(0);
     });
 
     it("an uncast or revoked own stance does not count as voted (query mode: dropped)", async () => {
@@ -295,7 +318,6 @@ describe("searchContent — result shaping", () => {
       mockFetch(200, searchBody({ polls: [pollRow({ hide_results: "until_closed" })] }));
       const open = await searchContent({ query: "budget" });
       expect(stanceHit(open)).toBeUndefined();
-      expect(open.scope.hidden_stance_hits_dropped).toBe(1);
       mockFetch(
         200,
         searchBody({
@@ -312,7 +334,7 @@ describe("searchContent — result shaping", () => {
       const { searchContent } = await import("../src/tools/search.js");
       const r = await searchContent({ query: "budget" });
       expect(stanceHit(r)).toBeUndefined();
-      expect(r.scope.hidden_stance_hits_dropped).toBe(1);
+      expect(r.returned).toBe(3);
     });
 
     it("AUTHOR mode (no query to probe with) keeps the hit with the snippet withheld and says why", async () => {
@@ -335,7 +357,6 @@ describe("searchContent — result shaping", () => {
         poll_id: 301,
       });
       expect(JSON.stringify(r)).not.toContain("reserve figure");
-      expect(r.scope.hidden_stance_hits_dropped).toBe(0);
       expect(r.returned).toBe(1);
     });
 
@@ -357,16 +378,38 @@ describe("searchContent — result shaping", () => {
     expect(r.results[0]!.url).toBe("https://www.loomio.com/d/dscKEY02/how-to-nominate-a-candidate");
   });
 
-  it("flags Loomio's 20-result cap", async () => {
+  it("flags Loomio's 20-result cap — a query search shows at most 19 (one slot held back), an author-only one 20", async () => {
     const rows = Array.from({ length: 20 }, (_, i) =>
       searchResultRow({ id: 300000 + i, searchable_id: 1000 + i }),
     );
     mockFetch(200, searchBody({ search_results: rows }));
     const { searchContent } = await import("../src/tools/search.js");
     const r = await searchContent({ query: "budget" });
-    expect(r.returned).toBe(20);
+    expect(r.returned).toBe(19);
     expect(r.capped).toBe(true);
     expect(r.scope.note).toMatch(/at most 20/);
+    // Author-only mode drops nothing (without an allow-list): all 20.
+    mockFetch(200, searchBody({ search_results: rows }));
+    const a = await searchContent({ author_id: 502 });
+    expect(a.returned).toBe(20);
+    expect(a.capped).toBe(true);
+  });
+
+  it("round 1: at the cap, 20 visible matches and 19 visible + 1 withheld vote reason read the same", async () => {
+    // Before: 20 rows / capped:true against 19 rows / capped:false — a
+    // caller who knew of 20 visible matches learned a withheld one matched.
+    const visible = Array.from({ length: 20 }, (_, i) =>
+      searchResultRow({ id: 300000 + i, searchable_id: 1000 + i }),
+    );
+    const stance = searchResultRow({ ...SEARCH_ROWS[2]!, id: 399999, searchable_id: 9999 });
+    const { searchContent } = await import("../src/tools/search.js");
+    const polls = [pollRow({ hide_results: "until_vote" })];
+    mockFetch(200, searchBody({ polls, search_results: visible }));
+    const worldA = await searchContent({ query: "budget" });
+    mockFetch(200, searchBody({ polls, search_results: [stance, ...visible.slice(0, 19)] }));
+    const worldB = await searchContent({ query: "budget" });
+    expect(JSON.stringify(worldB)).toBe(JSON.stringify(worldA));
+    expect(worldA).toMatchObject({ returned: 19, capped: true });
   });
 
   it("an empty result set is empty, not an error", async () => {

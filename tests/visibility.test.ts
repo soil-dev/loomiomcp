@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import {
   gatePollResults,
   HIDDEN_RESULT_FIELDS,
+  hiddenUntilVote,
   HIDDEN_STANCE_FIELDS,
   ownStanceFor,
   pollResultsVisible,
@@ -95,8 +96,31 @@ describe("pollResultsVisible (Loomio's results_visible?(voted:))", () => {
     ).toEqual({ visible: true });
   });
 
-  it("a missing hide_results (discarded poll hides it) is treated as off", () => {
-    expect(pollResultsVisible({ closed_at: null })).toEqual({ visible: true });
+  // Security review nit 8. PollSerializer hides `hide_results` only on a
+  // DISCARDED poll (hide_when_discarded); v0.0.16 read any absence as
+  // "off" and showed the results. Absent on a kept poll is now unknown,
+  // and unknown is hidden while the poll is open.
+  it("a missing hide_results on a DISCARDED poll is treated as off (the serializer hides it there)", () => {
+    expect(pollResultsVisible({ closed_at: null, discarded_at: "2026-10-01T00:00:00Z" })).toEqual({
+      visible: true,
+    });
+  });
+
+  it("a missing hide_results on a kept OPEN poll is hidden: until_vote unvoted, until_closed voted (v0.0.16: visible)", () => {
+    expect(pollResultsVisible({ closed_at: null })).toEqual({
+      visible: false,
+      reason: "until_vote",
+    });
+    expect(pollResultsVisible({ closed_at: null, hide_results: undefined }, castStance)).toEqual({
+      visible: false,
+      reason: "until_closed",
+    });
+    // So get_thread_markdown refuses a thread holding such a poll.
+    expect(hiddenUntilVote({ closed_at: null, opened_at: "2026-09-01T00:00:00Z" })).toBe(true);
+  });
+
+  it("a missing hide_results on a CLOSED poll is visible: every setting shows results once closed", () => {
+    expect(pollResultsVisible({ closed_at: "2026-10-01T00:00:00Z" })).toEqual({ visible: true });
   });
 });
 

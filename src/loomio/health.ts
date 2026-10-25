@@ -46,7 +46,12 @@
  * The result is cached for 60 s (`HEALTH_CACHE_TTL_MS`) and concurrent
  * callers share one in-flight probe, so an unauthenticated `/health`
  * being hammered costs Loomio at most one request pair per minute.
- * `force: true` bypasses the cache (startup, tests).
+ * `maxAgeMs` asks for a fresher result: check_connection wants the
+ * current posture, but reuses a probe up to 10 s old
+ * (`CHECK_CONNECTION_PROBE_MAX_AGE_MS`) — before review round 1 it forced
+ * a new pair on EVERY call, uncharged to the per-request budget, so
+ * repeating it was a cheap way to make the connector send two Loomio
+ * requests per POST. `force: true` bypasses the cache (startup, tests).
  *
  * Events. Every CHANGE of `key_status` — including the first result —
  * emits a forced `loomio.auth` event (bypasses the verbose gate; see
@@ -71,10 +76,12 @@ import {
   classifyForbidden,
   LoomioApiError,
   LoomioAuthError,
+  LoomioTransportError,
   loomioGetPublic,
   loomioGetRaw,
   readParams,
 } from "./client.js";
+import { observeGroupsIndex, resetGroupWatchForTests } from "./group-watch.js";
 import {
   cachedHealthAgeMs,
   getCachedGroupsIndex,
@@ -86,6 +93,7 @@ import {
   resetCachedHealth,
   setCachedHealth,
 } from "./health-cache.js";
+import { scrubSecrets } from "./secrets.js";
 import type { GroupsIndexResponse } from "./types.js";
 
 export type { HealthReason, LoomioHealth };
@@ -123,12 +131,22 @@ export const VERSION_PROBE_PATH = "/v1/boot/version";
  */
 export const HEALTH_PROBE_TIMEOUT_MS = 8_000;
 
+/**
+ * The oldest probe check_connection reuses instead of starting its own:
+ * fresh enough to report a rotated key or a membership change "now", and
+ * it caps the probe pairs repeated check_connection calls can cause at
+ * one per 10 s per process (the probe is exempt from the per-request
+ * budget and the upstream queue; src/loomio/upstream.ts).
+ */
+export const CHECK_CONNECTION_PROBE_MAX_AGE_MS = 10_000;
+
 let inflight: Promise<LoomioHealth> | undefined;
 let driftWarned = false;
 
 /** Test hook: clear the cache, any in-flight probe, and the one-time drift flag. */
 export function resetHealthForTests(): void {
   resetCachedHealth();
+  resetGroupWatchForTests();
   inflight = undefined;
   driftWarned = false;
 }
@@ -140,9 +158,12 @@ export function resetHealthForTests(): void {
  * `/health`, tools deciding whether an empty result is real) need an
  * answer, not an exception.
  */
-export async function checkLoomioHealth(opts: { force?: boolean } = {}): Promise<LoomioHealth> {
+export async function checkLoomioHealth(
+  opts: { force?: boolean; maxAgeMs?: number } = {},
+): Promise<LoomioHealth> {
   const cached = getCachedHealth();
-  if (!opts.force && cached && cachedHealthAgeMs() < HEALTH_CACHE_TTL_MS) return cached;
+  const maxAge = Math.min(opts.maxAgeMs ?? HEALTH_CACHE_TTL_MS, HEALTH_CACHE_TTL_MS);
+  if (!opts.force && cached && cachedHealthAgeMs() < maxAge) return cached;
   if (inflight) return inflight;
   inflight = runProbe().finally(() => {
     inflight = undefined;
@@ -161,6 +182,9 @@ async function runProbe(): Promise<LoomioHealth> {
     ...(key.detail ? { detail: key.detail } : {}),
   };
   setCachedHealth(health, Date.now(), key.groups);
+  // F-17 / F-04: diff what this probe saw against the previous one and
+  // raise the forced groups_changed / admin_scope events.
+  if (key.groups) observeGroupsIndex(key.groups, health.checked_at);
 
   if (!previous || previous.key_status !== health.key_status) {
     // `reason`, never `detail`: this event is forced (cannot be turned
@@ -210,6 +234,12 @@ function parseGroupsIndex(text: string): GroupsIndexResponse | undefined {
  */
 function reasonForThrow(err: unknown): HealthReason {
   if (err instanceof LoomioAuthError && err.status === undefined) return "config_error";
+  // An unbuildable request (a header or URL undici refused) is the
+  // configuration, not the network — v0.0.16 filed a two-line API key as
+  // a transient `network_error` (security review F-02).
+  if (err instanceof LoomioTransportError) {
+    return err.kind === "config" ? "config_error" : "network_error";
+  }
   if (err instanceof LoomioApiError && err.status === 504) return "timeout";
   return "network_error";
 }
@@ -220,14 +250,18 @@ async function probeKey(): Promise<KeyVerdict> {
   try {
     ({ status, text } = await loomioGetRaw(HEALTH_PROBE_PATH, readParams("groups"), {
       timeoutMs: HEALTH_PROBE_TIMEOUT_MS,
+      probe: true,
     }));
   } catch (err) {
     // Network error, timeout, missing LOOMIO_API_KEY, invalid base URL —
-    // none of these say anything about the key itself.
+    // none of these say anything about the key itself. `detail` is
+    // scrubbed of both credentials: it reaches the startup log.
     return {
       key_status: "unreachable",
       reason: reasonForThrow(err),
-      detail: `GET ${HEALTH_PROBE_PATH} failed: ${err instanceof Error ? err.message : String(err)}`,
+      detail: scrubSecrets(
+        `GET ${HEALTH_PROBE_PATH} failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
     };
   }
   if (status === 200) return { key_status: "valid", groups: parseGroupsIndex(text) };
@@ -258,7 +292,9 @@ async function probeKey(): Promise<KeyVerdict> {
     return {
       key_status: "unreachable",
       reason: "unrecognised_403",
-      detail: `GET ${HEALTH_PROBE_PATH} answered 403 with an unrecognised body: ${text.slice(0, 200)}`,
+      detail: scrubSecrets(
+        `GET ${HEALTH_PROBE_PATH} answered 403 with an unrecognised body: ${text.slice(0, 200)}`,
+      ),
     };
   }
   return {
@@ -272,6 +308,7 @@ async function probeVersion(): Promise<string | null> {
   try {
     const { status, text } = await loomioGetPublic(VERSION_PROBE_PATH, undefined, {
       timeoutMs: HEALTH_PROBE_TIMEOUT_MS,
+      probe: true,
     });
     if (status !== 200) return null;
     const parsed: unknown = JSON.parse(text);
