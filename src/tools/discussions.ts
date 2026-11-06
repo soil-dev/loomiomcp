@@ -51,6 +51,12 @@ import {
   listThreadItems,
   MAX_ITEMS_LIMIT,
 } from "./threads.js";
+import { type ApiDialect, apiDialect, userApiPath } from "../loomio/api-dialect.js";
+import {
+  getKnownLoomioVersion,
+  knownLoomioVersionAgeMs,
+  resolveApiDialect,
+} from "../loomio/health.js";
 
 // ── Shaping a discussion record ─────────────────────────────────────────────
 //
@@ -201,7 +207,7 @@ export async function getDiscussion(
   let body: DiscussionsResponse;
   try {
     body = await loomioGet<DiscussionsResponse>(
-      `/b2/discussions/${encodePathSegment(input.id_or_key)}`,
+      userApiPath(`/discussions/${encodePathSegment(input.id_or_key)}`),
       readParams("show"),
     );
   } catch (err) {
@@ -212,7 +218,7 @@ export async function getDiscussion(
   if (!record) {
     throw new LoomioApiError(
       502,
-      `Loomio answered GET /b2/discussions/${input.id_or_key} without a discussion record; the ` +
+      `Loomio answered GET ${userApiPath("/discussions/")}${input.id_or_key} without a discussion record; the ` +
         "response shape is not the one Loomio 3.8.1 produces.",
     );
   }
@@ -308,7 +314,7 @@ export async function listDiscussions(
   const status = input.status ?? "open";
   const max = input.description_max_chars ?? DEFAULT_DESCRIPTION_MAX_CHARS;
   const stripHtml = input.strip_html ?? true;
-  const body = await loomioGet<DiscussionsResponse>("/b2/discussions", {
+  const body = await loomioGet<DiscussionsResponse>(userApiPath("/discussions"), {
     group_id: input.group_id,
     // Always explicit — see the module note on how Loomio reads `status`.
     status,
@@ -444,7 +450,7 @@ export async function createDiscussion(
 ): Promise<DiscussionWriteResult> {
   assertGroupAllowed(input.group_id);
   const resp = await loomioPost<DiscussionsResponse>(
-    "/b2/discussions",
+    userApiPath("/discussions"),
     nestedBody("discussion", input),
   );
   const created = resp.discussions?.[0];
@@ -463,7 +469,7 @@ export async function createDiscussion(
         "was not read as intended; report it.",
     );
   }
-  return shapeDiscussionWrite(resp, "POST /b2/discussions");
+  return shapeDiscussionWrite(resp, `POST ${userApiPath("/discussions")}`);
 }
 
 // ── update_discussion ───────────────────────────────────────────────────────
@@ -483,9 +489,11 @@ export async function createDiscussion(
 //
 // What the service does with the hash (DiscussionService.update):
 //   - `TOPIC_ATTRS` are pulled out and only `TOPIC_ATTRS_UPDATE`
-//     (private, max_depth, newest_first, allow_concurrent_polls,
-//     allow_comments, allow_reactions, comment_length_max, locked_at,
-//     pinned_at) reach `discussion.topic.update!`. `group_id` and
+//     (private, max_depth, newest_first, polls_one_at_a_time —
+//     `allow_concurrent_polls` with the opposite meaning before Loomio
+//     3.14.0 (e50f78c34) —, allow_comments, allow_reactions,
+//     comment_length_max, attachments_admin_only (3.14.0, d1b51ef58),
+//     locked_at, pinned_at) reach `discussion.topic.update!`. `group_id` and
 //     `tags` are pulled out too and then DROPPED — a discussion cannot
 //     be moved through this route, and tags sent here are a silent
 //     no-op (3.8.1 through 3.13.1: `TOPIC_ATTRS_UPDATE` still excludes
@@ -527,7 +535,8 @@ const DISCUSSION_UPDATE_FIELDS = [
   "private",
   "allow_comments",
   "allow_reactions",
-  "allow_concurrent_polls",
+  "polls_one_at_a_time",
+  "attachments_admin_only",
 ] as const;
 
 export const updateDiscussionSchema = z
@@ -545,7 +554,11 @@ export const updateDiscussionSchema = z
       .describe("true = members only; must fit `discussion_privacy_options`."),
     allow_comments: z.boolean().optional().describe("Whether members may comment."),
     allow_reactions: z.boolean().optional().describe("Whether members may react."),
-    allow_concurrent_polls: z.boolean().optional().describe("Allow several open polls at once."),
+    polls_one_at_a_time: z.boolean().optional().describe("true = one open poll at a time."),
+    attachments_admin_only: z
+      .boolean()
+      .optional()
+      .describe("Only admins may add attachments (Loomio 3.14+)."),
     ...recipientFields,
   })
   .superRefine((input, ctx) => {
@@ -561,7 +574,7 @@ export const updateDiscussionSchema = z
         path: ["title"],
         message:
           "Nothing to update: pass at least one of title, description, private, allow_comments, " +
-          "allow_reactions, allow_concurrent_polls, or recipients to add.",
+          "allow_reactions, polls_one_at_a_time, attachments_admin_only, or recipients to add.",
       });
     }
   });
@@ -578,7 +591,7 @@ export async function assertDiscussionInScope(ref: IdOrKey): Promise<void> {
   let body: DiscussionsResponse;
   try {
     body = await loomioGet<DiscussionsResponse>(
-      `/b2/discussions/${encodePathSegment(ref)}`,
+      userApiPath(`/discussions/${encodePathSegment(ref)}`),
       readParams("compact"),
     );
   } catch (err) {
@@ -587,13 +600,75 @@ export async function assertDiscussionInScope(ref: IdOrKey): Promise<void> {
   assertRecordGroupAllowed(body.discussions?.[0]?.group_id ?? null, "discussion", ref);
 }
 
+/**
+ * The thread settings as the instance names them. Loomio 3.14.0 renamed
+ * `allow_concurrent_polls` to `polls_one_at_a_time` — the OPPOSITE
+ * meaning — and added `attachments_admin_only`; its `/b2` compatibility
+ * filter translates poll fields only ("the compatibility adapter does
+ * not translate this thread setting", release notes 3.14.0), and
+ * `PermittedParams` (`:raise`) answers 400 to a name the server does not
+ * list. So a write carrying either setting must know the dialect for
+ * certain (`resolveApiDialect`: a bounded probe when the version is
+ * unknown or stale); when it stays unknown the write is REFUSED rather
+ * than guessed (security review F-18-02), on a pre-3.14 server
+ * `polls_one_at_a_time` goes out inverted under its old name, and
+ * `attachments_admin_only` — which that server has no column for — is
+ * refused before anything is written. The dialect decided here is the
+ * one the request path is built with (F-18-04): both come from one
+ * snapshot, never from two reads of the cache.
+ */
+async function threadSettingsForWire<
+  T extends { polls_one_at_a_time?: boolean; attachments_admin_only?: boolean },
+>(attrs: T): Promise<{ attrs: Record<string, unknown>; dialect: ApiDialect }> {
+  if (attrs.polls_one_at_a_time === undefined && attrs.attachments_admin_only === undefined) {
+    return { attrs, dialect: apiDialect() };
+  }
+  const dialect = await resolveApiDialect();
+  if (dialect === undefined) {
+    const known = getKnownLoomioVersion();
+    const ageMin = Math.round(knownLoomioVersionAgeMs() / 60_000);
+    throw new LoomioApiError(
+      503,
+      "update_discussion: polls_one_at_a_time / attachments_admin_only were not sent because the " +
+        "instance's Loomio version is " +
+        (known
+          ? `stale (${known}, reported ${ageMin} min ago and not refreshed since)`
+          : "unknown") +
+        " and the setting's wire name depends on it (polls_one_at_a_time on Loomio 3.14+, " +
+        "allow_concurrent_polls before). The public GET /v1/boot/version probe did not answer " +
+        "although the authenticated probe may have; check that the version route is reachable from " +
+        "the connector, run check_connection, and retry. Nothing was changed.",
+    );
+  }
+  if (dialect === "versioned") return { attrs, dialect };
+  const { polls_one_at_a_time, attachments_admin_only, ...rest } = attrs;
+  if (attachments_admin_only !== undefined) {
+    // The version token is validated at the probe (≤ 64 chars, semver-shaped).
+    throw new LoomioApiError(
+      400,
+      "update_discussion: attachments_admin_only needs Loomio 3.14 or later; the instance reports " +
+        `version ${getKnownLoomioVersion()}. Nothing was changed.`,
+    );
+  }
+  return {
+    attrs:
+      polls_one_at_a_time === undefined
+        ? rest
+        : { ...rest, allow_concurrent_polls: !polls_one_at_a_time },
+    dialect,
+  };
+}
+
 export async function updateDiscussion(
   input: z.infer<typeof updateDiscussionSchema>,
 ): Promise<DiscussionWriteResult> {
   const { id_or_key, ...attrs } = input;
   await assertDiscussionInScope(id_or_key);
-  const path = `/b2/discussions/${encodePathSegment(id_or_key)}`;
-  const resp = await loomioPatch<DiscussionsResponse>(path, nestedBody("discussion", attrs));
+  // Settings first: resolving them may probe, and the path is built with
+  // the very dialect that decided the body.
+  const wire = await threadSettingsForWire(attrs);
+  const path = userApiPath(`/discussions/${encodePathSegment(id_or_key)}`, wire.dialect);
+  const resp = await loomioPatch<DiscussionsResponse>(path, nestedBody("discussion", wire.attrs));
   return shapeDiscussionWrite(resp, `PATCH ${path}`);
 }
 
@@ -625,7 +700,7 @@ export async function deleteDiscussion(
   input: z.infer<typeof deleteDiscussionSchema>,
 ): Promise<DeleteDiscussionResult> {
   await assertDiscussionInScope(input.id_or_key);
-  const path = `/b2/discussions/${encodePathSegment(input.id_or_key)}`;
+  const path = userApiPath(`/discussions/${encodePathSegment(input.id_or_key)}`);
   const resp = await loomioDelete<DiscussionsResponse>(path);
   const shaped = shapeDiscussionWrite(resp, `DELETE ${path}`);
   return {

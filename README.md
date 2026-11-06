@@ -8,11 +8,13 @@
 Model Context Protocol server for [Loomio](https://www.loomio.com). Lets
 Claude (Desktop, Code, or web Projects via Custom Connector) read and
 write Loomio discussions, polls, comments and group memberships — and
-analyse member participation — in plain English. Targets Loomio's **b2**
-API — the canonical surface documented at
-[/help/api2](https://www.loomio.com/help/api2) and the namespace where
-the controllers live in the open-source repo — as shipped in Loomio
-3.8 and later (tested on 3.13.1).
+analyse member participation — in plain English. Targets Loomio's
+**User API** — `/api/user0` since Loomio 3.14, `/api/b2` before; the
+connector picks the path by the version the instance reports — the
+canonical surface documented in Loomio's
+[User API guide](https://www.loomio.com/docs/en/user_manual/integrations/api/user-api)
+and the namespace where the controllers live in the open-source repo —
+as shipped in Loomio 3.8 and later (tested on 3.15.0).
 
 ## Tool catalog
 
@@ -36,14 +38,14 @@ cost, caveats, exact error texts — is in [HOWTO.md](HOWTO.md#tool-reference).
 
 | Tool | Purpose | Upstream calls |
 |---|---|---|
-| `check_connection()` | Key status, the account the key belongs to, its groups (`member` / `pending` / `parent`), readonly and b3 flags, fixed-wording notes. Call first when unsure what the connector can see. | the health probe (1 authenticated + 1 public GET); its groups body is reused — Loomio ≥ 3.11.1 puts only the first 50 groups in it, so +1 per further 500 member groups (`groups_partial: true` if that read fails) |
-| `list_groups()` | The connector user's member groups (pending invitations included) with the user's own `membership` {accepted, admin, delegate, title}, plus each subgroup's parent flagged `member: false` (a parent the user belongs to is a member group, wherever Loomio's page put it). Sorted by `full_name`. | 1 per 500 member groups (`GET /b2/groups`; at most 20, `scope.partial` beyond) |
+| `check_connection()` | Key status, `loomio_version` (this probe) and `loomio_version_in_use` (what the API paths are chosen from), the account the key belongs to, its groups (`member` / `pending` / `parent`), readonly and b3 flags, fixed-wording notes. Call first when unsure what the connector can see. | the health probe (1 authenticated + 1 public GET); its groups body is reused — Loomio ≥ 3.11.1 puts only the first 50 groups in it, so +1 per further 500 member groups (`groups_partial: true` if that read fails) |
+| `list_groups()` | The connector user's member groups (pending invitations included) with the user's own `membership` {accepted, admin, delegate, title}, plus each subgroup's parent flagged `member: false` (a parent the user belongs to is a member group, wherever Loomio's page put it). Sorted by `full_name`. | 1 per 500 member groups (`GET …/groups`; at most 20, `scope.partial` beyond) |
 | `get_group(id_or_key_or_handle)` | One group's full record — privacy, `members_can_*` permission flags, counters — with `member`, `membership`, `parent`, `url`. Works for publicly visible groups the user has not joined. | 1 |
 | `list_discussions(group_id, status?, limit?, offset?, description_max_chars?, strip_html?)` | A group's discussions, newest activity first, each joined with its thread counters (`items_count`, `replies_count`, `last_activity_at`, `locked_at`, `pinned_at`, `tags`, …) and `url`. `status` defaults to `open` and is always sent. Bodies come as plain text (`strip_html`, default true; `description_format: "text"`) capped at 1500 chars (`description_truncated: true` marks a cut). | 1 |
 | `get_discussion(id_or_key, strip_html?, include_items?, items_limit?, items_body_max_chars?)` | One discussion with the full body (as stored; `strip_html: true` for plain text), thread counters, group and users. `include_items: true` embeds `list_thread_items` for the thread (same reply budget; `thread_items.next_offset` says where to page on). | 1 (2 with `include_items`, +1 per further 500 embedded items) |
-| `list_polls(group_id, status?, limit?, offset?, description_max_chars?, strip_html?)` | A group's polls, newest first, as SLIM rows: identity, schedule, `hide_results`, participation counts, `stance_counts` + `total_score` when visible (aligned with `poll_options[]`), `current_outcome`, `my_stance`, `url`. The per-voter `results[]` breakdown and the type knobs Loomio left null are `get_poll`'s. `status` defaults to `active`. | 1 |
+| `list_polls(group_id, status?, limit?, offset?, description_max_chars?, strip_html?)` | A group's polls, newest first, as SLIM rows: identity, schedule, `hide_results`, participation counts (`vote_count_cast`, …), `scores_by_option` + `total_score` when visible (aligned with `poll_options[]`), `current_outcome`, `my_stance`, `url`. Poll fields carry Loomio 3.14's names on every Loomio version. The per-voter `results[]` breakdown and the type knobs Loomio left null are `get_poll`'s. `status` defaults to `active`. | 1 |
 | `get_poll(id_or_key, strip_html?)` | One poll with `poll_options`, `current_outcome`, the user's own `my_stance`, thread counters and `url`. `results_visible` / `results_hidden_reason` apply Loomio's own visibility rule; hidden stance counts are stripped, never zeroed. | 1 |
-| `list_threads(limit?, offset?, group_id?, type?, since?)` | Every thread the user can see across all groups, newest activity first — the cheapest "what is new" call. `group_id` / `type` / `since` filter client-side within the page (Loomio's route has no date filter); with `since`, page until `scope.exhausted`. | 1 (`GET /b2/threads`) |
+| `list_threads(limit?, offset?, group_id?, type?, since?)` | Every thread the user can see across all groups, newest activity first — the cheapest "what is new" call. `group_id` / `type` / `since` filter client-side within the page (Loomio's route has no date filter); with `since`, page until `scope.exhausted`. | 1 (`GET …/threads`) |
 | `list_thread_items(topic_id \| discussion_id \| poll_id, kinds?, limit?, offset?, include_reactions?, body_max_chars?, strip_html?, max_total_chars?)` | One thread's structured items (comments, polls, votes, outcomes, edits, with an edit's `change_note`) with slimmed side-loads; comment bodies, vote reasons and outcome statements come as plain text by default (`strip_html`). The connector asks Loomio for exactly the `offset` / `limit` window (Loomio ≥ 3.11.1 pages this route; older Loomio returns the whole thread, which is sliced here, `scope.server_paged: false`), under a reply budget (`max_total_chars`, default 120000; `truncated_by_budget` + `next_offset`). `kinds`, a filter Loomio lacks, reads the thread page by page from its start (at most 5 000 items, `scope.scan_truncated` beyond). Replaces `list_events`. | 1 per 500 items read (+1 by `discussion_id`/`poll_id`); `kinds` reads the thread |
 | `get_thread_markdown(topic_id \| discussion_id \| poll_id, max_chars?)` | The whole thread rendered to Markdown by Loomio — front matter, body, a reply tree of comments, polls with their votes and results tables, outcomes. Best single call for a summary. Loomio ≥ 3.10's export ignores "hide results until vote", so the connector reads the thread first and **refuses** one holding an open `until_vote` poll the user has not voted in (`list_thread_items` and `get_poll` apply the rule). | 2 (+1 per 500 items when the guard scans: any thread with replies, ≤ 10); refuses an open until_vote poll the user has not voted in |
 | `search_content(query \| author_id, group_id?, types?, tag?, order?)` | Full-text search across everything visible; `author_id` alone lists a user's 20 newest items. Snippets carry `**match**` emphasis; every hit has a deep-link `url` and `group` {id, full_name, handle} (Loomio's "Parent - Subgroup" name). A vote-reason hit on a poll whose results are hidden from the user is silently dropped from a `query` search — no counter, `capped` computed from what is returned — because its existence would confirm the term; in author mode it is kept with `snippet: null` + `snippet_hidden_reason`. Loomio caps results at 20 (a `query` search shows at most 19; `capped: true`), no paging. `tag` matches only contributions explicitly tagged with that name on Loomio 3.13+ (every item of a tagged thread before). | 1 |
@@ -66,7 +68,7 @@ cost, caveats, exact error texts — is in [HOWTO.md](HOWTO.md#tool-reference).
 | `delete_comment(id)` | Soft-discard a comment. | 1 |
 | `manage_memberships(group_id, emails, remove_absent?)` | Invite by email; with `remove_absent: true` **remove** everyone not listed. Group admin only. Read SECURITY.md first. | 1 |
 
-### Instance-operator tools (b3; registered when `LOOMIO_B3_API_KEY` is set and not read-only)
+### Instance-operator tools (b3 — Loomio's Server API, `/server0`, `/b3` before 3.14; registered when `LOOMIO_B3_API_KEY` is set and not read-only)
 
 | Tool | Purpose | Upstream calls |
 |---|---|---|
@@ -81,7 +83,8 @@ cost, caveats, exact error texts — is in [HOWTO.md](HOWTO.md#tool-reference).
 | `revoke_membership(id)` | Remove a person from a group **and its subgroups and threads**, revoking their open-poll votes; no notification. `add_group_members` restores the group only, without the admin role. Loomio 3.13+. | 1 |
 
 The b3 secret authenticates the *server*, not a user: it is validated
-against `ENV['B3_API_KEY']` on the Loomio instance and sees every
+against `ENV['SERVER_API_KEY']` on the Loomio instance (`B3_API_KEY`
+before Loomio 3.14, still read while the new name is unset) and sees every
 account and, on Loomio 3.13+, every group and every roster. Loomio
 records no actor for the b3 membership writes (and a b3 deactivation
 reads as the user deactivating themself), so the connector's own
@@ -134,7 +137,7 @@ index, thread items); the costs below are per 500 rows there.
 
 | Question | Before (0.0.11) | Now (0.0.16) |
 |---|---|---|
-| "Which groups can you see?" | `list_groups` probed `GET /b2/polls?group_id=N` per id: **50–500 calls**, blind to groups without polls | **1 call per 500 member groups** on the native `GET /b2/groups`; parents included; no blind spots |
+| "Which groups can you see?" | `list_groups` probed `GET /b2/polls?group_id=N` per id: **50–500 calls**, blind to groups without polls | **1 call per 500 member groups** on the native `GET …/groups`; parents included; no blind spots |
 | "How active was user X?" | `get_user_activity` walked every discussion's event stream: **~200 calls**, and 0 on Loomio ≥ 3.4 (endpoint removed) | **N + 1 calls** for N groups on Loomio's participation report + one author search |
 | "Who is most engaged in these groups?" | Not answerable without reconstructing from polls × memberships | `get_participation_report`: **1 call** for the whole group set |
 | "Read / summarise this thread" | `list_events` per discussion, paginated, bodies in full | `get_thread_markdown` (2 calls, +1 per 500 items when the thread has replies; Loomio renders) or `get_discussion` with `include_items` (2 calls, +1 per further 500 embedded items) |
@@ -249,9 +252,10 @@ removed that scheme in July 2026 because URLs are retained in browser
 history, proxy logs, and monitoring systems. A request carrying its key
 that way is treated as unauthenticated and 403s.
 
-The optional b3 admin namespace uses the same bearer header with a
-different secret (validated against `ENV['B3_API_KEY']` on the Loomio
-server, >16 chars). Only relevant if you operate a Loomio instance.
+The optional b3 admin tools (Loomio's Server API) use the same bearer
+header with a different secret (validated against `ENV['SERVER_API_KEY']`
+on the Loomio server — `B3_API_KEY` before Loomio 3.14 —, >16 chars).
+Only relevant if you operate a Loomio instance.
 
 ## What the connector's user can see
 
@@ -278,12 +282,24 @@ as data, never as instructions (SECURITY.md).
 
 ## Loomio compatibility
 
-Tested against **Loomio 3.13.1** (`TESTED_LOOMIO_VERSION` in
-`src/version.ts`; every request shape was first verified on 3.8.1, and
-the 3.9 → 3.13.1 changes — paged groups and thread items, serializer
-fields, the request-body handling, the b3 provisioning routes — were
-checked against Loomio's source and tests and, for the b2 reads,
-sanitized live captures). Older 3.x releases are still served: where
+Tested against **Loomio 3.15.0** (`TESTED_LOOMIO_VERSION` in
+`src/version.ts`; a master build — `v3.14.1` was the last tag — whose
+reads, writes and Markdown guard were verified live on 2026-11-06;
+every request shape was first verified on 3.8.1, and the 3.9 → 3.13.1
+changes — paged groups and thread items, serializer fields, the
+request-body handling, the b3 provisioning routes — were checked
+against Loomio's source and tests and, for the reads, sanitized live
+captures). Loomio 3.14 versioned its APIs (`/api/user0` and
+`/api/server0`; the old `/api/b2` and `/api/b3` still answer but are
+slated for removal) and renamed the poll participation and scoring
+fields: the connector chooses the path generation by the version it
+reads from the instance and always returns the 3.14 names
+(`vote_count_cast`, `scores_by_option`, `score_min`, …), renaming a
+pre-3.14 server's fields on the way in and translating the settings it
+sends on the way out. Loomio 3.14 also replaced the thread setting
+`allow_concurrent_polls` with `polls_one_at_a_time` (opposite meaning):
+`update_discussion` takes the new name on every version. Older 3.x
+releases are still served: where
 Loomio before 3.11.1 ignores `limit` / `offset` and returns a whole
 collection, the connector detects it and makes one request instead of
 paging, and on 3.8 / 3.9 — whose Markdown export still hides

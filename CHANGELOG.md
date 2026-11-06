@@ -1,5 +1,137 @@
 # Changelog
 
+## 0.0.18 — 2026-11-06
+
+**Loomio 3.14 / 3.15 adoption.** Loomio 3.14.0 (2026-11-01) versioned its
+integration APIs and renamed the poll vocabulary; the reference instance
+runs 3.15.0 since 2026-11-06. This release follows both. The connector
+now works on Loomio 3.8 through 3.15 and chooses per instance, from the
+version the key-health probe reports, which generation of paths and
+names to speak. No tool is added or removed (14 / 24 / 33 per mode), but
+**the poll field names in tool inputs and outputs change** and
+**`update_discussion` loses `allow_concurrent_polls`** — see below.
+
+Loomio-side facts (release notes 3.14.0, deploy/UPGRADING.md, commits
+81fbad246, af2dfa22a, 44bb45208, e50f78c34, 00423ec5b, d1b51ef58):
+
+- The User API is `/api/user0` and the Server API `/api/server0`.
+  `/api/b2` and `/api/b3` still answer "but will be removed in a later
+  release"; `/api/b2` is not an alias — a filter rewrites poll fields on
+  that path back to the pre-3.14 names.
+- Poll fields were renamed (old → new): `voters_count` →
+  `vote_count_eligible`, `decided_voters_count` → `vote_count_cast`,
+  `undecided_voters_count` → `vote_count_uncast`, `cast_stances_pct` →
+  `participation_pct`, `stance_counts` → `scores_by_option`,
+  `quorum_count` → `quorum_threshold`, `quorum_votes_required` →
+  `quorum_shortfall`, `min_score` → `score_min`, `max_score` →
+  `score_max`, `minimum_stance_choices` → `choice_count_min`,
+  `maximum_stance_choices` → `choice_count_max`, `dots_per_person` →
+  `points_per_voter`; in `results[]` rows `voter_count` → `vote_count`
+  and `voter_scores` → `scores_by_voter`; the `notify_on_closing_soon`
+  value `undecided_voters` → `voters_uncast`.
+- The thread setting `allow_concurrent_polls` became
+  `polls_one_at_a_time` with the OPPOSITE meaning (new threads allow
+  several polls by default), and `attachments_admin_only` was added.
+  The `/api/b2` filter does not translate this one, so since 3.14 the
+  v0.0.17 `update_discussion(allow_concurrent_polls)` answered 400.
+- The server secret setting is `SERVER_API_KEY` (`B3_API_KEY` is read
+  while it is unset; under 17 characters Loomio refuses to start).
+
+Changed:
+
+- **API generation by version** (`src/loomio/api-dialect.ts`). Every
+  request path is built from the instance's version: Loomio ≥ 3.14.0
+  gets `/user0` and `/server0`, older or unknown gets `/b2` and `/b3`.
+  The first key-health probe of a process, which has no version yet,
+  takes `/b2/groups` (every supported Loomio answers it); once a version
+  is known the probe and every tool move to `/user0`. The 403 catalogue
+  and the log redactor recognise both generations.
+- **One poll vocabulary** (`src/loomio/poll-fields.ts`). Tool inputs
+  and outputs use Loomio's current names on every Loomio: a `polls[]`
+  row answered with the old names (the `/b2` path, on any version) is
+  renamed in the HTTP client before any tool sees it, and on a pre-3.14
+  server the five renamed write settings and the reminder value are
+  translated back before sending. **Breaking for callers** that read
+  `stance_counts`, `voters_count`, … from `get_poll`, `list_polls`,
+  `list_thread_items`, `get_discussion(include_items)` or search
+  results, or that send `min_score` / `max_score` / `dots_per_person` /
+  `minimum_stance_choices` / `maximum_stance_choices` /
+  `notify_on_closing_soon: 'undecided_voters'` to `create_poll` /
+  `update_poll`: the new names above apply.
+- **`update_discussion`** takes `polls_one_at_a_time` (boolean) and
+  `attachments_admin_only` (boolean, Loomio 3.14+) instead of
+  `allow_concurrent_polls`. A write carrying either resolves the dialect
+  first (`resolveApiDialect`, probing when no version is known): on a
+  pre-3.14 server `polls_one_at_a_time` goes out inverted under the old
+  name, and `attachments_admin_only` is refused before anything is
+  written, naming the version seen.
+- `TESTED_LOOMIO_VERSION` is 3.15.0 (the commit the reference instance
+  ran, 5cde393b9 on Loomio's master; v3.14.1 was the last tag at the
+  time), so `loomio.version_drift` and the check_connection note are
+  quiet on 3.15.x. The Server-API wording in messages and docs names
+  `SERVER_API_KEY` (with `B3_API_KEY` before 3.14); the connector's own
+  `LOOMIO_B3_API_KEY`, the tool names and check_connection's
+  `b3_enabled` are unchanged.
+- Documentation: README, HOWTO (Tool reference), NOTES-ON-LOOMIO-API
+  (new "Loomio 3.13.1 → 3.15.0 changes that matter" section),
+  SECURITY, DEPLOY, INSTALL, DESIGN, CONTRIBUTING, OPTIMIZATIONS
+  brought in line. Catalogue: 35,967 B full (24 tools), 44,482 B with
+  the Server-API tools (33), 16,947 B read-only (14); instructions
+  1,792 chars.
+
+Security review of this release (2026-11-06, six lenses, every
+candidate judged by three adversarial verifiers; report in the
+reference deployment's repository): no P0 / P1, one P2 and ten P3, all
+fixed here —
+
+- **F-18-01 (P2)** the Loomio version string — a public, keyless
+  upstream value that now steers path selection and is reflected into
+  forced log events, `/health`, check_connection and a tool error — is
+  accepted only as a ≤ 64-character semver-shaped token
+  (`acceptVersionToken`); anything else counts as "no version".
+- **F-18-02 / 03 / 04 / 05** (one root cause: the dialect piggy-backed
+  on the key-health cache) the last reported version is now its own
+  sticky state (`getKnownLoomioVersion`): a probe whose version call
+  fails never downgrades the dialect; `resolveApiDialect` re-probes
+  (bounded like check_connection) when the version is unknown or older
+  than a minute, and `update_discussion` REFUSES its thread settings
+  with a message naming the version route when the version stays
+  unknown instead of guessing a name; every write builds its path and
+  body from one dialect snapshot; the key probe retries once on the
+  other path generation when the same run's version selects it (no
+  bogus `unreachable` once Loomio drops `/b2`).
+- **F-18-06** the plan-limit 403 wording matches `/server0/memberships`
+  as well as `/b3/memberships`.
+- **F-18-07** `polls_one_at_a_time` and `attachments_admin_only` are
+  relayed on every discussion / poll (`topicJoinFields`, a pre-3.14
+  `allow_concurrent_polls` inverted into the current name), so the
+  write can be read back.
+- **F-18-08** `list_groups`' scope note names the path generation in use.
+- **F-18-09** `modernizePollsIn` copies a row once and runs only on
+  `/b2` answers.
+- **F-18-10 / 11** tests pin the bounded in-tool probe and the re-probe
+  on `/user0/groups`.
+- Follow-ups from the verification sweep: a known version that is older
+  than a minute and could not be refreshed is not trusted for the thread
+  settings either (the write refuses, naming the stale version and its
+  age); the probe's generation retry also fires on an API gateway's JSON
+  403 and runs within what is left of the 8 s deadline;
+  `check_connection` gains `loomio_version_in_use` (the version the
+  API paths are chosen from, beside this probe's own answer) and says so
+  when the two differ; `list_groups` builds its request path and scope
+  note from one snapshot.
+
+Also corrected: Loomio 3.14 lets an authorized editor change a poll's
+type, anonymity and `hide_results` until voting opens (`poll_type` was
+dropped on update through 3.13); `update_poll` still offers none of
+them (docs and code notes say so).
+
+Tests: 1,056 (45 new: version → dialect decision, both path
+generations in the 403 catalogue and the redactor, the probe path, the
+vocabulary mapping and normaliser, dialect-sensitive write bodies on
+3.13 and 3.15, the probe-first write before a version is known, and one
+or more per security finding above).
+
 ## 0.0.17 — 2026-10-25
 
 **Security-review release.** A review of v0.0.16 (2026-10-25: 1 P0,

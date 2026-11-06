@@ -6,6 +6,7 @@ import type { LoomioReportUserRow, ReportsUsersResponse, SearchResponse } from "
 import { isUpstreamStop } from "../loomio/upstream.js";
 import { isoTimestamp, positiveId } from "./_common.js";
 import { type SearchHit, shapeSearchHits } from "./search.js";
+import { userApiPath } from "../loomio/api-dialect.js";
 
 // ── GET /b2/reports (Loomio ≥ 3.7.0; verified against 3.8.1) ───────────────
 //
@@ -249,7 +250,7 @@ interface ReportRequest {
  * never turn into Loomio's 500.
  */
 async function fetchUsersReport(req: ReportRequest): Promise<ReportsUsersResponse> {
-  return loomioGet<ReportsUsersResponse>("/b2/reports", {
+  return loomioGet<ReportsUsersResponse>(userApiPath("/reports"), {
     section: "users",
     group_scope: req.scope,
     ...(req.scope === "custom" ? { group_ids: csvParam(req.group_ids) } : {}),
@@ -410,7 +411,7 @@ export interface UserActivityResult {
 }
 
 const ACTIVITY_NOTE =
-  "Counts come from Loomio's participation report (GET /b2/reports?section=users), one call per " +
+  `Counts come from Loomio's participation report (GET ${userApiPath("/reports")}?section=users), one call per ` +
   "group, for whole calendar months (since/until rounded outward; see since_effective / " +
   "until_effective). Anonymous polls never count toward votes; a vote is counted in the month its " +
   "counted stance row was created — when the ballot was issued (poll opened, or the voter added " +
@@ -481,7 +482,7 @@ export async function getUserActivity(input: GetUserActivityInput): Promise<User
   // never leaves it dangling as an unhandled rejection.
   const singleGroup = groupIds.length === 1 ? groupIds[0] : undefined;
   const searchPromise: Promise<{ hits: SearchHit[]; error?: string }> = loomioGet<SearchResponse>(
-    "/b2/search",
+    userApiPath("/search"),
     {
       author_id: input.user_id,
       ...(singleGroup !== undefined ? { group_id: singleGroup } : {}),

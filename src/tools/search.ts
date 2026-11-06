@@ -10,6 +10,7 @@ import {
 } from "../loomio/visibility.js";
 import { assertGroupAllowed, hasGroupAllowlist, isGroupAllowed } from "../loomio/group-scope.js";
 import { positiveId, TEXT_MAX } from "./_common.js";
+import { userApiPath } from "../loomio/api-dialect.js";
 
 // ── GET /b2/search (Loomio 3.8.1) ───────────────────────────────────────────
 //
@@ -347,7 +348,7 @@ export async function searchContent(input: SearchContentInput): Promise<SearchCo
   if (input.group_id !== undefined) assertGroupAllowed(input.group_id);
   const hasQuery = input.query !== undefined;
   const order: SearchOrder = hasQuery ? (input.order ?? DEFAULT_SEARCH_ORDER) : "authored_at_desc";
-  const body = await loomioGet<SearchResponse>("/b2/search", {
+  const body = await loomioGet<SearchResponse>(userApiPath("/search"), {
     ...(hasQuery ? { query: input.query } : {}),
     ...(input.author_id !== undefined ? { author_id: input.author_id } : {}),
     ...(input.group_id !== undefined ? { group_id: input.group_id } : {}),

@@ -27,7 +27,8 @@ session, or after a 403 or an unexpectedly empty list.
 
 > What Loomio groups do you have access to?
 
-`list_groups({})` — ONE call on Loomio's `GET /b2/groups` for up to 500
+`list_groups({})` — ONE call on Loomio's groups index (`GET /user0/groups`;
+`/b2/groups` before Loomio 3.14) for up to 500
 member groups (Loomio ≥ 3.11.1 pages the index; one more call per
 further 500). Rows are the
 groups the connector's user is a member of (pending invitations
@@ -241,8 +242,8 @@ built-in options through the API and would save a proposal with none;
 Loomio's own option keys (`agree`, `abstain`, `disagree`, `block`;
 `looks_good` / `not_sure` / `concerned` for `check`; `accept` / `decline`
 for `count`) get its icons and labels. Without `closing_at` the poll
-does not open for voting on its own; Loomio rounds it down to the hour.
-Use `group_id` instead of `discussion_id` for a standalone poll, or
+does not open for voting on its own (Loomio 3.14+ keeps the minutes you
+pass; before 3.14 it rounded the time down to the hour). Use `group_id` instead of `discussion_id` for a standalone poll, or
 `topic_id` (from the discussion record) to skip the resolution call.
 **`closing_at` is effectively required**: without it Loomio saves the
 poll as an unopened draft (`opened_at: null`) that nobody can vote on
@@ -275,12 +276,15 @@ and sends the union (two calls; `options_sent` in the result shows what
 went out). Spell existing names as `get_poll` returns them ("Agree", not
 "agree"). Options cannot be removed through the connector.
 
-To **end voting soon**, set `closing_at` to the next full hour:
+To **end voting soon**, set `closing_at` a little ahead:
 `update_poll({id_or_key: "xyz12345", closing_at: "2026-10-01T15:00:00Z"})`
-— Loomio rounds the time down to the hour, requires the future, and its
-hourly job closes the poll when that hour arrives (within ~60 minutes).
-An immediate close, reopening and recording an outcome have no b2
-route; those need Loomio's UI.
+— Loomio requires the future. On Loomio 3.14+ the minutes are kept and
+a job checks every minute, so the poll closes within a minute of the
+time given; before 3.14 the time was rounded down to the hour and an
+hourly job closed the poll when that hour arrived (within ~60
+minutes), so pass the next full hour there — which works on every
+version. An immediate close, reopening and recording an outcome have no
+User API route; those need Loomio's UI.
 
 `delete_discussion` / `delete_poll` / `delete_comment` are Loomio's
 **soft discard**: the record leaves every list and its text is blanked,
@@ -339,7 +343,11 @@ with `destructiveHint: true` so clients can prompt. See SECURITY.md.
 ## Instance administration (b3, single-tenant only)
 
 With `LOOMIO_B3_API_KEY` set (and the server not read-only) nine more
-tools appear. Four manage accounts: `deactivate_user({id})` /
+tools appear. They call Loomio's Server API (`/server0`; `/b3` before
+Loomio 3.14 — the connector picks the path by the version its health
+probe reports) with the Loomio server's own secret: `SERVER_API_KEY` on
+the instance (`B3_API_KEY` before 3.14, still read while the new name
+is unset). Four manage accounts: `deactivate_user({id})` /
 `reactivate_user({id})`, and the reads `get_user({id})` or
 `get_user({identity_type: "saml", uid: "…"})` and
 `list_users({is_admin: true})`. Five more, on Loomio 3.13 and later,
@@ -374,7 +382,7 @@ the human, the group or thread to invite them to.
 The reads return **email addresses** for any account and any roster on
 the instance, which is why all nine exist only on deployments where one
 organisation owns the whole Loomio instance. A `uid` containing a dot
-cannot be resolved by `get_user` — still so on Loomio 3.13.1 — use the
+cannot be resolved by `get_user` — still so on Loomio 3.15.0 — use the
 numeric id.
 
 ## Drive the connector against a real Loomio from a shell
@@ -418,6 +426,16 @@ changes behaviour. Everything else — field-by-field outputs, permission
 rules, Loomio's counting rules, the exact 403 / 404 texts (static-client
 and stdio wording; open-DCR deployments collapse them, see *Shared
 conventions*) — lives here, one subsection per tool. Ids and names are illustrative.
+
+Upstream paths in the **Cost** lines are written in their pre-3.14 form
+(`/b2/…`, `/b3/…`); on Loomio ≥ 3.14 the connector sends the same routes
+under `/user0/…` and `/server0/…`, chosen by the version its health
+probe reports. Poll fields are named as Loomio 3.14+ names them
+(`vote_count_cast`, `scores_by_option`, `score_min`, …) whatever the
+server's version: the connector renames a pre-3.14 server's
+`decided_voters_count`, `stance_counts`, `min_score`, … on the way in
+and translates the settings you send back on the way out
+(NOTES-ON-LOOMIO-API.md, "Loomio 3.13.1 → 3.15.0 changes that matter").
 
 ### Shared conventions
 
@@ -497,11 +515,11 @@ rows.
 **Poll results** follow Loomio's own rule for the connector's user:
 tallies are visible when `hide_results` is `off`, the poll is closed, or
 it is `until_vote` and the connector's user has voted. Otherwise
-`results`, `stance_counts`, `total_score`, `stv_results` and other
+`results`, `scores_by_option`, `total_score`, `stv_results` and other
 voters' `option_scores` / `reason` are stripped, and `results_visible:
 false` + `results_hidden_reason` (`until_closed` | `until_vote`) say so.
 Absent counts mean hidden, never zero. Anonymous polls never reveal who
-voted what: Loomio's b2 API serializes no stances for them at all.
+voted what: Loomio's User API serializes no stances for them at all.
 `get_thread_markdown` is the one read where Loomio itself stopped
 applying the `until_vote` rule (3.10+); the connector refuses that case
 instead (see its section).
@@ -565,6 +583,19 @@ callers walking ids can then not map which hidden records exist
   before a long task, after a 403 or an unexpected empty list. A
   continuation failure never fails the call: the key verdict is still
   the answer.
+
+- **Two version fields.** `loomio_version` is what this probe's public
+  `GET /v1/boot/version` answered (null when that call failed);
+  `loomio_version_in_use` is the last version any probe reported — the
+  one `/api/user0` vs `/api/b2` is chosen from. A note explains when
+  they differ.
+- **Also refreshes the API dialect.** The connector picks `/api/user0` or
+  `/api/b2` from the Loomio version its last probe reported; a version
+  once seen is kept until another probe reports a different one. After an
+  in-place Loomio upgrade on a stdio deployment (where nothing probes on
+  a timer), call `check_connection` so the next write uses the right
+  generation; `update_discussion`'s thread settings re-probe by
+  themselves when the known version is older than a minute.
 
 ### list_groups
 
@@ -718,18 +749,29 @@ callers walking ids can then not map which hidden records exist
 - **Inputs:** `id_or_key`; any of `title`, `description` (+
   `description_format`; omitted keeps the stored format), `private`
   (422 against `discussion_privacy_options`), `allow_comments`,
-  `allow_reactions`, `allow_concurrent_polls`, and recipients to add
+  `allow_reactions`, `polls_one_at_a_time` (true = one open poll at a
+  time; Loomio 3.14 renamed `allow_concurrent_polls` to this with the
+  OPPOSITE meaning — on a pre-3.14 server the connector sends the value
+  inverted under the old name), `attachments_admin_only` (Loomio 3.14+:
+  only thread and group admins may add files and inline images; refused
+  with a clear error on an older server before anything is written),
+  and recipients to add
   (`recipient_user_ids`, `recipient_emails`, `recipient_audience:
   'group'`, `recipient_message` — a message makes Loomio record a
   visible "edited" item and notify, `notify_recipients`). At least one
   field is required.
-- **Cost:** 1 (`PATCH /b2/discussions/{id}`).
+- **Cost:** 1 (`PATCH /b2/discussions/{id}`); +1 health probe when
+  `polls_one_at_a_time` or `attachments_admin_only` is sent and no probe
+  has reported the Loomio version yet (the connector must know which
+  name the server permits).
 - **Returns:** the updated record shaped like `get_discussion`
   (`versions_count` increments). Idempotent.
 - **Caveats:** the body is REPLACED, not appended — read it with
   `get_discussion` first and send the whole new text. Cannot move a
   thread to another group or change its tags (Loomio drops both silently
-  on update). Permission: the author, a thread admin, or any member
+  on update). On Loomio 3.14+ a new thread allows several polls at once
+  by default (`polls_one_at_a_time: false`); existing threads keep
+  their saved setting. Permission: the author, a thread admin, or any member
   where the group allows members to edit discussions — else 403 `"Not
   authorized to update Discussion."`; a discarded thread cannot be
   edited; unknown 404.
@@ -753,28 +795,35 @@ callers walking ids can then not map which hidden records exist
 - **Cost:** 1.
 - **Returns:** `poll` — id, key, title, full `details` + `details_format`,
   poll_type, group_id, `topic_id`, author_id, closing_at, closed_at,
-  hide_results, anonymous, specified_voters_only, voters_count,
-  decided_voters_count, undecided_voters_count, cast_stances_pct,
-  poll_option_names, the type knobs — joined with the thread counters;
+  hide_results, anonymous, specified_voters_only, `vote_count_eligible`,
+  `vote_count_cast`, `vote_count_uncast`, `participation_pct` (Loomio
+  3.14's names, returned on every Loomio version — a pre-3.14 server's
+  `voters_count` / `decided_voters_count` / `undecided_voters_count` /
+  `cast_stances_pct` are renamed on the way in), poll_option_names, the
+  type knobs — joined with the thread counters;
   `poll_options[]` {id, name, priority, meaning, prompt};
   `current_outcome` (statement, author, created_at) or null;
   `my_stance` (the connector user's own vote: cast_at, option_scores,
   reason; plus `weight` on a weighted poll) or null; `url`; `group` and
   `users` slim; `results_visible` / `results_hidden_reason` and, when
-  visible, `results[]`, `stance_counts`, `total_score`, `stv_results`.
-  Quorum: `quorum_pct`, and `quorum_count` / `quorum_votes_required` /
+  visible, `results[]`, `scores_by_option` (`stance_counts` before
+  3.14), `total_score`, `stv_results`.
+  Quorum: `quorum_pct`, and `quorum_threshold` / `quorum_shortfall`
+  (`quorum_count` / `quorum_votes_required` before 3.14) /
   `quorum_reached` only when the poll HAS a quorum — Loomio 3.13 sends
   `quorum_reached: false` on polls with none, so the three are dropped
   when `quorum_pct` is null.
 - **Loomio 3.10+ result fields:** on a `weighted_voting: true` poll the
-  tallies are in vote-weight units — `stance_counts` entries, the
+  tallies are in vote-weight units — `scores_by_option` entries, the
   `results[]` scores and `total_score` may be fractional decimal
   strings — and `result_heading_keys` (kept on weighted polls only) says
   which result columns are weighted. `total_score` is a decimal STRING
   such as `"3.0"` on every poll (the integer 0 when nothing was
   counted); read it as a number, not as text. `results[]` rows also
-  carry `unweighted_score` (3.10+) and `test_requirement_key` (3.13+);
-  `voter_scores` is `{}` except on meeting polls; the id −1 row lists
+  carry `vote_count` and `unweighted_score` (3.10+) and
+  `test_requirement_key` (3.13+); `scores_by_voter` (`voter_count` /
+  `voter_scores` before 3.14) is `{}` except on meeting polls; the id
+  −1 row lists
   the non-voters (named `poll_receipts_page.not_voted` from 3.13,
   `poll_common_votes_panel.undecided` in 3.10–3.12). `voter_has_access`
   (the web client's vote-button state) is dropped; `voting_system` is
@@ -782,7 +831,7 @@ callers walking ids can then not map which hidden records exist
 - **Caveats:** a poll has no `discussion_id`: `topic_id` is its thread,
   and for a poll inside a discussion it is that discussion's topic_id —
   pass it to `list_thread_items` / `get_thread_markdown`. Anonymous
-  polls have no stances on the b2 API: the tallies (when visible) are
+  polls have no stances on the User API: the tallies (when visible) are
   all there is. 403 `"Not authorized to show Poll."`; unknown 404
   (open-DCR: both "not visible").
 
@@ -795,8 +844,8 @@ callers walking ids can then not map which hidden records exist
   `strip_html` (default true).
 - **Cost:** 1.
 - **Returns:** SLIM rows — identity, type, schedule, hide_results /
-  anonymous, participation counts, `stance_counts` + `total_score` when
-  visible (aligned with `poll_options[]`), topic counters,
+  anonymous, participation counts, `scores_by_option` + `total_score`
+  when visible (aligned with `poll_options[]`), topic counters,
   `poll_options[]`, `current_outcome`, `my_stance`, `url`; the
   per-voter `results[]` and the type knobs Loomio left null are omitted
   (use `get_poll`). Same results gate and the same Loomio 3.10+ field
@@ -830,26 +879,30 @@ callers walking ids can then not map which hidden records exist
   written). `anonymous` (permanent; needs `closing_at`; refused for
   `count`, `question`, `meeting`; forces `hide_results: until_closed`,
   `stance_reason_required: disabled`, `notify_on_closing_soon:
-  undecided_voters`). `details` + `details_format`. `closing_at`
-  (ISO-8601, future; Loomio rounds it DOWN to the hour). `hide_results`
+  voters_uncast`). `details` + `details_format`. `closing_at`
+  (ISO-8601, future; Loomio 3.14+ keeps the minutes, before 3.14 it was
+  rounded DOWN to the hour). `hide_results`
   `off` (default) | `until_vote` | `until_closed` (never relaxable
   later). `specified_voters_only` (only `recipient_user_ids` /
   `recipient_emails` may vote). `shuffle_options`. `notify_on_open`
   (Loomio's default is TRUE: `poll_announced` to every eligible voter,
   in-app for all, email/push per their settings).
   `notify_on_closing_soon` `nobody` (API default; the web form
-  pre-selects `undecided_voters`) | `author` | `undecided_voters` |
-  `voters`. `stance_reason_required` `optional` (default) | `disabled` |
+  pre-selects `voters_uncast`) | `author` | `voters_uncast`
+  (`undecided_voters` before Loomio 3.14; the connector translates it
+  for such a server) | `voters`. `stance_reason_required` `optional` (default) | `disabled` |
   `required` | `required_for_disagree_or_block` | `required_for_block`;
   `reason_prompt`. `show_none_of_the_above` (poll, ranked_choice).
-  `min_score` (score; default 0), `max_score` (score default 5; meeting
-  2 = yes / maybe / no), `dots_per_person` (dot_vote, default 8),
-  `minimum_stance_choices` (poll 1; ranked_choice = ranks required,
+  `score_min` (score; default 0), `score_max` (score default 5; meeting
+  2 = yes / maybe / no), `points_per_voter` (dot_vote, default 8),
+  `choice_count_min` (poll 1; ranked_choice = ranks required,
   default 3 — on Loomio 3.10+ a voter ranks AT LEAST that many, up to
-  every option), `maximum_stance_choices` (poll 1 = single choice; raise
+  every option), `choice_count_max` (poll 1 = single choice; raise
   for multi-choice; Loomio 3.10+ ignores it for `score`, `dot_vote`,
   `ranked_choice`, `stv` and `meeting`, where the option count always
-  applies), `stv_seats` (must be fewer than the options: Loomio 3.10+
+  applies) — Loomio 3.14's names; a pre-3.14 server receives them as
+  `min_score`, `max_score`, `dots_per_person`, `minimum_stance_choices`,
+  `maximum_stance_choices` —, `stv_seats` (must be fewer than the options: Loomio 3.10+
   answers 422 otherwise, so the connector refuses it before sending),
   `meeting_duration` (minutes; no default through the API — the form
   uses 60), `can_respond_maybe`
@@ -867,7 +920,8 @@ callers walking ids can then not map which hidden records exist
   omits it, and `update_poll` with a future `closing_at` opens it later.
   Permission: group admin, member where `members_can_raise_motions`, or
   thread admin, and the thread must allow another poll
-  (`allow_concurrent_polls` or none active) — 403 `"Not authorized to
+  (`polls_one_at_a_time` false — `allow_concurrent_polls` before Loomio
+  3.14 — or none active) — 403 `"Not authorized to
   create Poll."` otherwise. The call THROWS naming the created id if
   Loomio's echo disagrees on the group / thread or shows no options.
   `tags` on a standalone poll follow the create_discussion rule (dropped
@@ -877,7 +931,8 @@ callers walking ids can then not map which hidden records exist
 
 - **Inputs:** `id_or_key`; any of `title`, `details` (+
   `details_format`), `closing_at` (extend or shorten; must stay in the
-  future; rounded down to the hour; a `closing_at` that first opens a
+  future; Loomio 3.14+ keeps the minutes, before 3.14 it was rounded
+  down to the hour; a `closing_at` that first opens a
   draft also triggers `poll_announced` unless `notify_on_open` is
   false), `options` (names to ADD), `hide_results` (may be tightened;
   `until_closed` can never be relaxed), the other settings listed under
@@ -896,15 +951,21 @@ callers walking ids can then not map which hidden records exist
   dropped by Loomio, so avoid concurrent edits. Removing options is not
   offered.
 - **Returns:** the updated poll shaped like `get_poll`.
-- **Caveats:** cannot change `poll_type`, `anonymous`, the group or
-  tags. Permission: a poll admin (author or group admin), thread not
+- **Caveats:** cannot change the group or tags, nor `poll_type` or
+  `anonymous` (not offered; Loomio 3.14+ lets an authorized editor
+  change anonymity, voting method and result visibility in its UI
+  before voting opens — once voting has opened they are fixed on every
+  version). Permission: a poll admin (author or group admin), thread not
   locked, poll NOT closed — a closed poll answers 403 `"Not authorized
   to update Poll."` (reopen it in Loomio first). An anonymous poll's
   configuration is frozen once any ballot exists (422). To END VOTING
-  SOON set `closing_at` to the next full hour: Loomio's hourly job
-  closes the poll when that hour arrives (within ~60 minutes). An
-  immediate close, reopening, and recording an outcome have no b2
-  route; those need Loomio's UI.
+  SOON set `closing_at` a little ahead: on Loomio 3.14+ the minutes are
+  kept and the poll closes within a minute of that time; before 3.14
+  the time was rounded down to the hour and an hourly job closed the
+  poll when that hour arrived (within ~60 minutes), so pass the next
+  full hour there (works on every version). An immediate close,
+  reopening, and recording an outcome have no User API route; those
+  need Loomio's UI.
 
 ### delete_poll
 
@@ -1004,7 +1065,7 @@ callers walking ids can then not map which hidden records exist
   `body_chars` when cut), `polls` (identity, type, schedule,
   hide_results, participation counts, `poll_options[]` {id, name,
   priority} — the ids a stance's `option_scores` is keyed by —,
-  `weighted_voting`, `stance_counts` only when visible), `stances`
+  `weighted_voting`, `scores_by_option` only when visible), `stances`
   (`participant_id`; `option_scores`; `reason`; `weight` only on a
   weighted poll — anonymous polls have no stances at all), `outcomes`,
   `users` {id, name, username}; `total` (every item), `matched` (after
@@ -1342,11 +1403,16 @@ callers walking ids can then not map which hidden records exist
 ### b3: deactivate_user, reactivate_user, get_user, list_users, list_instance_groups, list_instance_memberships, add_group_members, update_membership_roles, revoke_membership
 
 All nine authenticate with `LOOMIO_B3_API_KEY` — the Loomio SERVER's
-own secret (`B3_API_KEY`, ≥ 17 chars), not a user key — and are
-registered only when it is set AND the server is not read-only. They
+own secret (`SERVER_API_KEY` on Loomio 3.14+, `B3_API_KEY` before and
+still read while the new name is unset; ≥ 17 chars), not a user key —
+and are registered only when it is set AND the server is not read-only.
+They call Loomio's Server API: `/server0/…` on Loomio ≥ 3.14, `/b3/…`
+before (the paths below are the pre-3.14 form; the connector picks by
+the version its health probe reports). They
 are meant for single-tenant deployments: one organisation owns the
 whole Loomio instance. Since Loomio 3.13.0 the secret is checked by
-`Api::B3::BaseController` for every b3 route (same rule as before);
+the Server API's base controller (`Api::B3::BaseController`;
+`Api::Server0::` since 3.14) for every route (same rule as before);
 a wrong secret is the generic 403, which the connector names as a b3
 secret mismatch.
 
@@ -1378,7 +1444,7 @@ secret mismatch.
   email, name}]} for ANY account on the instance, member of the
   connector's groups or not, plus `resolved_by`. A `uid` containing a
   dot (most emails) cannot be resolved — Rails reads the suffix as a
-  format; still so on Loomio 3.13.1 — so use the numeric id for those.
+  format; still so on Loomio 3.15.0 — so use the numeric id for those.
   404 when nothing matches.
 - **`list_users({is_admin?})`** — 1 call (`GET /b3/users`, unpaginated,
   ordered by id): EVERY account, active and deactivated, in every group

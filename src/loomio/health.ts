@@ -71,6 +71,13 @@
  */
 
 import { logEvent } from "../log.js";
+import {
+  type ApiDialect,
+  apiDialect,
+  apiDialectKnown,
+  dialectForVersion,
+  userApiPath,
+} from "./api-dialect.js";
 import { TESTED_LOOMIO_VERSION } from "../version.js";
 import {
   classifyForbidden,
@@ -87,8 +94,10 @@ import {
   getCachedGroupsIndex,
   getCachedHealth,
   getFreshGroupsIndex,
+  getKnownLoomioVersion,
   HEALTH_CACHE_TTL_MS,
   type HealthReason,
+  knownLoomioVersionAgeMs,
   type LoomioHealth,
   resetCachedHealth,
   setCachedHealth,
@@ -102,11 +111,24 @@ export {
   getCachedGroupsIndex,
   getCachedHealth,
   getFreshGroupsIndex,
+  getKnownLoomioVersion,
   HEALTH_CACHE_TTL_MS,
+  knownLoomioVersionAgeMs,
 };
 
-/** The authenticated probe target. See the module comment for why this endpoint. */
-export const HEALTH_PROBE_PATH = "/b2/groups";
+/**
+ * The authenticated probe target, for the dialect of the Loomio version
+ * the PREVIOUS probe reported (see the module comment for why the
+ * groups index). The first probe of a process knows no version yet and
+ * takes the legacy `/b2/groups`, which every supported Loomio answers;
+ * once a version is known the probe moves to `/user0/groups` on 3.14+.
+ * Kept out of a constant on purpose: the path is a function of state.
+ */
+export function healthProbePath(knownVersion: string | null | undefined): string {
+  return userApiPath("/groups", dialectForVersion(knownVersion));
+}
+/** The probe path before any version is known — Loomio 3.8 through 3.15 all answer it. Kept for the docs and tests; the probe itself calls `healthProbePath`. */
+export const HEALTH_PROBE_PATH = healthProbePath(null);
 /** Public endpoint reporting the instance's Loomio version. */
 export const VERSION_PROBE_PATH = "/v1/boot/version";
 
@@ -173,7 +195,35 @@ export async function checkLoomioHealth(
 
 async function runProbe(): Promise<LoomioHealth> {
   const previous = getCachedHealth();
-  const [key, loomioVersion] = await Promise.all([probeKey(), probeVersion()]);
+  const knownBefore = getKnownLoomioVersion();
+  const startedAt = Date.now();
+  // Both requests in parallel so a hung Loomio costs one 8 s deadline,
+  // not two; the key probe takes the path of the LAST known version.
+  let [key, loomioVersion] = await Promise.all([
+    probeKey(healthProbePath(knownBefore)),
+    probeVersion(),
+  ]);
+  // Security review F-18-05: the version learned in THIS run may select
+  // the other path generation (first probe of a process on a Loomio that
+  // no longer serves /b2, or a version change in place). A 404 — or any
+  // 403 that is not Loomio's own unauthenticated body: a WAF or an API
+  // gateway refusing the deprecated prefix — on the old generation's path
+  // then says nothing about the key: retry once on the right path before
+  // anything is cached or a forced event fires. The retry gets what is
+  // LEFT of the probe deadline, so /health still answers inside the
+  // window the 8 s was chosen for (a hung retry after a slow pair must
+  // not add a second 8 s).
+  if (
+    key.key_status === "unreachable" &&
+    (key.reason === "http_404" || key.reason === "waf" || key.reason === "unrecognised_403") &&
+    loomioVersion &&
+    healthProbePath(loomioVersion) !== healthProbePath(knownBefore)
+  ) {
+    const remaining = HEALTH_PROBE_TIMEOUT_MS - (Date.now() - startedAt);
+    if (remaining > 500) {
+      key = await probeKey(healthProbePath(loomioVersion), remaining);
+    }
+  }
   const health: LoomioHealth = {
     key_status: key.key_status,
     loomio_version: loomioVersion,
@@ -244,12 +294,15 @@ function reasonForThrow(err: unknown): HealthReason {
   return "network_error";
 }
 
-async function probeKey(): Promise<KeyVerdict> {
+async function probeKey(
+  probePath: string,
+  timeoutMs: number = HEALTH_PROBE_TIMEOUT_MS,
+): Promise<KeyVerdict> {
   let status: number;
   let text: string;
   try {
-    ({ status, text } = await loomioGetRaw(HEALTH_PROBE_PATH, readParams("groups"), {
-      timeoutMs: HEALTH_PROBE_TIMEOUT_MS,
+    ({ status, text } = await loomioGetRaw(probePath, readParams("groups"), {
+      timeoutMs,
       probe: true,
     }));
   } catch (err) {
@@ -260,7 +313,7 @@ async function probeKey(): Promise<KeyVerdict> {
       key_status: "unreachable",
       reason: reasonForThrow(err),
       detail: scrubSecrets(
-        `GET ${HEALTH_PROBE_PATH} failed: ${err instanceof Error ? err.message : String(err)}`,
+        `GET ${probePath} failed: ${err instanceof Error ? err.message : String(err)}`,
       ),
     };
   }
@@ -269,13 +322,13 @@ async function probeKey(): Promise<KeyVerdict> {
     // Only Loomio's own unauthenticated body proves the key is rejected.
     // A WAF's 403 never reached Loomio; any other JSON 403 on this
     // endpoint is uncatalogued, so refuse to guess.
-    const { kind } = classifyForbidden(text, { path: HEALTH_PROBE_PATH });
+    const { kind } = classifyForbidden(text, { path: probePath });
     if (kind === "unauthenticated") {
       return {
         key_status: "rejected",
         reason: "unauthenticated_body",
         detail:
-          `Loomio answered GET ${HEALTH_PROBE_PATH} with 403 and its unauthenticated body: no active ` +
+          `Loomio answered GET ${probePath} with 403 and its unauthenticated body: no active ` +
           "user owns this API key (rotated on password change / Loomio 3.3.1 upgrade, or the user was " +
           "deactivated). Obtain the current key from the user's API access page (/profile/api_access).",
       };
@@ -285,7 +338,7 @@ async function probeKey(): Promise<KeyVerdict> {
         key_status: "unreachable",
         reason: "waf",
         detail:
-          `GET ${HEALTH_PROBE_PATH} was answered 403 by a CDN/WAF in front of Loomio, not by Loomio; ` +
+          `GET ${probePath} was answered 403 by a CDN/WAF in front of Loomio, not by Loomio; ` +
           "check the WAF's rules (User-Agent / bot rules) — the key was never evaluated.",
       };
     }
@@ -293,15 +346,41 @@ async function probeKey(): Promise<KeyVerdict> {
       key_status: "unreachable",
       reason: "unrecognised_403",
       detail: scrubSecrets(
-        `GET ${HEALTH_PROBE_PATH} answered 403 with an unrecognised body: ${text.slice(0, 200)}`,
+        `GET ${probePath} answered 403 with an unrecognised body: ${text.slice(0, 200)}`,
       ),
     };
   }
   return {
     key_status: "unreachable",
     reason: `http_${status}`,
-    detail: `GET ${HEALTH_PROBE_PATH} answered HTTP ${status}`,
+    detail: `GET ${probePath} answered HTTP ${status}`,
   };
+}
+
+/**
+ * What a Loomio version looks like on the wire: Loomio serves the
+ * literal `Version.current` ("3.15.0"), so a semver-shaped token with an
+ * optional short pre-release / build suffix covers every real value.
+ * Security review F-18-01: the string steers path selection and is
+ * reflected into forced log events, the anonymous /health body,
+ * check_connection and a tool error, and it is the one upstream value
+ * that was neither bounded nor clipped — a proxy answering the keyless
+ * version route with megabytes could break the log line the key-rotation
+ * alert matches. Anything else is treated as "no version" (`null`),
+ * which keeps every guard and the legacy paths.
+ */
+const VERSION_TOKEN = /^v?\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]{1,32})?$/;
+export const VERSION_TOKEN_MAX_LENGTH = 64;
+
+/** The version string Loomio reported, or `null` when it is missing or not a plausible version token. */
+export function acceptVersionToken(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const version = value.trim();
+  return version.length > 0 &&
+    version.length <= VERSION_TOKEN_MAX_LENGTH &&
+    VERSION_TOKEN.test(version)
+    ? version
+    : null;
 }
 
 async function probeVersion(): Promise<string | null> {
@@ -312,9 +391,9 @@ async function probeVersion(): Promise<string | null> {
     });
     if (status !== 200) return null;
     const parsed: unknown = JSON.parse(text);
-    const version =
-      parsed && typeof parsed === "object" ? (parsed as { version?: unknown }).version : undefined;
-    return typeof version === "string" && version.length > 0 ? version : null;
+    return acceptVersionToken(
+      parsed && typeof parsed === "object" ? (parsed as { version?: unknown }).version : undefined,
+    );
   } catch {
     return null;
   }
@@ -345,6 +424,39 @@ function warnOnVersionDrift(loomioVersion: string | null): void {
 }
 
 /**
+ * The API dialect to write in, or `undefined` when the Loomio version is
+ * not known. Reads never need this — the legacy path works on every
+ * Loomio and `modernizePollsIn` evens out what it answers — but a write
+ * carrying the thread settings Loomio renamed in 3.14
+ * (`polls_one_at_a_time`, `attachments_admin_only`) must know which name
+ * the server permits: the `/b2` compatibility filter translates poll
+ * fields only, and `PermittedParams` (`:raise`) answers 400 to the wrong
+ * one. So this probes when no version was ever reported, or when the
+ * known one is older than the health cache's TTL (security review
+ * F-18-03: under stdio nothing else re-probes, and an in-place Loomio
+ * upgrade would otherwise be followed for the life of the process) —
+ * bounded exactly like check_connection: a probe younger than
+ * `CHECK_CONNECTION_PROBE_MAX_AGE_MS` is reused and concurrent callers
+ * share one in flight, so repeated writes cost at most one probe pair
+ * per 10 s per process. A version stays unknown only when the keyless
+ * version route is unreachable while the authenticated probe passes; the
+ * caller then refuses rather than guesses (F-18-02). The same holds for
+ * a version that WAS known but could not be refreshed: once it is older
+ * than the TTL and the re-probe brought no newer one, it is not trusted
+ * for this decision either (the sweep after the review: an in-place
+ * upgrade plus a version route that stopped answering must not be
+ * followed for the life of the process), while reads keep using it —
+ * the legacy paths still answer, and reads are self-correcting.
+ */
+export async function resolveApiDialect(): Promise<ApiDialect | undefined> {
+  if (knownLoomioVersionAgeMs() > HEALTH_CACHE_TTL_MS) {
+    await checkLoomioHealth({ maxAgeMs: CHECK_CONNECTION_PROBE_MAX_AGE_MS });
+    if (knownLoomioVersionAgeMs() > HEALTH_CACHE_TTL_MS) return undefined;
+  }
+  return apiDialectKnown() ? apiDialect() : undefined;
+}
+
+/**
  * The connector user's own Loomio id, from the LAST groups probe body of
  * any age — or `undefined` before the first successful probe. The
  * groups index side-loads only the API user's own membership rows, so
@@ -372,7 +484,7 @@ export function cachedOwnUserId(): number | undefined {
  */
 export function keyRejectedWarning(): string {
   return (
-    "Loomio rejected the connector's API key (GET /api/b2/groups answered 403 with Loomio's " +
+    "Loomio rejected the connector's API key (the groups index answered 403 with Loomio's " +
     "unauthenticated body). The key has almost certainly been ROTATED: Loomio regenerates a " +
     "user's API key whenever that user's password changes, and Loomio 3.3.1 rotated every key " +
     "once on upgrade. Every tool call will fail with a clear 403 until the key is replaced. " +

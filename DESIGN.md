@@ -1,23 +1,45 @@
 # Design
 
 Short notes on the load-bearing choices. Loomio facts are stated
-against Loomio 3.13.1 (`TESTED_LOOMIO_VERSION` in `src/version.ts`,
-since 0.0.16). The 3.9 → 3.13.1 changes that matter — the paged groups
+against Loomio 3.15.0 (`TESTED_LOOMIO_VERSION` in `src/version.ts`,
+since 0.0.18; 3.13.1 from 0.0.16). The 3.13.1 → 3.15.0 changes — the
+versioned API paths (`/user0` / `/server0`, 3.14.0), the poll field
+renames and the inverted `polls_one_at_a_time` thread setting (3.14.0)
+— are under "Surface area" below. The 3.9 → 3.13.1 changes that matter — the paged groups
 index and thread items (3.11.1), `wrap_parameters false` on b2 (3.12.0),
 the b3 group / membership provisioning routes (3.13.0), the Markdown
 export ignoring "hide results until vote" (3.10.0) — are dated where
 they matter below; NOTES-ON-LOOMIO-API.md has the line-by-line evidence
-and a per-commit table ("Loomio 3.9 → 3.13.1 changes that matter").
-Citations made at 3.8.1 / 3.9.0 still hold where nothing is dated.
+and per-commit tables ("Loomio 3.9 → 3.13.1 …" and "Loomio 3.13.1 →
+3.15.0 changes that matter"). Citations made at 3.8.1 / 3.9.0 still
+hold where nothing is dated; paths are quoted in their pre-3.14 form.
 
 ## Surface area
 
-All non-admin tools target the **b2** API (`/api/b2/...`), with auth
-via `Authorization: Bearer <api_key>`. This is the namespace where
-Loomio's controllers live in the open-source repo (the `b1` namespace
-was removed in Loomio 3.1.0) and the one Loomio's OpenAPI document
-describes. The canonical b2 docs are at https://www.loomio.com/help/api2.
-As of 3.13.1 the connector wraps every b2 resource except `/b2/chatbots`
+All non-admin tools target Loomio's **User API** — `/api/user0/...` on
+Loomio ≥ 3.14, `/api/b2/...` before (the "b2" namespace; `b1` was
+removed in Loomio 3.1.0) — with auth via `Authorization: Bearer
+<api_key>`. This is the namespace where Loomio's controllers live in
+the open-source repo (`app/controllers/api/user0/`) and the one
+Loomio's OpenAPI document describes; the docs are at
+https://www.loomio.com/docs/en/user_manual/integrations/api/user-api.
+Which generation to send is decided per request by
+`src/loomio/api-dialect.ts` from the Loomio version the health probe
+last reported (≥ 3.14.0 → `/user0`; older or unknown → `/b2`, which
+every supported Loomio answers). On 3.14+ `/b2` is a compatibility
+shim, not an alias: `Api::User0::LegacyB2Fields` renames poll fields on
+that path back to their pre-3.14 names, so `src/loomio/poll-fields.ts`
+normalises every `polls[]` row to the 3.14 vocabulary
+(`modernizePollsIn`, in the HTTP client) and translates poll writes
+back on the legacy dialect (`legacyPollParams`) — a caller sees one
+set of names on every Loomio. The one setting the shim does not
+translate, the thread's `polls_one_at_a_time` (3.14's inverted
+`allow_concurrent_polls`) and its sibling `attachments_admin_only`,
+makes `update_discussion` resolve the dialect first
+(`resolveApiDialect`, which probes when no version is known) and send
+the inverted old name, or refuse the 3.14-only field, on an older
+server.
+As of 3.15.0 the connector wraps every User API resource except `/b2/chatbots`
 (group-admin webhook configuration whose serializer returns the webhook
 URL — nothing an AI caller needs, and a leak surface), `GET
 /b2/threads/{id}` as a tool of its own (its row is what `list_threads`
@@ -25,8 +47,11 @@ returns; `get_thread_markdown`'s vote-visibility guard and `create_poll`'s
 `topic_id` cross-check read it internally) and the participation
 report's `base` / `countries` sections.
 
-The **b3** namespace uses a separate auth secret — a bearer token
-validated against `ENV['B3_API_KEY']` on the Loomio server, >16 chars.
+The **b3** tools target Loomio's **Server API** — `/api/server0` on
+≥ 3.14, `/api/b3` before, chosen the same way — with a separate auth
+secret: a bearer token validated against `ENV['SERVER_API_KEY']` on the
+Loomio server (`B3_API_KEY` before 3.14, still read while the new name
+is unset), >16 chars.
 This is a server-instance admin secret, not a per-user key. The
 connector wraps these of its routes (nine tools): the member routes
 `POST /b3/users/{id}/deactivate` and `…/reactivate` (Loomio's OpenAPI
@@ -234,7 +259,8 @@ poll whose author said "vote first". `src/loomio/visibility.ts` applies
 the full predicate with "voted" = the API user's own latest stance is
 cast (the `my_stance` side-load on a poll show; in a thread's items the
 stance whose `participant_id` is the id the health probe learned),
-strips `results` / `stance_counts` / `total_score` / `stv_results` and
+strips `results` / `scores_by_option` (`stance_counts` before 3.14) /
+`total_score` / `stv_results` and
 other voters' `option_scores` / `reason` when it says no, and always
 emits `results_visible` + `results_hidden_reason` so a caller can tell
 "hidden" from "zero". With no cached identity the thread tools assume
@@ -246,7 +272,7 @@ connector checks the thread first and refuses one holding an open
 src/tools/threads.ts; SECURITY.md); on Loomio 3.8 / 3.9, whose
 `ThreadMarkdownService` still applied `results_visible?(voted:)`, the
 check is skipped when a health probe confirmed that version within the
-last minute. Anonymous polls (Loomio ≥ 3.10) have no stances on the b2
+last minute. Anonymous polls (Loomio ≥ 3.10) have no stances on the User
 API at all (≤ 3.9: `participant_id: null` on every stance); nothing
 here can or should de-anonymise them, and the server instructions tell
 the model not to try.
@@ -329,7 +355,7 @@ function over the body text, unit-tested per shape:
 | Body | Meaning | Kind |
 |---|---|---|
 | non-JSON, or JSON whose `type` URL names cloudflare | a CDN/WAF answered; Loomio never saw the request | `waf` |
-| `"You are not authorized to access this page."` | unauthenticated — no active user owns the key (rotated?); on the `b2/discussions` and `b2/polls` `?group_id=` GET lists also "group not visible"; on `/b2/threads…`, `/b2/search`, `/b2/reports` and the `/b2/groups` index (where Loomio filters or 404s instead of refusing) the key and nothing else; on `/b3/` the b3 secret | `unauthenticated` |
+| `"You are not authorized to access this page."` | unauthenticated — no active user owns the key (rotated?); on the `b2/discussions` and `b2/polls` `?group_id=` GET lists also "group not visible"; on `/b2/threads…`, `/b2/search`, `/b2/reports` and the `/b2/groups` index (where Loomio filters or 404s instead of refusing) the key and nothing else; on `/server0/` or `/b3/` the b3 secret | `unauthenticated` |
 | `"Not authorized to <action> <Model>."` | valid key, user lacks permission for that record/action; `show Group` on `GET /b2/groups/:id` = a hidden group (the id is right, the remedy is membership) | `not_authorized` |
 | `"User is not an admin"` | `manage_memberships` without the coordinator role on that group | `not_admin` |
 | numeric body, or `action: "upgrade"` | subscription / plan cap | `plan_limit` |
@@ -346,8 +372,9 @@ definitive, a fresh `valid` on a gated list points at visibility first,
 and a stale verdict is ignored — the startup probe under stdio may be
 days old, and a stale `valid` must never make a post-rotation 403 read as
 "not a key problem". A 401 is mapped separately and per namespace:
-Loomio's b2/b3 API answers its own authentication failures with 403, so
-a 401 on a b2/b3 path came from something in front of Loomio; Loomio's
+Loomio's User and Server APIs answer their own authentication failures
+with 403, so a 401 on one of their paths came from something in front
+of Loomio; Loomio's
 v1 API can itself answer 401 (`require_current_user`) because it is a
 session-cookie API. 429 (Rack::Attack, `text/plain`) becomes a clear
 retry message with `Retry-After` when present. Every echo of upstream
@@ -363,13 +390,22 @@ process is healthy). Loomio rotates a user's key on password change,
 rotated every key once in 3.3.1, and publishes no compatibility policy.
 So the connector probes actively (`src/loomio/health.ts`):
 
-- `GET /api/b2/groups` with the key (and the groups read profile, so
+- `GET /api/user0/groups` with the key — `/api/b2/groups` before Loomio
+  3.14 and for a process's first probe, before any version is known
+  (`healthProbePath`) — (and the groups read profile, so
   the probe does not haul tag / translation side-loads) — 200 for any
   valid key (even with zero groups), 403 with Loomio's unauthenticated
   body for a rejected one; a WAF 403 or any other failure is
   `unreachable`, never a false "rejected". Plus the public
   `GET /api/v1/boot/version` for `loomio_version`, whose failure never
   affects `key_status`.
+- The version it reports is also what `src/loomio/api-dialect.ts` reads
+  to choose `/user0` + `/server0` (≥ 3.14.0) over `/b2` + `/b3`.
+  Reads never wait for it (the legacy path works everywhere and the
+  poll renaming evens out the answer); a write that needs the dialect
+  — `update_discussion` with a renamed thread setting — calls
+  `resolveApiDialect`, which runs a probe when none has reported a
+  version yet.
 - Each probe request has its own 8 s deadline (`HEALTH_PROBE_TIMEOUT_MS`)
   instead of the client's 60 s. The probe serves an uptime checker that
   gives up at ~10 s, and the hosting platform's request timeout is often
@@ -413,9 +449,9 @@ message definitive) without importing the probe that *uses* the client
 
 ## API-key injection
 
-Both Loomio public APIs (b2 and b3) take their auth secret in an
-`Authorization: Bearer` header — the per-user key for b2, the
-server-instance secret for b3. Loomio rejects keys in the query string
+Both Loomio public APIs (User and Server — "b2" and "b3") take their
+auth secret in an `Authorization: Bearer` header — the per-user key for
+the User API, the server-instance secret for the Server API. Loomio rejects keys in the query string
 (changed July 2026). There is one injection point, `authHeaders()` in
 `src/loomio/client.ts`; `buildUrl()` builds a URL that carries no
 credential at all, and `loomioGetPublic` sends no credential for the

@@ -83,10 +83,32 @@ export interface LoomioHealth {
 let cached: LoomioHealth | undefined;
 let cachedAtMs = 0;
 let cachedGroups: GroupsIndexResponse | undefined;
+// The last Loomio version any probe REPORTED, kept apart from the
+// verdict it came with: `LoomioHealth.loomio_version` is honest about
+// one probe ("null when that call failed", for /health), while the API
+// dialect (src/loomio/api-dialect.ts) must not flip to the legacy
+// paths because one keyless version request timed out. Security review
+// F-18-02: a transient failure of GET /v1/boot/version erased a known
+// version for 60 s and sent the renamed thread setting under its old
+// name. A known version only ever changes to another known version.
+let knownVersion: string | undefined;
+let knownVersionAtMs = 0;
 
 /** Last probe result, if any — regardless of age. `undefined` before the first probe. */
 export function getCachedHealth(): LoomioHealth | undefined {
   return cached;
+}
+
+/** The last Loomio version any probe reported — sticky across probes whose version call failed. */
+export function getKnownLoomioVersion(): string | undefined {
+  return knownVersion;
+}
+
+/** Age of the known version, `Infinity` before any probe reported one. */
+export function knownLoomioVersionAgeMs(now: number = Date.now()): number {
+  return knownVersion === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, now - knownVersionAtMs);
 }
 
 /**
@@ -151,6 +173,10 @@ export function setCachedHealth(
   cached = health;
   cachedAtMs = now;
   cachedGroups = groups;
+  if (health.loomio_version) {
+    knownVersion = health.loomio_version;
+    knownVersionAtMs = now;
+  }
 }
 
 /** Test hook: forget the cached result so the next probe hits the network. */
@@ -158,4 +184,6 @@ export function resetCachedHealth(): void {
   cached = undefined;
   cachedAtMs = 0;
   cachedGroups = undefined;
+  knownVersion = undefined;
+  knownVersionAtMs = 0;
 }

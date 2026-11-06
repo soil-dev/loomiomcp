@@ -9,6 +9,7 @@ import {
 } from "../loomio/client.js";
 import { pick } from "../loomio/shape.js";
 import { emailAddress, positiveId } from "./_common.js";
+import { serverApiPath } from "../loomio/api-dialect.js";
 
 // ── b3 provisioning: groups and memberships (Loomio ≥ 3.13.0) ──────────────
 //
@@ -72,7 +73,7 @@ import { emailAddress, positiveId } from "./_common.js";
 //     INSTANCE admins; with a name and DEFAULT_ONBOARDING_GROUP_ID set it
 //     also silently joins a group. add_group_members already creates the
 //     accounts it needs (`User.find_or_create_by!(email:)`).
-//   - `PATCH` / `DELETE` / redact on `/b3/users` and their identity
+//   - `PATCH` / `DELETE` / redact on serverApiPath(`/users`) and their identity
 //     variants: `is_admin` escalation, an email change hands the login to
 //     whoever owns the new address, and delete / redact are irreversible.
 //   - The `PUT` alias Rails' `resources` generates beside each PATCH.
@@ -189,7 +190,7 @@ function explainB3Error(err: unknown, op: B3Operation, id?: number): never {
   if (!(err instanceof LoomioApiError)) throw err;
   if (err.status === 404) {
     const why: Record<B3Operation, string> = {
-      list_instance_groups: `GET /b3/groups names no record, so only the route can be missing: ${OLDER_LOOMIO}.`,
+      list_instance_groups: `GET ${serverApiPath("/groups")} names no record, so only the route can be missing: ${OLDER_LOOMIO}.`,
       list_instance_memberships: `Group ${id} is unknown or deleted, or this is ${OLDER_LOOMIO}. Group ids: list_instance_groups.`,
       add_group_members: `Group ${id} is unknown or deleted, or this is ${OLDER_LOOMIO}. ${NOTHING_CHANGED}`,
       update_membership_roles:
@@ -312,7 +313,7 @@ export async function listInstanceGroups(
   const offset = input.offset ?? 0;
   let body: B3GroupsResponse;
   try {
-    body = await loomioGetB3<B3GroupsResponse>("/b3/groups", { limit, offset });
+    body = await loomioGetB3<B3GroupsResponse>(serverApiPath("/groups"), { limit, offset });
   } catch (err) {
     explainB3Error(err, "list_instance_groups");
   }
@@ -361,7 +362,7 @@ export async function listInstanceMemberships(
   const offset = input.offset ?? 0;
   let body: B3MembershipsResponse;
   try {
-    body = await loomioGetB3<B3MembershipsResponse>("/b3/memberships", {
+    body = await loomioGetB3<B3MembershipsResponse>(serverApiPath("/memberships"), {
       group_id: input.group_id,
       limit,
       offset,
@@ -453,7 +454,7 @@ export async function addGroupMembers(input: AddGroupMembersInput): Promise<AddG
   const body = { group_id: input.group_id, emails: [...input.emails] };
   let resp: B3SyncResponse;
   try {
-    resp = await loomioPostB3<B3SyncResponse>("/b3/memberships", body);
+    resp = await loomioPostB3<B3SyncResponse>(serverApiPath("/memberships"), body);
   } catch (err) {
     explainB3Error(err, "add_group_members", input.group_id);
   }
@@ -462,7 +463,7 @@ export async function addGroupMembers(input: AddGroupMembersInput): Promise<AddG
     // "unchanged" for everyone would be a lie about emails already sent.
     throw new LoomioApiError(
       502,
-      "Loomio answered POST /b3/memberships without `added_emails`; the response shape is not the " +
+      `Loomio answered POST ${serverApiPath("/memberships")} without \`added_emails\`; the response shape is not the ` +
         "one Loomio 3.13 produces. The call may have taken effect — check with " +
         "list_instance_memberships before retrying.",
     );
@@ -530,7 +531,7 @@ export async function updateMembershipRoles(
   const roles: Record<string, boolean> = {};
   if (input.admin !== undefined) roles["admin"] = input.admin;
   if (input.delegate !== undefined) roles["delegate"] = input.delegate;
-  const path = `/b3/memberships/${input.id}`;
+  const path = serverApiPath(`/memberships/${input.id}`);
   let resp: B3MembershipResponse;
   try {
     resp = await loomioPatchB3<B3MembershipResponse>(path, nestedBody("membership", roles));
@@ -540,7 +541,7 @@ export async function updateMembershipRoles(
   if (!resp.membership) {
     throw new LoomioApiError(
       502,
-      "Loomio answered PATCH /b3/memberships/{id} without a `membership`; the response shape is not " +
+      `Loomio answered PATCH ${serverApiPath("/memberships/")}{id} without a \`membership\`; the response shape is not ` +
         "the one Loomio 3.13 produces. The roles may have changed — check with " +
         "list_instance_memberships.",
     );
@@ -590,7 +591,7 @@ export async function revokeMembership(
   input: RevokeMembershipInput,
 ): Promise<RevokeMembershipResult> {
   try {
-    await loomioDeleteB3<{ success?: boolean }>(`/b3/memberships/${input.id}`);
+    await loomioDeleteB3<{ success?: boolean }>(serverApiPath(`/memberships/${input.id}`));
   } catch (err) {
     explainB3Error(err, "revoke_membership", input.id);
   }

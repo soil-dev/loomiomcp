@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { loomioGetB3, loomioPostB3 } from "../loomio/client.js";
 import { encodePathSegment, positiveId } from "./_common.js";
+import { serverApiPath } from "../loomio/api-dialect.js";
 
 // ── deactivate_user / reactivate_user (b3 admin) ────────────────────────────
 //
@@ -83,7 +84,7 @@ export const deactivateUserSchema = z.object({
 export async function deactivateUser(
   input: z.infer<typeof deactivateUserSchema>,
 ): Promise<B3UserResponse> {
-  return loomioPostB3<B3UserResponse>(`/b3/users/${input.id}/deactivate`);
+  return loomioPostB3<B3UserResponse>(serverApiPath(`/users/${input.id}/deactivate`));
 }
 
 export const reactivateUserSchema = z.object({
@@ -93,7 +94,7 @@ export const reactivateUserSchema = z.object({
 export async function reactivateUser(
   input: z.infer<typeof reactivateUserSchema>,
 ): Promise<B3UserResponse> {
-  return loomioPostB3<B3UserResponse>(`/b3/users/${input.id}/reactivate`);
+  return loomioPostB3<B3UserResponse>(serverApiPath(`/users/${input.id}/reactivate`));
 }
 
 // ── get_user / list_users (b3 reads) ────────────────────────────────────────
@@ -139,7 +140,7 @@ export interface B3UsersIndexResponse {
  * The two identity-route segments (security review nit 9). v0.0.16 sent
  * them through `encodeURIComponent`, which leaves `.` alone, so `.` and
  * `..` segments were resolved away by the URL parser and the request
- * went to another b3 route (`identity_type: ".."` reached `/b3/users/…`)
+ * went to another b3 route (`identity_type: ".."` reached serverApiPath(`/users/…`))
  * — the same gate and credential, no new data, but a path the tool
  * never meant to call. Now both must be ONE Rails
  * route segment: Rails' default segment pattern excludes `/`, `.` and
@@ -199,7 +200,7 @@ export interface GetUserResult {
 
 export async function getUser(input: GetUserInput): Promise<GetUserResult> {
   if (input.id !== undefined) {
-    const body = await loomioGetB3<B3UserShowResponse>(`/b3/users/${input.id}`);
+    const body = await loomioGetB3<B3UserShowResponse>(serverApiPath(`/users/${input.id}`));
     return { user: body.user, resolved_by: "id" };
   }
   // Both segments are caller strings: the schema restricted them to one
@@ -207,7 +208,9 @@ export async function getUser(input: GetUserInput): Promise<GetUserResult> {
   // neither can rewrite the path.
   const type = encodePathSegment(input.identity_type ?? "");
   const uid = encodePathSegment(input.uid ?? "");
-  const body = await loomioGetB3<B3UserShowResponse>(`/b3/users/identity/${type}/${uid}`);
+  const body = await loomioGetB3<B3UserShowResponse>(
+    serverApiPath(`/users/identity/${type}/${uid}`),
+  );
   return { user: body.user, resolved_by: "identity" };
 }
 
@@ -231,7 +234,7 @@ export interface ListUsersResult {
 
 export async function listUsers(input: ListUsersInput = {}): Promise<ListUsersResult> {
   const body = await loomioGetB3<B3UsersIndexResponse>(
-    "/b3/users",
+    serverApiPath("/users"),
     input.is_admin === undefined ? undefined : { is_admin: input.is_admin },
   );
   const users = Array.isArray(body.users) ? body.users : [];

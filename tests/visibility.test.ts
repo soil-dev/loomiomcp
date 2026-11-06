@@ -1,6 +1,6 @@
 /**
  * Client-side poll result gating (src/loomio/visibility.ts). Loomio's
- * b2 API serialises `results` / `stance_counts` / `total_score` for
+ * b2 API serialises `results` / `scores_by_option` / `total_score` for
  * every poll whose `hide_results` is not `until_closed` — including an
  * OPEN `until_vote` poll the API user has not voted on, which the
  * browser client would hide. These tests pin Loomio's predicate
@@ -37,12 +37,12 @@ function poll(overrides: Partial<LoomioPoll> = {}): LoomioPoll {
       { id: 1, name: "agree", score: 3, voter_ids: [11, 12, 13] },
       { id: 2, name: "disagree", score: 1, voter_ids: [14] },
     ],
-    stance_counts: [3, 1],
+    scores_by_option: [3, 1],
     total_score: 4,
-    voters_count: 10,
-    decided_voters_count: 4,
-    undecided_voters_count: 6,
-    cast_stances_pct: 40,
+    vote_count_eligible: 10,
+    vote_count_cast: 4,
+    vote_count_uncast: 6,
+    participation_pct: 40,
     ...overrides,
   };
 }
@@ -130,7 +130,7 @@ describe("stripHiddenResults / gatePollResults", () => {
     expect(out.results_visible).toBe(true);
     expect(out).not.toHaveProperty("results_hidden_reason");
     expect(out.results).toHaveLength(2);
-    expect(out.stance_counts).toEqual([3, 1]);
+    expect(out.scores_by_option).toEqual([3, 1]);
     expect(out.total_score).toBe(4);
   });
 
@@ -145,10 +145,10 @@ describe("stripHiddenResults / gatePollResults", () => {
     expect(out).toMatchObject({
       id: 301,
       title: "Adopt the budget?",
-      voters_count: 10,
-      decided_voters_count: 4,
-      undecided_voters_count: 6,
-      cast_stances_pct: 40,
+      vote_count_eligible: 10,
+      vote_count_cast: 4,
+      vote_count_uncast: 6,
+      participation_pct: 40,
     });
     // Pure.
     expect(p.results).toHaveLength(2);

@@ -412,7 +412,7 @@ describe("forced events", () => {
   it("stays quiet on a patch-level difference or an unknown version", async () => {
     mockRoutes({
       "/b2/groups": { status: 200, body: {} },
-      "/v1/boot/version": { status: 200, body: { version: "3.13.7" } },
+      "/v1/boot/version": { status: 200, body: { version: "3.15.7" } },
     });
     await checkLoomioHealth();
     resetHealthForTests();

@@ -803,8 +803,8 @@ describe("listThreadItems", () => {
         hide_results: "until_vote",
         anonymous: false,
         closed_at: null,
-        voters_count: 6,
-        decided_voters_count: 4,
+        vote_count_eligible: 6,
+        vote_count_cast: 4,
         results_visible: false,
         results_hidden_reason: "until_vote",
         url: "https://www.loomio.com/p/polKEY01/adopt-the-2027-budget",
@@ -817,7 +817,7 @@ describe("listThreadItems", () => {
         { id: 3, name: "abstain", priority: 2 },
       ]);
       expect(poll).not.toHaveProperty("poll_option_names");
-      expect(poll).not.toHaveProperty("stance_counts");
+      expect(poll).not.toHaveProperty("scores_by_option");
       expect(poll).not.toHaveProperty("total_score");
       expect(poll).not.toHaveProperty("results");
       expect(poll).not.toHaveProperty("result_columns");
@@ -855,7 +855,7 @@ describe("listThreadItems", () => {
       expect(r.scope.own_user_known).toBe(true);
       expect(r.polls[0]).toMatchObject({
         results_visible: true,
-        stance_counts: [3, 1, 0],
+        scores_by_option: [3, 1, 0],
         total_score: "4.0",
       });
       expect(r.polls[0]).not.toHaveProperty("results_hidden_reason");
@@ -872,9 +872,9 @@ describe("listThreadItems", () => {
       const byId = new Map(r.polls[0]!.poll_options.map((o) => [String(o.id), o.name]));
       expect(byId.get(Object.keys(voter.option_scores!)[0]!)).toBe("disagree");
       expect(byId.get(Object.keys(own.option_scores!)[0]!)).toBe("agree");
-      // stance_counts[i] is the tally of poll_options[i].
+      // scores_by_option[i] is the tally of poll_options[i].
       expect(r.polls[0]!.poll_options.map((o) => o.name)).toEqual(["agree", "disagree", "abstain"]);
-      expect(r.polls[0]!.stance_counts).toEqual([3, 1, 0]);
+      expect(r.polls[0]!.scores_by_option).toEqual([3, 1, 0]);
       expect(r.scope.note).toMatch(/option_scores is keyed by poll_option ID/);
     });
 
@@ -914,7 +914,7 @@ describe("listThreadItems", () => {
       );
       const { listThreadItems } = await import("../src/tools/threads.js");
       const r = await listThreadItems({ topic_id: 701 });
-      expect(r.polls[0]).toMatchObject({ results_visible: true, stance_counts: [3, 1, 0] });
+      expect(r.polls[0]).toMatchObject({ results_visible: true, scores_by_option: [3, 1, 0] });
       expect(r.stances.find((s) => s.id === 902)).toMatchObject({ option_scores: { "2": 1 } });
     });
 
@@ -934,7 +934,7 @@ describe("listThreadItems", () => {
     it("until_closed, still open: Loomio already withheld the fields; the pair says why", async () => {
       const poll = pollRow({ hide_results: "until_closed", topic_id: 701 });
       delete poll.results;
-      delete poll.stance_counts;
+      delete poll.scores_by_option;
       delete poll.total_score;
       mockFetch(200, pollThreadItemsBody({ polls: [poll] }));
       const { listThreadItems } = await import("../src/tools/threads.js");

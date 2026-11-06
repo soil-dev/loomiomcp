@@ -13,7 +13,9 @@ import {
   CHECK_CONNECTION_PROBE_MAX_AGE_MS,
   checkLoomioHealth,
   getCachedGroupsIndex,
+  getKnownLoomioVersion,
   keyRejectedWarning,
+  knownLoomioVersionAgeMs,
   type LoomioHealth,
 } from "../loomio/health.js";
 import { adminGroupIds, lastGroupsChange, noteAdminScope } from "../loomio/group-watch.js";
@@ -36,6 +38,7 @@ import type { GroupsIndexResponse, LoomioGroup, LoomioMembership } from "../loom
 import { isUpstreamStop } from "../loomio/upstream.js";
 import { TESTED_LOOMIO_VERSION, VERSION } from "../version.js";
 import { encodePathSegment, idOrKeyOrHandle, maybeCollapseNotVisible } from "./_common.js";
+import { userApiPath } from "../loomio/api-dialect.js";
 
 // ── GET /b2/groups — what the index is and is not ──────────────────────────
 //
@@ -258,8 +261,10 @@ export interface ListGroupsResult {
  */
 export const MAX_GROUP_PAGES = 20;
 
-const LIST_SCOPE_NOTE =
-  "Member groups of the connector's user (Loomio's GET /b2/groups = current_user.groups, pending " +
+// A function, not a module constant: the path names the generation the
+// connector is using NOW, which the probe decides after import (F-18-08).
+const listScopeNote = (path: string): string =>
+  `Member groups of the connector's user (Loomio's GET ${path} = current_user.groups, pending ` +
   "invitations included), plus each subgroup's parent for navigation — a parent the user has not " +
   "joined is flagged member:false and may or may not be readable. Publicly visible groups the user " +
   "has not joined are NOT listed here but are readable by id: use get_group, list_discussions or " +
@@ -280,6 +285,7 @@ const LIST_PARTIAL_NOTE =
 export function shapeGroupsIndex(
   body: GroupsIndexResponse,
   walk?: Pick<PagerState, "requests" | "capped">,
+  path: string = userApiPath("/groups"),
 ): ListGroupsResult {
   const groups = Array.isArray(body.groups) ? body.groups : [];
   const parents = Array.isArray(body.parent_groups) ? body.parent_groups : [];
@@ -331,7 +337,7 @@ export function shapeGroupsIndex(
       non_member_parents: nonMemberParents,
       ...(walk ? { upstream_calls: walk.requests } : {}),
       ...(walk?.capped ? { partial: true as const } : {}),
-      note: LIST_SCOPE_NOTE + (walk?.capped ? LIST_PARTIAL_NOTE : ""),
+      note: listScopeNote(path) + (walk?.capped ? LIST_PARTIAL_NOTE : ""),
     },
   };
 }
@@ -349,14 +355,16 @@ export const GROUP_ALLOWLIST_NOTE =
 export async function listGroups(
   _input: z.infer<typeof listGroupsSchema> = {},
 ): Promise<ListGroupsResult> {
-  const { body, state } = await loomioGetAllPages<GroupsIndexResponse>(
-    "/b2/groups",
-    readParams("groups"),
-    { root: "groups", maxPages: MAX_GROUP_PAGES },
-  );
+  // One snapshot of the path for the request AND the note (a probe may
+  // move the generation while the pages are read).
+  const path = userApiPath("/groups");
+  const { body, state } = await loomioGetAllPages<GroupsIndexResponse>(path, readParams("groups"), {
+    root: "groups",
+    maxPages: MAX_GROUP_PAGES,
+  });
   // F-17: the operator's allow-list, applied before shaping so totals and
   // counts describe only the listed groups.
-  const shaped = shapeGroupsIndex(filterGroupsIndex(body), state);
+  const shaped = shapeGroupsIndex(filterGroupsIndex(body), state, path);
   if (hasGroupAllowlist()) shaped.scope.note += ` ${GROUP_ALLOWLIST_NOTE}`;
   return shaped;
 }
@@ -395,7 +403,10 @@ export async function getGroup(input: z.infer<typeof getGroupSchema>): Promise<G
   const segment = encodePathSegment(ref);
   let body: GroupsIndexResponse;
   try {
-    body = await loomioGet<GroupsIndexResponse>(`/b2/groups/${segment}`, readParams("groups"));
+    body = await loomioGet<GroupsIndexResponse>(
+      userApiPath(`/groups/${segment}`),
+      readParams("groups"),
+    );
   } catch (err) {
     // nit 19: in open-DCR mode "hidden" (403) and "no such group" (404)
     // read the same; elsewhere the precise wording below stays.
@@ -414,7 +425,7 @@ export async function getGroup(input: z.infer<typeof getGroupSchema>): Promise<G
   if (!group) {
     throw new LoomioApiError(
       502,
-      `Loomio answered GET /b2/groups/${input.id_or_key_or_handle} without a group record; the ` +
+      `Loomio answered GET ${userApiPath("/groups/")}${input.id_or_key_or_handle} without a group record; the ` +
         "response shape is not the one Loomio 3.8.1 produces.",
     );
   }
@@ -479,7 +490,10 @@ export interface ConnectionGroup {
 export interface CheckConnectionResult {
   connector_version: string;
   tested_loomio_version: string;
+  /** What THIS probe's public version call answered; null when it failed. */
   loomio_version: string | null;
+  /** The last version any probe reported — what the connector's API paths are chosen from; null before the first. */
+  loomio_version_in_use: string | null;
   key_status: LoomioHealth["key_status"];
   checked_at: string;
   readonly: boolean;
@@ -575,10 +589,14 @@ export async function checkConnection(
     } else {
       // The probe proved the key but its body did not parse as JSON —
       // pay for the index ourselves rather than report an empty world.
-      const all = await loomioGetAllPages<GroupsIndexResponse>("/b2/groups", readParams("groups"), {
-        root: "groups",
-        maxPages: MAX_GROUP_PAGES,
-      });
+      const all = await loomioGetAllPages<GroupsIndexResponse>(
+        userApiPath("/groups"),
+        readParams("groups"),
+        {
+          root: "groups",
+          maxPages: MAX_GROUP_PAGES,
+        },
+      );
       index = all.body;
       partial = all.state.capped;
     }
@@ -674,10 +692,19 @@ export async function checkConnection(
           "unexpected results with suspicion and re-verify.",
       );
     }
+  } else if (getKnownLoomioVersion()) {
+    notes.push(
+      "This probe's public GET /v1/boot/version did not answer 200 with a version; the connector " +
+        `keeps using version ${getKnownLoomioVersion()} (reported ${Math.round(knownLoomioVersionAgeMs() / 60_000)} min ago, ` +
+        "loomio_version_in_use) for its API paths. update_discussion's thread settings refuse once " +
+        "that version is older than a minute and cannot be refreshed. Check the version route if " +
+        "this persists; it does not affect the key verdict.",
+    );
   } else {
     notes.push(
       "The instance's Loomio version is unknown: the public GET /v1/boot/version probe did not " +
-        "answer 200 with a version. This does not affect the key verdict.",
+        "answer 200 with a version. This does not affect the key verdict, but update_discussion's " +
+        "polls_one_at_a_time / attachments_admin_only refuse until a version is known.",
     );
   }
   const readonly = isReadOnly();
@@ -714,6 +741,7 @@ export async function checkConnection(
     connector_version: VERSION,
     tested_loomio_version: TESTED_LOOMIO_VERSION,
     loomio_version: health.loomio_version,
+    loomio_version_in_use: getKnownLoomioVersion() ?? null,
     key_status: health.key_status,
     checked_at: health.checked_at,
     readonly,
@@ -741,11 +769,15 @@ async function completeGroupsIndex(
   const total = typeof probe.meta?.total === "number" ? probe.meta.total : undefined;
   if (total === undefined || have >= total) return { index: probe, partial: false };
   try {
-    const rest = await loomioGetAllPages<GroupsIndexResponse>("/b2/groups", readParams("groups"), {
-      root: "groups",
-      offset: have,
-      maxPages: MAX_GROUP_PAGES,
-    });
+    const rest = await loomioGetAllPages<GroupsIndexResponse>(
+      userApiPath("/groups"),
+      readParams("groups"),
+      {
+        root: "groups",
+        offset: have,
+        maxPages: MAX_GROUP_PAGES,
+      },
+    );
     return { index: mergePageBodies([probe, rest.body], "groups"), partial: rest.state.capped };
   } catch (err) {
     // F-01: budget / cancellation / a full upstream queue end the call; only

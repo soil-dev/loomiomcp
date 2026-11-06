@@ -58,6 +58,8 @@ import {
   titleText,
 } from "./_common.js";
 import { resolveThread, type ThreadRef } from "./threads.js";
+import { type ApiDialect, apiDialect, userApiPath } from "../loomio/api-dialect.js";
+import { legacyPollParams } from "../loomio/poll-fields.js";
 
 // ── Shaping a poll record ───────────────────────────────────────────────────
 //
@@ -67,7 +69,7 @@ import { resolveThread, type ThreadRef } from "./threads.js";
 //      side-loaded `topics[]` row (joined by `poll.topic_id`), so the
 //      reads keep that root and `joinTopics` folds the counters on.
 //   2. Result gating (src/loomio/visibility.ts). PollSerializer emits
-//      `results` / `stance_counts` / `total_score` / `stv_results`
+//      `results` / `scores_by_option` / `total_score` / `stv_results`
 //      whenever `results_available?` — i.e. for every open `until_vote`
 //      poll too, although Loomio's own client hides them from a member
 //      who has not voted. The connector applies Loomio's full predicate
@@ -93,22 +95,22 @@ import { resolveThread, type ThreadRef } from "./threads.js";
 //
 // Two shapes. The SHOW (get_poll, the write echoes) returns the record
 // whole minus that bloat. A LIST row is slimmer, because `results[]` —
-// per option: `voter_ids` (up to 50), a `voter_scores` map, colour,
+// per option: `voter_ids` (up to 50), a `scores_by_voter` map, colour,
 // icon, rank, percentages, plus a synthetic row (id -1) listing the
 // non-voters — was measured at 30–40 % of a visible poll's bytes and,
 // over a 50-row page with ~100 voters, hundreds of KB of user ids a
 // list has no use for. Its per-option tallies are already
-// `stance_counts` (poll.rb `update_counts!`:
+// `scores_by_option` (poll.rb `update_counts!`:
 // `poll_options.map(&:total_score)` in priority order, i.e. aligned
 // with the `poll_options[]` the row carries), so a list row keeps
-// `stance_counts` + `total_score`, drops `results` / `stv_results`, keeps
+// `scores_by_option` + `total_score`, drops `results` / `stv_results`, keeps
 // the type-specific voting knobs only when Loomio set them (they are
 // null for every other type), and drops `poll_option_names` when
 // `poll_options[]` already names them. get_poll has everything.
 //
 // Loomio 3.10–3.13 changed the record (passed through, no arithmetic):
 //   - `results[]` rows gained `unweighted_score` (3.10) and
-//     `test_requirement_key` (3.13); `voter_scores` is `{}` except on
+//     `test_requirement_key` (3.13); `scores_by_voter` is `{}` except on
 //     meeting polls (159a9c7a9, 3.10); the id -1 row is named
 //     `poll_receipts_page.not_voted` from 3.13.0 (c42eff3af),
 //     `poll_common_votes_panel.undecided` in 3.10–3.12.
@@ -116,13 +118,13 @@ import { resolveThread, type ThreadRef } from "./threads.js";
 //     tallies, `total_score` and `results[]` scores are in vote-weight
 //     units, possibly fractional; `total_score` is a decimal STRING
 //     ("3.0") on every poll since 3.10 (the integer 0 when
-//     `stance_counts` is empty, a3736458b). `result_heading_keys` (42f7199e7) says which result
+//     `scores_by_option` is empty, a3736458b). `result_heading_keys` (42f7199e7) says which result
 //     columns are weighted, so it is kept on a weighted poll only, and
 //     the own stance's `weight` likewise. A list row drops
 //     `weighted_voting: false`.
 //   - Quorum: `quorum_reached` (3.13.0, ad60e7728) is `false` on a poll
-//     that has no quorum at all, beside `quorum_count` /
-//     `quorum_votes_required` zeros. When `quorum_pct` is null the poll
+//     that has no quorum at all, beside `quorum_threshold` /
+//     `quorum_shortfall` zeros. When `quorum_pct` is null the poll
 //     has no quorum and the three are dropped rather than read as "not
 //     reached".
 //   - `voter_has_access` (3.11.0, 8eb9236a4) is the web client's
@@ -178,21 +180,21 @@ export const POLL_FIELDS = [
   "stance_reason_required",
   "reason_prompt",
   "poll_option_names",
-  "cast_stances_pct",
-  "decided_voters_count",
-  "undecided_voters_count",
-  "voters_count",
+  "participation_pct",
+  "vote_count_cast",
+  "vote_count_uncast",
+  "vote_count_eligible",
   "versions_count",
   "results",
-  "stance_counts",
+  "scores_by_option",
   "total_score",
   "stv_results",
   "result_heading_keys",
-  "dots_per_person",
-  "max_score",
-  "min_score",
-  "minimum_stance_choices",
-  "maximum_stance_choices",
+  "points_per_voter",
+  "score_max",
+  "score_min",
+  "choice_count_min",
+  "choice_count_max",
   "meeting_duration",
   "stv_seats",
   "stv_method",
@@ -201,8 +203,8 @@ export const POLL_FIELDS = [
   "poll_template_key",
   "quorum_pct",
   "quorum_reached",
-  "quorum_count",
-  "quorum_votes_required",
+  "quorum_threshold",
+  "quorum_shortfall",
   "weighted_voting",
   "current_outcome_id",
   "my_stance_id",
@@ -214,9 +216,9 @@ export const POLL_FIELDS = [
 ] as const;
 
 /** Meaningless when `quorum_pct` is null (the poll has no quorum); see the module note. */
-const QUORUM_FIELDS = ["quorum_count", "quorum_votes_required", "quorum_reached"] as const;
+const QUORUM_FIELDS = ["quorum_threshold", "quorum_shortfall", "quorum_reached"] as const;
 
-/** Result breakdowns a LIST row leaves to get_poll (`stance_counts` / `total_score` stay). */
+/** Result breakdowns a LIST row leaves to get_poll (`scores_by_option` / `total_score` stay). */
 const LIST_POLL_DROP = ["results", "stv_results"] as const;
 
 /**
@@ -239,11 +241,11 @@ const LIST_POLL_NULLABLE_KNOBS = [
   "poll_template_key",
   "quorum_pct",
   "reason_prompt",
-  "min_score",
-  "max_score",
-  "dots_per_person",
-  "minimum_stance_choices",
-  "maximum_stance_choices",
+  "score_min",
+  "score_max",
+  "points_per_voter",
+  "choice_count_min",
+  "choice_count_max",
 ] as const;
 
 const POLL_OPTION_FIELDS = ["id", "name", "priority", "meaning", "prompt"] as const;
@@ -379,7 +381,7 @@ export async function getPoll(input: z.infer<typeof getPollSchema>): Promise<Get
   let body: PollsResponse;
   try {
     body = await loomioGet<PollsResponse>(
-      `/b2/polls/${encodePathSegment(input.id_or_key)}`,
+      userApiPath(`/polls/${encodePathSegment(input.id_or_key)}`),
       readParams("show"),
     );
   } catch (err) {
@@ -390,7 +392,7 @@ export async function getPoll(input: z.infer<typeof getPollSchema>): Promise<Get
   if (!record) {
     throw new LoomioApiError(
       502,
-      `Loomio answered GET /b2/polls/${input.id_or_key} without a poll record; the response shape is ` +
+      `Loomio answered GET ${userApiPath("/polls/")}${input.id_or_key} without a poll record; the response shape is ` +
         "not the one Loomio 3.8.1 produces.",
     );
   }
@@ -450,7 +452,7 @@ export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise
   const status = input.status ?? "active";
   const max = input.description_max_chars ?? DEFAULT_DESCRIPTION_MAX_CHARS;
   const stripHtml = input.strip_html ?? true;
-  const body = await loomioGet<PollsResponse>("/b2/polls", {
+  const body = await loomioGet<PollsResponse>(userApiPath("/polls"), {
     group_id: input.group_id,
     status,
     ...(input.limit !== undefined ? { limit: input.limit } : {}),
@@ -548,7 +550,8 @@ export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise
 // body, `topic_id` attachment and the option-loss symptom of a flat
 // body were verified live against a 3.8.1 instance.
 // Authorization (`:create`, app/models/ability/poll.rb): group enabled,
-// thread not locked, `allow_concurrent_polls` or no active poll in the
+// thread not locked, not `polls_one_at_a_time` (`allow_concurrent_polls`
+// before 3.14) or no active poll in the
 // thread, and the user a group admin, a member where
 // `members_can_raise_motions`, or a thread admin/member so allowed →
 // 403 "Not authorized to create Poll." otherwise.
@@ -556,7 +559,7 @@ export async function listPolls(input: z.infer<typeof listPollsSchema>): Promise
 const HideResultsEnum = z.enum(["off", "until_vote", "until_closed"]);
 
 /** `Poll.notify_on_closing_soon` enum (app/models/poll.rb): the four values Loomio accepts. */
-const NotifyOnClosingSoonEnum = z.enum(["nobody", "author", "undecided_voters", "voters"]);
+const NotifyOnClosingSoonEnum = z.enum(["nobody", "author", "voters_uncast", "voters"]);
 
 /** `Poll.stance_reason_required` enum. */
 const StanceReasonRequiredEnum = z.enum([
@@ -608,21 +611,21 @@ const pollSettingFields = {
     .boolean()
     .optional()
     .describe("Offer 'none of the above' (poll, ranked_choice)."),
-  min_score: z.number().int().optional().describe("score: min per option (default 0)."),
-  max_score: z.number().int().optional().describe("score: max per option (default 5); meeting: 2."),
-  dots_per_person: z
+  score_min: z.number().int().optional().describe("score: min per option (default 0)."),
+  score_max: z.number().int().optional().describe("score: max per option (default 5); meeting: 2."),
+  points_per_voter: z
     .number()
     .int()
     .positive()
     .optional()
     .describe("dot_vote: points per voter (default 8)."),
-  minimum_stance_choices: z
+  choice_count_min: z
     .number()
     .int()
     .min(0)
     .optional()
     .describe("Min options per voter (ranked_choice: ranks, default 3)."),
-  maximum_stance_choices: z
+  choice_count_max: z
     .number()
     .int()
     .positive()
@@ -666,6 +669,19 @@ const RECIPIENT_KEYS = [
   "recipient_message",
   "notify_recipients",
 ] as const;
+
+/**
+ * The settings under the names THIS instance permits. The tool schema
+ * speaks Loomio 3.14+'s names (`score_min`, `points_per_voter`,
+ * `notify_on_closing_soon: 'voters_uncast'`, …); a pre-3.14 server
+ * knows only the old ones (`PermittedParams`, `:raise` → 400), so on the
+ * legacy dialect they are translated back (src/loomio/poll-fields.ts).
+ * Before the version is known the legacy path is used too, and there
+ * Loomio 3.14+'s `/b2` filter accepts the old names as well.
+ */
+function pollParamsForWire<T extends Record<string, unknown>>(attrs: T, dialect: ApiDialect): T {
+  return dialect === "legacy" ? legacyPollParams(attrs) : attrs;
+}
 
 function splitRecipients<T extends Record<string, unknown>>(
   attrs: T,
@@ -909,9 +925,12 @@ export async function createPoll(input: CreatePollInput): Promise<CreatePollResu
     attachTopicId !== undefined
       ? { ...rest, topic_id: attachTopicId, ...recipients }
       : { ...rest, group_id, ...recipients };
+  // One dialect snapshot for the path AND the body (security review F-18-04).
+  const dialect = apiDialect();
+  const postPath = userApiPath("/polls", dialect);
   const resp = await loomioPost<PollsResponse>(
-    "/b2/polls",
-    nestedBody("poll", pollAttrs, recipients),
+    postPath,
+    nestedBody("poll", pollParamsForWire(pollAttrs, dialect), recipients),
   );
 
   const created = resp.polls?.[0];
@@ -941,7 +960,7 @@ export async function createPoll(input: CreatePollInput): Promise<CreatePollResu
       throw misdirected(created, "with NO options although options were sent");
     }
   }
-  const shaped = shapePollWrite(resp, "POST /b2/polls");
+  const shaped = shapePollWrite(resp, `POST ${postPath}`);
   // A draft is a silent outcome Loomio answers 200 to (see the module
   // note): say so on the result instead of leaving `opened_at: null` for
   // the caller to notice.
@@ -956,10 +975,14 @@ export async function createPoll(input: CreatePollInput): Promise<CreatePollResu
 // resource_params, actor:)`. Body NESTED `{"poll":{…}}`; the service
 // reads the recipient keys from THIS hash (`UserInviter.authorize!(
 // user_ids: params[:recipient_user_ids] …)`), so on update they are
-// nested only. `poll_type` is dropped by the service
-// (`params.except(:poll_type, …)`) and `group_id` / `tags` are pulled
-// into topic params and then discarded (`TOPIC_ATTRS_UPDATE`), so none
-// of them is offered.
+// nested only. `group_id` / `tags` are pulled into topic params and then
+// discarded (`TOPIC_ATTRS_UPDATE`), so neither is offered. `poll_type`
+// was dropped by the service through 3.13 (`params.except(:poll_type,
+// …)`); since 3.14.0 (162f52820) an authorized editor may change it —
+// with `anonymous` and `hide_results` — until voting opens
+// (`Poll#configuration_changes_are_allowed`). Not offered either:
+// changing a poll's type after the fact is not what an "edit" tool is
+// for, and on a pre-3.14 server it would be silently ignored.
 //
 // `options` is DANGEROUS on the wire and the connector neutralises it.
 // `Poll#options=` is an alias of `poll_option_names=` (poll.rb), which
@@ -1068,7 +1091,7 @@ export async function updatePoll(
   // Refuse the write before the option lookup spends a call (see create).
   if (isReadOnly()) throw new LoomioReadOnlyError("PATCH");
   const { id_or_key, options, ...attrs } = input;
-  const path = `/b2/polls/${encodePathSegment(id_or_key)}`;
+  const path = userApiPath(`/polls/${encodePathSegment(id_or_key)}`);
 
   // `options` REPLACES on the wire (see the module note): read the stored
   // names and send the union so the documented ADD semantics hold.
@@ -1089,9 +1112,17 @@ export async function updatePoll(
     await readPollForWrite(id_or_key);
   }
 
+  // The pre-read above awaited a real request, during which a probe may
+  // have changed the cached version: take ONE dialect snapshot now and
+  // build both the path and the body from it (security review F-18-04).
+  const dialect = apiDialect();
+  const patchPath = userApiPath(`/polls/${encodePathSegment(id_or_key)}`, dialect);
   const body = optionsSent ? { ...attrs, options: optionsSent } : attrs;
-  const resp = await loomioPatch<PollsResponse>(path, nestedBody("poll", body));
-  const shaped = shapePollWrite(resp, `PATCH ${path}`);
+  const resp = await loomioPatch<PollsResponse>(
+    patchPath,
+    nestedBody("poll", pollParamsForWire(body, dialect)),
+  );
+  const shaped = shapePollWrite(resp, `PATCH ${patchPath}`);
   return optionsSent ? { ...shaped, options_sent: optionsSent } : shaped;
 }
 
@@ -1126,7 +1157,7 @@ async function readPollForWrite(ref: IdOrKey): Promise<PollsResponse> {
   let body: PollsResponse;
   try {
     body = await loomioGet<PollsResponse>(
-      `/b2/polls/${encodePathSegment(ref)}`,
+      userApiPath(`/polls/${encodePathSegment(ref)}`),
       readParams("compact"),
     );
   } catch (err) {
@@ -1141,7 +1172,7 @@ export async function deletePoll(
   input: z.infer<typeof deletePollSchema>,
 ): Promise<DeletePollResult> {
   if (hasGroupAllowlist()) await readPollForWrite(input.id_or_key);
-  const path = `/b2/polls/${encodePathSegment(input.id_or_key)}`;
+  const path = userApiPath(`/polls/${encodePathSegment(input.id_or_key)}`);
   const resp = await loomioDelete<PollsResponse>(path);
   const shaped = shapePollWrite(resp, `DELETE ${path}`);
   return {

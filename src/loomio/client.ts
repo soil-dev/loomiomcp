@@ -1,6 +1,8 @@
 import { fetch, type Response } from "undici";
 import { readBool } from "../env.js";
 import { getRequestContext, logEvent, redactPath } from "../log.js";
+import { isServerApiPath } from "./api-dialect.js";
+import { modernizePollsIn } from "./poll-fields.js";
 import { VERSION } from "../version.js";
 import { getFreshKeyStatus, type LoomioHealth } from "./health-cache.js";
 import { readSecret } from "./secrets.js";
@@ -642,7 +644,7 @@ const GENERIC_UNAUTHENTICATED = /^you are not authorized to access this page\.?$
  * #create, whose refusals come from the service's `authorize!` with a
  * message, so the generic body on a write is the key and nothing else.
  */
-const VISIBILITY_GATED_LIST = /\/b2\/(discussions|polls)$/;
+const VISIBILITY_GATED_LIST = /\/(?:user0|b2)\/(discussions|polls)$/;
 
 function isVisibilityGatedList(path: string | undefined, method: string | undefined): boolean {
   return (
@@ -655,7 +657,9 @@ function isVisibilityGatedList(path: string | undefined, method: string | undefi
 /** `POST /b2/polls` — the one write where a bare `CanCan::AccessDenied` is reachable with a valid key. */
 function isPollCreate(path: string | undefined, method: string | undefined): boolean {
   return (
-    path !== undefined && (method ?? "GET").toUpperCase() === "POST" && /\/b2\/polls$/.test(path)
+    path !== undefined &&
+    (method ?? "GET").toUpperCase() === "POST" &&
+    /\/(?:user0|b2)\/polls$/.test(path)
   );
 }
 
@@ -664,7 +668,7 @@ function isTaggableCreate(path: string | undefined, method: string | undefined):
   return (
     path !== undefined &&
     (method ?? "GET").toUpperCase() === "POST" &&
-    /\/b2\/(discussions|polls)$/.test(path)
+    /\/(?:user0|b2)\/(discussions|polls)$/.test(path)
   );
 }
 
@@ -681,7 +685,8 @@ function isTaggableCreate(path: string | undefined, method: string | undefined):
  * these paths has exactly one meaning: the key. Matched on the redacted
  * tail (`/b2/threads/:id/items`, `/api/b2/search`, …).
  */
-const VISIBILITY_FILTERED = /\/b2\/(threads(\/:id(\/items|\/markdown)?)?|search|reports|groups)$/;
+const VISIBILITY_FILTERED =
+  /\/(?:user0|b2)\/(threads(\/:id(\/items|\/markdown)?)?|search|reports|groups)$/;
 
 function isVisibilityFiltered(path: string | undefined): boolean {
   return path !== undefined && VISIBILITY_FILTERED.test(path);
@@ -696,19 +701,21 @@ function isVisibilityFiltered(path: string | undefined): boolean {
  * key produces on this path, and it means "hidden group", not "bad id"
  * (an unknown id is 404).
  */
-const GROUP_SHOW = /\/b2\/groups\/:id$/;
+const GROUP_SHOW = /\/(?:user0|b2)\/groups\/:id$/;
 
 function isGroupShow(path: string | undefined): boolean {
   return path !== undefined && GROUP_SHOW.test(path);
 }
 
 /**
- * Loomio's b3 Server API. Authenticates with the server-instance secret
- * (`LOOMIO_B3_API_KEY` ↔ `ENV['B3_API_KEY']`), never with the per-user
- * key, so nothing the health probe learned about the b2 key applies.
+ * Loomio's Server API (`/server0` since Loomio 3.14, `/b3` before — the
+ * connector picks by version, src/loomio/api-dialect.ts). Authenticates
+ * with the server-instance secret (`LOOMIO_B3_API_KEY` ↔ Loomio's
+ * `SERVER_API_KEY`, `B3_API_KEY` before 3.14), never with the per-user
+ * key, so nothing the health probe learned about the user key applies.
  */
 function isB3Path(path: string | undefined): boolean {
-  return path !== undefined && /\/b3\//.test(path);
+  return isServerApiPath(path);
 }
 
 /** Loomio's v1 (browser) API resolves its user from the session cookie only; the key is not evaluated. */
@@ -719,7 +726,7 @@ function isV1Path(path: string | undefined): boolean {
 const KEY_REMEDIATION =
   "A rejected key is almost always a ROTATED key: Loomio regenerates a user's API key whenever " +
   "that user's password changes (and Loomio 3.3.1 rotated every key once, on upgrade). " +
-  "To check: GET /health on this connector (HTTP transport), or GET /api/b2/groups on the Loomio " +
+  "To check: GET /health on this connector (HTTP transport), or GET /api/user0/groups (/api/b2/groups before Loomio 3.14) on the Loomio " +
   "instance with the key as `Authorization: Bearer` — 200 means the key is valid. To fix: sign in " +
   "to Loomio as the connector's user, copy the current key from the API access page " +
   "(/profile/api_access), and update LOOMIO_API_KEY / the deployment secret. No API can read " +
@@ -775,11 +782,12 @@ export function classifyForbidden(
     return {
       kind: "unauthenticated",
       message:
-        `Loomio returned 403 for ${where}: "${errorText}". Loomio's b3 Server API rejected the bearer ` +
-        "secret: LOOMIO_B3_API_KEY does not match ENV['B3_API_KEY'] on the Loomio server, or that " +
-        "variable is unset or 16 characters or shorter there (Loomio then refuses every b3 call). " +
-        "This is independent of the per-user LOOMIO_API_KEY, of password rotation and of the /health " +
-        "verdict — those concern the b2 API only — and there is no per-user page for the b3 secret. " +
+        `Loomio returned 403 for ${where}: "${errorText}". Loomio's Server API rejected the bearer ` +
+        "secret: LOOMIO_B3_API_KEY does not match SERVER_API_KEY (B3_API_KEY before Loomio 3.14) on the " +
+        "Loomio server, or that variable is unset or 16 characters or shorter there (Loomio then refuses " +
+        "every Server API call). This is independent of the per-user LOOMIO_API_KEY, of password " +
+        "rotation and of the /health verdict — those concern the user API only — and there is no " +
+        "per-user page for the server secret. " +
         "Compare LOOMIO_B3_API_KEY with the value the Loomio instance operator configured and fix the " +
         "deployment secret.",
     };
@@ -799,7 +807,7 @@ export function classifyForbidden(
         kind: "unauthenticated",
         message:
           `Loomio rejected the connector's API key (HTTP 403 for ${where}, and the connector's own ` +
-          `key-health probe against GET /api/b2/groups is failing the same way). ${KEY_REMEDIATION}`,
+          `key-health probe against the groups index is failing the same way). ${KEY_REMEDIATION}`,
       };
     }
     if (isVisibilityGatedList(opts.path, opts.method)) {
@@ -858,7 +866,7 @@ export function classifyForbidden(
         kind: "unauthenticated",
         message:
           `${quoted} ${onlyCause} The connector's key passed a key-health probe within the last ` +
-          "minute, so it was most likely rotated in between — re-check /health (or GET /api/b2/groups " +
+          "minute, so it was most likely rotated in between — re-check /health (or the groups index " +
           `with the key). ${KEY_REMEDIATION}`,
       };
     }
@@ -926,7 +934,7 @@ export function classifyForbidden(
   if (typeof error === "number" || json.action === "upgrade") {
     const detail = errorText ? `: "${clip(errorText)}"` : "";
     const b3Membership =
-      opts.path !== undefined && /\/b3\/memberships(\/:id)?$/.test(opts.path)
+      opts.path !== undefined && /\/(?:server0|b3)\/memberships(\/:id)?$/.test(opts.path)
         ? " On a b3 membership write this means the target group's subscription is inactive or " +
           "expired, or the addition would exceed its member cap; nothing was changed (the b3 secret " +
           "was accepted)."
@@ -1101,6 +1109,15 @@ async function throwForStatus(start: RequestStart): Promise<void> {
  *     HTML 200 for every path) all land here. The message says what was
  *     received (clipped) instead of a bare parse error.
  */
+/** True for a request URL on Loomio's `/b2` compatibility path, the one generation that answers with the pre-3.14 poll vocabulary. */
+function isLegacyUserApiUrl(url: string): boolean {
+  try {
+    return /\/b2\//.test(new URL(url).pathname);
+  } catch {
+    return true;
+  }
+}
+
 async function handleResponse<T>(start: RequestStart): Promise<T> {
   const { res, url } = start;
   await throwForStatus(start);
@@ -1113,8 +1130,9 @@ async function handleResponse<T>(start: RequestStart): Promise<T> {
     throw transportError(err);
   }
   if (text.trim() === "") return {} as T;
+  let parsed: unknown;
   try {
-    return JSON.parse(text) as T;
+    parsed = JSON.parse(text);
   } catch {
     throw new LoomioApiError(
       res.status,
@@ -1123,6 +1141,13 @@ async function handleResponse<T>(start: RequestStart): Promise<T> {
         "points at the API root (…/api) and that no proxy or captive portal is answering in its place.",
     );
   }
+  // One vocabulary for every caller: a `polls[]` root answered on the
+  // legacy `/b2` path carries Loomio's pre-3.14 field names (see
+  // src/loomio/poll-fields.ts); fold them into the current ones here so
+  // no tool ever sees two spellings of the same field. Only `/b2`
+  // answers can carry them (the `/user0` and `/server0` paths and v1
+  // never do), so the walk is skipped everywhere else (F-18-09).
+  return (isLegacyUserApiUrl(url) ? modernizePollsIn(parsed) : parsed) as T;
 }
 
 /**

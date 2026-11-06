@@ -16,14 +16,21 @@
  * `major.minor` to this and logs a one-time `loomio.version_drift`
  * warning when they differ — a prompt to re-verify, not an error.
  *
- * 3.13.1 (since 0.0.16): the b2 routes, serializers and the paged
- * indexes were checked against the source, the upstream tests and
- * sanitized live captures from a 3.13.1 instance. The five b3
- * provisioning tools (src/tools/server-admin.ts) were verified ONLY
- * through Loomio's source, integration tests and server-API docs — no
- * live b3 capture exists, because the reference deployment holds no b3
- * secret.
+ * 3.15.0 (since 0.0.18): Loomio versioned its APIs in 3.14.0 (`/user0`
+ * and `/server0` beside the `/b2` / `/b3` compatibility paths, which
+ * "will be removed in a later release") and renamed the poll
+ * participation / scoring fields and the `polls_one_at_a_time` thread
+ * setting; the connector follows the instance's version
+ * (src/loomio/api-dialect.ts, src/loomio/poll-fields.ts). The user-API
+ * routes, serializers and permitted params were checked against Loomio's
+ * source at the commit the reference instance ran (5cde393b9, "3.15.0"
+ * on master — Loomio had tagged v3.14.1 but not v3.15.0 at the time)
+ * and live against that instance in a sandbox group (reads, writes, the
+ * Markdown guard). The server-API provisioning tools
+ * (src/tools/server-admin.ts) remain verified through Loomio's source,
+ * integration tests and server-API docs only — the reference deployment
+ * holds no server secret.
  */
-export const VERSION = "0.0.17";
+export const VERSION = "0.0.18";
 
-export const TESTED_LOOMIO_VERSION = "3.13.1";
+export const TESTED_LOOMIO_VERSION = "3.15.0";
