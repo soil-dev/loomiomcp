@@ -263,7 +263,7 @@ describe("classifyForbidden", () => {
         expect(c.kind).toBe("unauthenticated");
         expect(c.message).toContain(path);
         expect(c.message).toMatch(/LOOMIO_B3_API_KEY/);
-        expect(c.message).toMatch(/ENV\['B3_API_KEY'\]/);
+        expect(c.message).toMatch(/SERVER_API_KEY \(B3_API_KEY before Loomio 3\.14\)/);
         expect(c.message).toMatch(/16 characters/);
         // None of the per-user-key remediation, and no health colouring.
         expect(c.message).not.toContain("/profile/api_access");

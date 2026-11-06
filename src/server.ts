@@ -245,7 +245,7 @@ export function createLoomioMcpServer(): McpServer {
   registerTool(
     server,
     "list_polls",
-    "One group's polls, newest first: 1 call. `status` defaults to 'active' ('closed', 'all'); `description_max_chars` caps `details`; `strip_html` (default true). Slim rows with `poll_options[]` and `stance_counts` when visible (trust `results_visible`). For member activity use get_participation_report, not this plus list_memberships.",
+    "One group's polls, newest first: 1 call. `status` defaults to 'active' ('closed', 'all'); `description_max_chars` caps `details`; `strip_html` (default true). Slim rows with `poll_options[]` and `scores_by_option` when visible (trust `results_visible`). For member activity use get_participation_report, not this plus list_memberships.",
     listPollsSchema,
     listPolls,
   );

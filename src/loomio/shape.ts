@@ -82,8 +82,13 @@ export function indexById<T extends { id: number }>(
  * or poll. Deliberately NOT the whole row: the `reader_*` fields
  * describe the API user's own reading state (volume, last read, read
  * ranges) and mean nothing to a caller; `ranges`, `max_depth`,
- * `position`-style internals serve Loomio's incremental loading; the
- * `allow_*` flags are group policy the group record already states.
+ * `position`-style internals serve Loomio's incremental loading. The
+ * two thread settings `update_discussion` can SET — `polls_one_at_a_time`
+ * and `attachments_admin_only` (Loomio 3.14+) — are relayed so a write
+ * can be read back (security review F-18-07); a pre-3.14 row spells the
+ * first `allow_concurrent_polls` with the opposite meaning, and the
+ * compatibility path never translates thread settings, so
+ * `topicJoinFields` inverts it into the current name.
  *
  * `members_count` and `closed_polls_count` arrive from Loomio ≤ 3.10
  * only (TopicSerializer dropped them in 3.11.0, 79280ee7a); they stay
@@ -103,13 +108,23 @@ export const TOPIC_JOIN_FIELDS = [
   "seen_by_count",
   "active_polls_count",
   "closed_polls_count",
+  "polls_one_at_a_time",
+  "attachments_admin_only",
 ] as const;
 
 export type TopicJoin = Pick<LoomioTopic, (typeof TOPIC_JOIN_FIELDS)[number]>;
 
-/** The joinable subset of one topic row (only the fields Loomio actually sent). */
+/**
+ * The joinable subset of one topic row (only the fields Loomio actually
+ * sent), with a pre-3.14 `allow_concurrent_polls` folded into
+ * `polls_one_at_a_time` (inverted) so both dialects read the same.
+ */
 export function topicJoinFields(topic: LoomioTopic): TopicJoin {
-  return pick(topic, TOPIC_JOIN_FIELDS);
+  const join = pick(topic, TOPIC_JOIN_FIELDS);
+  if (join.polls_one_at_a_time === undefined && typeof topic.allow_concurrent_polls === "boolean") {
+    join.polls_one_at_a_time = !topic.allow_concurrent_polls;
+  }
+  return join;
 }
 
 /**

@@ -243,10 +243,10 @@ Loomio still accept the connector's API key?
 ```json
 {
   "status": "ok",
-  "connector_version": "0.0.17",
+  "connector_version": "0.0.18",
   "key_status": "valid",
-  "loomio_version": "3.13.1",
-  "checked_at": "2026-10-24T10:00:00.000Z"
+  "loomio_version": "3.15.0",
+  "checked_at": "2026-11-06T10:00:00.000Z"
 }
 ```
 
@@ -258,7 +258,9 @@ Loomio still accept the connector's API key?
   of "HTTP 200 and body contains `"key_status":"valid"`" is the whole
   alert.
 - `Cache-Control: no-store` — a cached 200 would defeat the point.
-- The probe behind it (`GET /api/b2/groups` with the key, plus the
+- The probe behind it (`GET /api/user0/groups` with the key —
+  `/api/b2/groups` before Loomio 3.14, and for a process's first probe
+  before the version is known —, plus the
   public `GET /api/v1/boot/version`) is **cached for 60 s** and shared
   between concurrent callers, so a flood of `/health` hits costs Loomio
   at most one request pair per minute. The endpoint is also under the
@@ -347,7 +349,8 @@ warning, and `check_connection` reports it to the AI caller with the
 remediation in `notes`.
 
 **Check.** `GET /health` on the connector, or directly
-`GET https://<loomio>/api/b2/groups` with
+`GET https://<loomio>/api/user0/groups` (`/api/b2/groups` before Loomio
+3.14) with
 `Authorization: Bearer <key>` — 200 means the key is valid (even for a
 user with no groups), 403 means it is not.
 
@@ -355,7 +358,7 @@ user with no groups), 403 means it is not.
 
 1. Sign in to Loomio **as the connector's user** and open the **API
    access** page (`/profile/api_access`). It shows the current key. No
-   API can read another user's key — the b3 Server API's user payload
+   API can read another user's key — the Server API's user payload
    does not include it, and the User API only ever authenticates with
    the caller's own — so this step needs that user's login (or an
    instance admin's "sign in as" if the instance offers it).
@@ -388,7 +391,8 @@ look at what the user authored recently (`search_content` with
 deployment authors nothing, so anything there is foreign. **With
 `LOOMIO_MCP_GROUP_IDS` set that search hides items in unlisted groups
 and direct threads** — exactly where a leaked key can post unseen — so
-ask Loomio directly instead: `GET /api/b2/search?author_id=<id>` with
+ask Loomio directly instead: `GET /api/user0/search?author_id=<id>`
+(`/api/b2/…` before Loomio 3.14) with
 `Authorization: Bearer` read from a 0600 file (`curl -H @header-file`),
 or run a local connector without the allow-list. Never type
 the key into a command line (`VAR=key ./script`, `curl -H "…: Bearer

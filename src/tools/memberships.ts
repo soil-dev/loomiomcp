@@ -6,6 +6,7 @@ import { cachedOwnUserId } from "../loomio/health.js";
 import { pick, type SlimUser, slimUsers } from "../loomio/shape.js";
 import type { LoomioMembership, MembershipsResponse } from "../loomio/types.js";
 import { emailAddress, positiveId } from "./_common.js";
+import { userApiPath } from "../loomio/api-dialect.js";
 
 // ── list_memberships ────────────────────────────────────────────────────────
 //
@@ -174,7 +175,7 @@ export async function listMemberships(
   assertGroupAllowed(input.group_id);
   let body: MembershipsResponse;
   try {
-    body = await loomioGet<MembershipsResponse>("/b2/memberships", {
+    body = await loomioGet<MembershipsResponse>(userApiPath("/memberships"), {
       group_id: input.group_id,
       ...(input.limit !== undefined ? { limit: input.limit } : {}),
       ...(input.offset !== undefined ? { offset: input.offset } : {}),
@@ -271,5 +272,5 @@ export async function manageMemberships(input: z.infer<typeof manageMembershipsS
   const body: Record<string, unknown> = { group_id: input.group_id, emails: input.emails };
   // Integer 1, or nothing — never the JSON boolean. See WIRE FORMAT above.
   if (input.remove_absent) body["remove_absent"] = 1;
-  return loomioPost<ManageMembershipsResponse>("/b2/memberships", body);
+  return loomioPost<ManageMembershipsResponse>(userApiPath("/memberships"), body);
 }

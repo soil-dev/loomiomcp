@@ -96,7 +96,7 @@ describe("getPoll", () => {
       tags: ["budget"],
       // gating (total_score: Loomio ≥ 3.10 sends a decimal string)
       results_visible: true,
-      stance_counts: [3, 1, 0],
+      scores_by_option: [3, 1, 0],
       total_score: "4.0",
       url: "https://www.loomio.com/p/polKEY01/adopt-the-2027-budget",
     });
@@ -158,8 +158,8 @@ describe("getPoll", () => {
     expect(r.poll.results_hidden_reason).toBe("until_closed");
     for (const f of HIDDEN_RESULT_FIELDS) expect(r.poll).not.toHaveProperty(f);
     // Participation counts are not results and stay.
-    expect(r.poll.voters_count).toBe(6);
-    expect(r.poll.undecided_voters_count).toBe(2);
+    expect(r.poll.vote_count_eligible).toBe(6);
+    expect(r.poll.vote_count_uncast).toBe(2);
     expect(r.poll.poll_option_names).toEqual(["agree", "disagree", "abstain"]);
   });
 
@@ -182,7 +182,7 @@ describe("getPoll", () => {
     const { getPoll } = await import("../src/tools/polls.js");
     const r = await getPoll({ id_or_key: 301 });
     expect(r.poll.results_visible).toBe(true);
-    expect(r.poll.stance_counts).toEqual([3, 1, 0]);
+    expect(r.poll.scores_by_option).toEqual([3, 1, 0]);
     expect(r.poll.my_stance).toEqual({
       id: 901,
       cast_at: "2026-09-05T10:00:00Z",
@@ -335,14 +335,14 @@ describe("listPolls", () => {
     expect(r).not.toHaveProperty("poll_options");
   });
 
-  it("a LIST row is slim: no results[] / stv_results even when visible (stance_counts + total_score stay), no poll_option_names beside poll_options[], no null type knobs", async () => {
+  it("a LIST row is slim: no results[] / stv_results even when visible (scores_by_option + total_score stay), no poll_option_names beside poll_options[], no null type knobs", async () => {
     mockFetch(200, pollsListBody({ polls: [pollRow({ stv_results: { rounds: [] } })] }));
     const { listPolls } = await import("../src/tools/polls.js");
     const r = await listPolls({ group_id: 7 });
     const row = r.polls[0]!;
     expect(row.results_visible).toBe(true);
     // The per-option tallies survive, aligned with poll_options[] order.
-    expect(row.stance_counts).toEqual([3, 1, 0]);
+    expect(row.scores_by_option).toEqual([3, 1, 0]);
     expect(row.total_score).toBe("4.0");
     expect(row.poll_options.map((o) => o.name)).toEqual(["agree", "disagree", "abstain"]);
     // The voter-id breakdown does not: that is get_poll's.
@@ -366,7 +366,7 @@ describe("listPolls", () => {
     ]) {
       expect(row, k).not.toHaveProperty(k);
     }
-    expect(row.max_score).toBe(1);
+    expect(row.score_max).toBe(1);
     expect(row.opened_at).toBe("2026-09-01T12:00:00Z");
     // Identity, schedule, participation and the gate flags are all there.
     expect(row).toMatchObject({
@@ -374,9 +374,9 @@ describe("listPolls", () => {
       key: "polKEY01",
       poll_type: "proposal",
       hide_results: "off",
-      voters_count: 6,
-      decided_voters_count: 4,
-      undecided_voters_count: 2,
+      vote_count_eligible: 6,
+      vote_count_cast: 4,
+      vote_count_uncast: 2,
       items_count: 3,
     });
   });
@@ -406,7 +406,7 @@ describe("listPolls", () => {
       title: "Meeting time",
       hide_results: "until_vote",
       topic_id: 712,
-      stance_counts: [2],
+      scores_by_option: [2],
       results: [{ id: 4, poll_id: 302, name: "Monday", score: 2, voter_ids: [501, 502] }],
       total_score: 2,
       poll_option_names: ["Monday"],
@@ -1033,7 +1033,7 @@ describe("createPollSchema — Loomio 3.8.1's poll types and their rules", () =>
 
   it("notify_on_closing_soon is Loomio's enum — 'all_members' (the 0.0.11 value) does not exist", async () => {
     const { createPollSchema } = await import("../src/tools/polls.js");
-    for (const v of ["nobody", "author", "undecided_voters", "voters"]) {
+    for (const v of ["nobody", "author", "voters_uncast", "voters"]) {
       expect(
         createPollSchema.safeParse({
           ...base,
@@ -1078,7 +1078,7 @@ describe("createPollSchema — Loomio 3.8.1's poll types and their rules", () =>
       expect(shape["notify_on_open"]!.description).toMatch(/poll_announced/);
       expect(shape["notify_on_closing_soon"]!.description).toMatch(/default is 'nobody'/);
       expect(shape["notify_on_closing_soon"]!.description).not.toMatch(
-        /own default is 'undecided_voters'/,
+        /own default is 'voters_uncast'/,
       );
       expect(shape["meeting_duration"]!.description).toMatch(/No default through the API/);
       expect(shape["can_respond_maybe"]!.description).toMatch(/default is false/);
@@ -1288,7 +1288,7 @@ describe("deletePoll", () => {
 // (3.11) and `quorum_reached` (3.13) — what the tools keep, and when.
 
 describe("shapePoll — Loomio 3.10–3.13 fields", () => {
-  it("a poll with NO quorum (quorum_pct null) loses quorum_count / quorum_votes_required / quorum_reached, in the show and the list", async () => {
+  it("a poll with NO quorum (quorum_pct null) loses quorum_threshold / quorum_shortfall / quorum_reached, in the show and the list", async () => {
     const { getPoll, listPolls } = await import("../src/tools/polls.js");
     mockFetch(200, pollShowBody());
     const show = await getPoll({ id_or_key: 301 });
@@ -1297,7 +1297,7 @@ describe("shapePoll — Loomio 3.10–3.13 fields", () => {
     for (const poll of [show.poll, list.polls[0]!]) {
       // `quorum_reached: false` on a poll that has no quorum would read as
       // "the quorum was missed".
-      for (const f of ["quorum_count", "quorum_votes_required", "quorum_reached"]) {
+      for (const f of ["quorum_threshold", "quorum_shortfall", "quorum_reached"]) {
         expect(poll, f).not.toHaveProperty(f);
       }
     }
@@ -1311,8 +1311,8 @@ describe("shapePoll — Loomio 3.10–3.13 fields", () => {
         polls: [
           pollRow({
             quorum_pct: 50,
-            quorum_count: "3.0",
-            quorum_votes_required: "0.0",
+            quorum_threshold: "3.0",
+            quorum_shortfall: "0.0",
             quorum_reached: true,
           }),
         ],
@@ -1322,8 +1322,8 @@ describe("shapePoll — Loomio 3.10–3.13 fields", () => {
     const r = await getPoll({ id_or_key: 301 });
     expect(r.poll).toMatchObject({
       quorum_pct: 50,
-      quorum_count: "3.0",
-      quorum_votes_required: "0.0",
+      quorum_threshold: "3.0",
+      quorum_shortfall: "0.0",
       quorum_reached: true,
     });
   });
@@ -1357,7 +1357,7 @@ describe("shapePoll — Loomio 3.10–3.13 fields", () => {
     const show = await getPoll({ id_or_key: 304 });
     expect(show.poll).toMatchObject({
       weighted_voting: true,
-      stance_counts: [2.5, 1, 0],
+      scores_by_option: [2.5, 1, 0],
       total_score: "3.5",
       result_heading_keys: { votes_cast_percent: "poll_common.pct_of_vote_weight_cast" },
     });

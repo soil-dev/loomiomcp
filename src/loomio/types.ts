@@ -196,7 +196,12 @@ export interface LoomioTopic {
   max_depth?: number;
   allow_comments?: boolean;
   allow_reactions?: boolean;
+  /** 3.14+ (e50f78c34): `allow_concurrent_polls` with the opposite meaning before. */
+  polls_one_at_a_time?: boolean;
+  /** ≤ 3.13 name of `polls_one_at_a_time`, inverted; `topicJoinFields` folds it into that name and never relays this one. */
   allow_concurrent_polls?: boolean;
+  /** 3.14+ (d1b51ef58): only thread / group admins may add files. */
+  attachments_admin_only?: boolean;
   comment_length_max?: number | null;
   /** Present on side-loaded rows: the id of the record this topic fronts, by type. */
   discussion_id?: number;
@@ -228,14 +233,14 @@ export interface LoomioDiscussion {
 export type LoomioHideResults = "off" | "until_vote" | "until_closed";
 
 /**
- * PollSerializer. `results`, `stance_counts`, `total_score` and
+ * PollSerializer. `results`, `scores_by_option`, `total_score` and
  * `stv_results` are emitted whenever `results_available?` — that is,
  * unless `hide_results == until_closed` and the poll is still open. The
  * `until_vote` setting is NOT enforced server-side for an API user who
  * has not voted; `visibility.ts` applies it client-side. Since 3.10
  * scores are decimals: `total_score` is a BigDecimal (a JSON STRING
- * such as "3.0", or the integer 0 when `stance_counts` is empty,
- * a3736458b) and `stance_counts` entries can be fractional on a
+ * such as "3.0", or the integer 0 when `scores_by_option` is empty,
+ * a3736458b) and `scores_by_option` entries can be fractional on a
  * weighted poll. The connector passes them through and does no
  * arithmetic on them.
  */
@@ -274,17 +279,17 @@ export interface LoomioPoll {
   poll_option_ids?: number[];
   current_outcome_id?: number | null;
   results?: unknown[];
-  stance_counts?: Array<number | string>;
+  scores_by_option?: Array<number | string>;
   total_score?: number | string;
   stv_results?: unknown;
-  voters_count?: number;
-  decided_voters_count?: number;
-  undecided_voters_count?: number;
-  cast_stances_pct?: number;
+  vote_count_eligible?: number;
+  vote_count_cast?: number;
+  vote_count_uncast?: number;
+  participation_pct?: number;
   /** null = the poll has no quorum; the three fields below then mean nothing. */
   quorum_pct?: number | null;
-  quorum_count?: number | string;
-  quorum_votes_required?: number | string;
+  quorum_threshold?: number | string;
+  quorum_shortfall?: number | string;
   /** 3.13+ (ad60e7728); `false` also on a poll with no quorum at all. */
   quorum_reached?: boolean;
   specified_voters_only?: boolean;

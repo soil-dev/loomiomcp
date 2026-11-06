@@ -12,7 +12,7 @@
  * (`enum :hide_results`). The browser client honours the second rule:
  * a member who has not voted on an `until_vote` poll sees no tallies.
  * The API does NOT: `PollSerializer#results_visible?` is
- * `poll.results_available?` alone, so `results`, `stance_counts`,
+ * `poll.results_available?` alone, so `results`, `scores_by_option`,
  * `total_score` (and `stv_results`) are serialised for every open
  * `until_vote` poll, and `StanceSerializer#include_results?` likewise
  * emits every voter's `option_scores` and `reason` once
@@ -101,16 +101,16 @@ export function pollResultsVisible(
 /**
  * The PollSerializer fields that ARE the results (all gated by its
  * `results_visible?`). `results[]` carries per-option scores, voter ids
- * and voter scores; `stance_counts` per-option tallies; `total_score`
+ * and voter scores; `scores_by_option` per-option tallies; `total_score`
  * the sum; `stv_results` the transfer rounds of an STV poll.
- * Participation counts (`voters_count`, `decided_voters_count`,
- * `undecided_voters_count`, `cast_stances_pct`) are not results — Loomio
+ * Participation counts (`vote_count_eligible`, `vote_count_cast`,
+ * `vote_count_uncast`, `participation_pct`) are not results — Loomio
  * shows them under every setting — and stay.
  *
  * Re-checked at 3.13.1: PollSerializer still gates exactly these four
  * on `results_visible?` = `results_available?`
  * (poll_serializer.rb:112-114, 197-215). The 3.10–3.13 additions are not
- * results: `quorum_count` / `quorum_votes_required` / `quorum_reached`
+ * results: `quorum_threshold` / `quorum_shortfall` / `quorum_reached`
  * and the participation counts are gated by `participation_visible?`
  * (`!anonymous? || closed?`, :116-118) — hidden on an open anonymous
  * poll whatever `hide_results` says — and `weighted_voting` /
@@ -119,7 +119,7 @@ export function pollResultsVisible(
  */
 export const HIDDEN_RESULT_FIELDS = [
   "results",
-  "stance_counts",
+  "scores_by_option",
   "total_score",
   "stv_results",
 ] as const;

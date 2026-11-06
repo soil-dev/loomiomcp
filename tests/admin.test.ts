@@ -99,7 +99,7 @@ describe("deactivateUser (b3 admin)", () => {
       expect(err.message).toMatch(/\/b3\/users\/:id\/(de|re)activate/);
       expect(err.message).not.toContain("42");
       expect(err.message).toMatch(/LOOMIO_B3_API_KEY/);
-      expect(err.message).toMatch(/ENV\['B3_API_KEY'\]/);
+      expect(err.message).toMatch(/SERVER_API_KEY \(B3_API_KEY before Loomio 3\.14\)/);
       expect(err.message).not.toContain("/profile/api_access");
       expect(err.message).not.toMatch(/password changes|rotated|update LOOMIO_API_KEY/);
       expect(err.message).not.toMatch(/failing the same way|rotated in between|key-health probe/);

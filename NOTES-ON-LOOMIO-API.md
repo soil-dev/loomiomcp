@@ -3,9 +3,19 @@
 Empirical / source-verified behaviour that informs the tool schemas.
 Update as we learn more.
 
-Unless a section says otherwise, "current" means **Loomio 3.13.1** (tag
-`v3.13.1`) — the release this connector is verified against since
-0.0.16 (`TESTED_LOOMIO_VERSION` in `src/version.ts`). The 3.9.0 →
+Unless a section says otherwise, "current" means **Loomio 3.15.0** —
+the master build this connector is verified against since 0.0.18
+(`TESTED_LOOMIO_VERSION` in `src/version.ts`): commit 5cde393b9, 87
+commits after tag `v3.14.0`, whose `Version.current` already says
+3.15.0; `v3.14.1` was the last tag on 2026-11-06. The 3.13.1 → 3.15.0
+changes — the versioned API paths (`/user0`, `/server0`), the poll
+field renames, the inverted thread setting — are collected in "Loomio
+3.13.1 → 3.15.0 changes that matter" below. Paths in this file are
+written in their pre-3.14 form (`/b2/…`, `/b3/…`) except where the
+section is about the paths; poll fields are named as Loomio 3.14+
+names them, with the older name in parentheses where it helps. Before
+that, "current" meant **Loomio 3.13.1** (tag `v3.13.1`), the release
+verified against since 0.0.16. The 3.9.0 →
 3.13.1 changes were taken from Loomio's source, tests and OpenAPI
 document at the two tags on 2026-10-24 (the OpenAPI document moved to
 `docs/help/en/user_manual/integrations/api/openapi.yaml`) and, for the
@@ -13,7 +23,7 @@ b2 reads, checked against sanitized live captures from a 3.13.1
 instance; they are collected in "Loomio 3.9 → 3.13.1 changes that
 matter" below, and the sections they touch are dated where the
 behaviour differs by version. The b3 provisioning routes (3.13.0+) are
-verified against source, tests and documentation only. Before that,
+verified against source, tests and documentation only. Before 3.13.1,
 "current" meant **Loomio 3.9.0** (tag `v3.9.0`, 2026-09-23). Facts were taken from
 Loomio's source at tag `v3.8.1` (2026-09-18) and re-checked at `v3.9.0`
 and master on 2026-10-02: the `namespace :b2` / `:b3` route blocks, the
@@ -46,24 +56,53 @@ of the same instance while on 3.8.1 (see "Verified live"). Sections marked
 **historical** describe older Loomio behaviour and are kept so the
 connector's own history stays legible; they are not current guidance.
 
-## Why b2 is the canonical surface
+## The User API and the Server API (`/user0`, `/server0`; `/b2`, `/b3` before 3.14)
 
-Loomio's `/api/...` namespaces, as of 3.8.1:
+Loomio's `/api/...` namespaces, as of 3.15.0:
 
-- **`b2`** — the *User API*: documented at
-  https://www.loomio.com/help/api2 and in Loomio's own OpenAPI document.
-  Controllers in `app/controllers/api/b2/` are the implementation;
-  authentication is the per-user API key as a bearer token, and every
-  request runs with that user's permissions. **All non-admin tools in
-  this connector hit `/b2/...`.** (The older `b1` namespace was removed
-  in Loomio 3.1.0.)
-- **`b3`** — the *Server API*: a different secret (bearer token
-  validated with `secure_compare` against `ENV['B3_API_KEY']` on the
-  Loomio server, >16 chars). It covers user index / show / update /
-  destroy / redact, deactivate / reactivate, and lookup by external
-  identity. The connector wraps `deactivate`, `reactivate`, `show` (by
-  id or identity) and `index`, behind opt-in `LOOMIO_B3_API_KEY`; the
-  rest is deliberately not wrapped (below).
+- **User API** — `/api/user0` since Loomio 3.14.0 (81fbad246),
+  `/api/b2` before. Documented at
+  https://www.loomio.com/docs/en/user_manual/integrations/api/user-api
+  (formerly `/help/api2`) and in Loomio's own OpenAPI document.
+  Controllers in `app/controllers/api/user0/` (`api/b2/` through 3.13)
+  are the implementation; authentication is the per-user API key as a
+  bearer token, and every request runs with that user's permissions.
+  **All non-admin tools in this connector hit this API.** On 3.14+ the
+  `/b2` path still answers — `config/routes.rb` mounts the same
+  controllers under both (`scope 'b2', module: 'user0'`) — but the
+  release notes say the old paths "will be removed in a later release",
+  and `/b2` is not a plain alias: `Api::User0::LegacyB2Fields` rewrites
+  the poll fields on that path back to the pre-3.14 names, in requests
+  and responses (see the 3.13.1 → 3.15.0 table). (The older `b1`
+  namespace was removed in Loomio 3.1.0.)
+- **Server API** — `/api/server0` since 3.14.0, `/api/b3` before
+  (`scope 'b3', module: 'server0'`). Documented at
+  https://www.loomio.com/docs/en/user_manual/integrations/api/server-api.
+  A different secret: a bearer token validated with `secure_compare`
+  against `ENV['SERVER_API_KEY']` on the Loomio server (`B3_API_KEY`
+  before 3.14, and still read while `SERVER_API_KEY` is unset; ≥ 17
+  chars — since 3.14 a shorter configured key stops Loomio from
+  starting). It covers user index / show / update / destroy / redact,
+  deactivate / reactivate, lookup by external identity and, since 3.13,
+  group and membership provisioning. The connector wraps `deactivate`,
+  `reactivate`, `show` (by id or identity), `index` and the provisioning
+  routes listed under "Endpoints wrapped", behind opt-in
+  `LOOMIO_B3_API_KEY`; the rest is deliberately not wrapped (below).
+  "b3" stays the connector's name for this tool set: the tool names,
+  the env var and `check_connection`'s `b3_enabled` are unchanged.
+- **Which generation the connector sends** (`src/loomio/api-dialect.ts`):
+  the Loomio version the key-health probe reads from the public
+  `GET /v1/boot/version` decides — ≥ 3.14.0 → `/user0` and `/server0`;
+  < 3.14.0, or no version known yet → `/b2` and `/b3`. The first probe
+  of a process knows no version and takes `/b2/groups`, which every
+  supported Loomio (3.8 through 3.15) answers; later probes use
+  `/user0/groups` on 3.14+ (`healthProbePath`, `src/loomio/health.ts`).
+  The legacy path is safe for every read and for every write except the
+  renamed thread settings, because `src/loomio/poll-fields.ts` renames
+  what comes back and translates what goes out (see the table); a write
+  carrying `polls_one_at_a_time` or `attachments_admin_only` resolves
+  the dialect first (`resolveApiDialect`, which probes when the version
+  is unknown).
 - **`v1`** — Loomio's internal browser API (~37 controllers). It
   authenticates by session cookie (plus Cloudflare Turnstile on login)
   and does **not** read the API key; see DESIGN.md. The connector makes
@@ -124,16 +163,19 @@ Consequences:
 
 ## Base URL
 
-`https://www.loomio.com/api` — version (`b2` / `b3` / `v1`) is part of
-each path so a single client serves all namespaces. The **web** origin
+`https://www.loomio.com/api` — the namespace (`user0` / `server0` /
+`v1`; `b2` / `b3` before Loomio 3.14) is part of each path so a single
+client serves all of them. The **web** origin
 for the canonical links the tools return is the same value with its
 trailing `/api` removed (`siteBaseUrl` in `src/loomio/shape.ts`).
 
 ## Endpoints wrapped
 
-### b2 (per-user api_key)
+### User API (per-user api_key)
 
-Every read below also carries the connector's read profile — an explicit
+Paths are written in their pre-3.14 form, `/b2/…`; on Loomio ≥ 3.14
+the connector sends the same route under `/user0/…` (see "The User API
+and the Server API" above). Every read below also carries the connector's read profile — an explicit
 `exclude_types=…` or `compact=1` (see "Pagination and response options")
 — which the table omits for brevity. Writes carry neither.
 
@@ -169,7 +211,10 @@ Every read below also carries the connector's read profile — an explicit
 |---|---|---|
 | GET | `/v1/boot/version` | key-health probe — sent **without** the key; `{version}` |
 
-### b3 (server-instance secret; opt-in via LOOMIO_B3_API_KEY)
+### Server API — "b3" (server-instance secret; opt-in via LOOMIO_B3_API_KEY)
+
+`/b3/…` is the pre-3.14 form; on Loomio ≥ 3.14 the connector sends
+`/server0/…`.
 
 | Method | Path | Tool |
 |---|---|---|
@@ -189,7 +234,7 @@ The collection routes `POST /b3/users/deactivate?id=` /
 OpenAPI document ("legacy query-ID route"); the connector uses the
 member routes.
 
-### Available in Loomio 3.8.1 – 3.13.1, deliberately not wrapped
+### Available in Loomio 3.8.1 – 3.15.0, deliberately not wrapped
 
 | Method | Path | Why not |
 |---|---|---|
@@ -347,13 +392,16 @@ carries a `defaults:` block per type, but only
 `PollTemplateService.build_templates_from` reads it — for poll
 templates, i.e. the web form. `PollService.build` is `Poll.new` +
 `assign_attributes_and_files`. The model's readers DO fall back to the
-YAML for the ballot bounds (`poll.rb`: `min_score`, `max_score`,
-`dots_per_person`, `minimum_stance_choices`, `maximum_stance_choices`
-read `self[field] || AppConfig.poll_types.dig(poll_type, 'defaults',
-field)`), so those need no client-side default. Three do not:
+YAML for the ballot bounds (`poll.rb`: `score_min`, `score_max`,
+`points_per_voter`, `choice_count_min`, `choice_count_max` — `min_score`,
+`max_score`, `dots_per_person`, `minimum_stance_choices`,
+`maximum_stance_choices` before 3.14 — read `self[field] ||
+AppConfig.poll_types.dig(poll_type, 'defaults', field)`), so those need
+no client-side default. Three do not:
 `notify_on_closing_soon` is a plain enum with column default 0 =
 `nobody` (no closing-soon reminder at all; the form pre-selects
-`undecided_voters`; anonymous polls are forced to it),
+`voters_uncast` — `undecided_voters` before 3.14; anonymous polls are
+forced to it),
 `meeting_duration` is a bare `custom_fields` reader (nil unless sent;
 `calendar_invite.rb` interpolates it into the ICS duration), and
 `can_respond_maybe` is hard-coded `fetch('can_respond_maybe', false)`.
@@ -361,8 +409,12 @@ The field descriptions say so.
 
 **What the update routes drop silently** (`DiscussionService.update`,
 `PollService.update`): `group_id` and `tags` are pulled out and
-discarded, `poll_type` is excluded — a discussion cannot be moved and a
-poll's type cannot change through b2. Neither tool offers those fields.
+discarded — a discussion cannot be moved through the API. Through 3.13
+`poll_type` was excluded too (`params.except(:poll_type, …)`); since
+3.14.0 (162f52820) an authorized editor may change a poll's type,
+anonymity and `hide_results` until voting opens
+(`Poll#configuration_changes_are_allowed`). Neither tool offers those
+fields.
 
 **What `PATCH /b2/polls/{id}` does with `options`** (3.8.1
 `app/models/poll.rb`): `Poll#options=` is an alias of
@@ -547,15 +599,22 @@ YAML):
   `create` saved it (the one bare 403 a valid key can hit on a write;
   the classifier names it). The schema requires `closing_at` when
   `anonymous`, and refuses `hide_results` other than `until_closed`.
-  Anonymity cannot be switched later; an anonymous poll's configuration
-  is frozen once a ballot exists (422).
-- `closing_at` is rounded DOWN to the hour and must be in the future;
-  without it the poll never opens for voting on its own.
+  Anonymity cannot be switched once voting has opened (Loomio 3.14.0,
+  162f52820: an authorized editor may change anonymity, the voting
+  method and result visibility BEFORE voting opens; before 3.14 never
+  — and the connector's `update_poll` offers neither field); an
+  anonymous poll's configuration is frozen once a ballot exists (422).
+- `closing_at` must be in the future; without it the poll never opens
+  for voting on its own. Loomio 3.14+ (427412336) keeps the minutes and
+  checks opening and closing every minute (`config/recurring.yml`);
+  before 3.14 the time was rounded DOWN to the hour and the poll closed
+  on an hourly job.
 - Loomio 3.10+: `stv_seats` must be fewer than the options (422
   otherwise, 35b632cc7; the schema refuses it first), and
-  `maximum_stance_choices` is the option count for `dot_vote`, `score`,
-  `ranked_choice`, `stv` and `meeting` (3d9f313d0) — a ranked-choice
-  voter ranks at least `minimum_stance_choices`, up to every option.
+  `choice_count_max` (`maximum_stance_choices` before 3.14) is the
+  option count for `dot_vote`, `score`, `ranked_choice`, `stv` and
+  `meeting` (3d9f313d0) — a ranked-choice voter ranks at least
+  `choice_count_min` (`minimum_stance_choices`), up to every option.
 - `hide_results` may be tightened on update but `until_closed` can never
   be relaxed ("cannot reveal results early").
 
@@ -570,7 +629,8 @@ results_visible?(voted:) = results_available? &&
 ```
 
 `PollSerializer#results_visible?` is `poll.results_available?` ALONE, so
-`results`, `stance_counts`, `total_score` and `stv_results` are serialised
+`results`, `scores_by_option` (`stance_counts` before 3.14),
+`total_score` and `stv_results` are serialised
 for every open `until_vote` poll; `StanceSerializer#include_results?`
 likewise emits every voter's `option_scores` / `reason` once
 `results_available?` holds. The browser client applies the `until_vote`
@@ -583,13 +643,18 @@ poll fields and the other voters' stance fields when it says no, and
 emits `results_visible` / `results_hidden_reason` (`until_closed` |
 `until_vote`) either way. At 3.13.1 PollSerializer gates exactly those
 four fields (`results`, `stance_counts`, `total_score`, `stv_results`;
-poll_serializer.rb:112-118, 197-215) on `results_available?`; quorum and
-participation fields follow `participation_visible?`, so
-`HIDDEN_RESULT_FIELDS` is unchanged. **Markdown:** through Loomio 3.9,
+poll_serializer.rb:112-118, 197-215) on `results_available?`, and at
+3.15.0 the same four under their new names (`include_scores_by_option?`,
+`include_results?`, `include_total_score?`, `include_stv_results?` — all
+`results_available?`); quorum and participation fields (`quorum_*`,
+`vote_count_*`, `participation_pct`) follow `participation_visible?`,
+so `HIDDEN_RESULT_FIELDS` is unchanged — the connector strips by the
+current names, after `modernizePollsIn` has renamed a `/b2` row.
+**Markdown:** through Loomio 3.9,
 `ThreadMarkdownService` applied `results_visible?(voted:)` itself
 ("_Hidden until the poll closes._" / "_Hidden until the viewer
 votes._"). **Since 3.10.0 (df28cf845) it uses `poll.results_available?`
-alone** (thread_markdown_service.rb:213-215; upstream test
+alone** (thread_markdown_service.rb:213-215, unchanged at 3.15.0; upstream test
 thread_markdown_service_test.rb:222-250): an open `until_vote` poll's
 votes and results table are exported to a reader who has not voted.
 (a117c62fa added a `topic.polls.active.where(hide_results: :until_vote)`
@@ -1010,16 +1075,21 @@ Loomio 3.8.1, `Api::B2::MembershipsController`, `MembershipQuery`,
 ## b3 admin (opt-in)
 
 `Api::B3::UsersController` (and, since 3.13.0, the groups and
-memberships controllers) — bearer token `secure_compare`d against
-`ENV['B3_API_KEY']` (must be >16 chars) by `authenticate_api_key!`,
-which lives in `Api::B3::BaseController` since 3.13.0 (ee6befeb7; a
-`prepend_before_action`, same rule as UsersController's own before); a
-wrong or missing secret, *or a server with no `B3_API_KEY` set*,
-answers the generic 403 body. No per-user authorization is applied —
-the secret authenticates the server.
+memberships controllers; the module is `Api::Server0` since 3.14.0,
+mounted under `/server0` and the legacy `/b3`) — bearer token
+`secure_compare`d against `ENV['SERVER_API_KEY']` (3.14+; `B3_API_KEY`
+before, and still read while `SERVER_API_KEY` is unset; must be >16
+chars — since 3.14 a shorter configured key stops Loomio from starting)
+by `authenticate_api_key!`, which lives in the base controller since
+3.13.0 (ee6befeb7; a `prepend_before_action`, same rule as
+UsersController's own before); a wrong or missing secret, *or a server
+with neither `SERVER_API_KEY` nor `B3_API_KEY` set*, answers the
+generic 403 body. No per-user authorization is applied — the secret
+authenticates the server.
 The connector's 403 classifier therefore names `LOOMIO_B3_API_KEY` on
-`/b3/` paths — never the per-user key, `/profile/api_access` or the
-`/health` verdict, which probes the b2 key.
+`/server0/` and `/b3/` paths — never the per-user key,
+`/profile/api_access` or the `/health` verdict, which probes the
+per-user key.
 
 - `POST /b3/users/{id}/deactivate`: finds the user in `User.active`
   (else 404), enqueues `DeactivateUserWorker` and answers
@@ -1051,9 +1121,9 @@ The connector's 403 classifier therefore names `LOOMIO_B3_API_KEY` on
   two reads are gated like the writes and documented single-tenant only.
 - Identity route caveat: Rails' default segment pattern excludes `.`, so
   a `uid` containing a dot (most email addresses) is split into uid +
-  format and answers 404 — in 3.8.1 and still in 3.13.1 (no
-  `constraints:` on the identity routes). Address such users by numeric
-  id.
+  format and answers 404 — in 3.8.1 and still in 3.15.0 (no
+  `constraints:` on the identity routes, routes.rb@5cde393b9:118-123).
+  Address such users by numeric id.
 
 **Provisioning (Loomio ≥ 3.13.0, ee6befeb7).** Routes
 (routes.rb@v3.13.1:113-115): `resources :groups, only: [:index]`,
@@ -1149,7 +1219,7 @@ All Loomio API errors are JSON (`render json:` in `Api::V1::SnorlaxBase`).
 | Status | Body | Source | Connector |
 |---|---|---|---|
 | 400 | `{"error":400}` | `ActionController::UnpermittedParameters` / `ParameterMissing` — a key `PermittedParams` does not list (`discussion_id` on a poll, a nested `comment` hash, `compact` on a write) | `LoomioApiError` |
-| 403 | `{"error":"You are not authorized to access this page."}` | CanCan's default message for a bare `raise CanCan::AccessDenied` (Loomio's `server.en.yml` defines no `unauthorized.default`). Raised by `authenticate_api_key!` (no active user owns the key) on every b2 path; by `records_visible_in_group` — called **only** from `DiscussionsController#index` and `PollsController#index` (the GET index, not `#create` on the same paths) — when the group is not visible to the caller; by `PollService.invite` on `POST /b2/polls` for an anonymous poll that is not active (no future `closing_at`), **after** the poll was saved; by `TagService.authorize_create_tag_names!` on a discussion / poll create carrying a tag name the user may not create (Loomio ≤ 3.12 only; 3.13 drops such tags silently); and by `authenticate_api_key!` (`Api::B3::BaseController` since 3.13.0, `Api::B3::UsersController` before) on every b3 path when the bearer does not `secure_compare` to the server's `ENV['B3_API_KEY']` or that variable is unset / ≤ 16 chars. **Never** for visibility on `/b2/groups` (index), `/b2/threads…`, `/b2/search` or `/b2/reports` — those filter or 404 instead — so there the body means the key and nothing else. `MembershipsController#index` never raises it (a non-member gets `200 []`), `show` actions use `load_and_authorize` (the message-bearing body below). | `LoomioAuthError` kind `unauthenticated`; the message hedges towards visibility only on the two gated lists **and only on GET**, names the poll exception on `POST /b2/polls`, says "key, nothing else" on the filter-only paths, is definitive ("key rejected") when a **fresh** (< 60 s) health verdict says so, and on `/b3/` paths names the b3 secret and ignores the health verdict |
+| 403 | `{"error":"You are not authorized to access this page."}` | CanCan's default message for a bare `raise CanCan::AccessDenied` (Loomio's `server.en.yml` defines no `unauthorized.default`). Raised by `authenticate_api_key!` (no active user owns the key) on every b2 path; by `records_visible_in_group` — called **only** from `DiscussionsController#index` and `PollsController#index` (the GET index, not `#create` on the same paths) — when the group is not visible to the caller; by `PollService.invite` on `POST /b2/polls` for an anonymous poll that is not active (no future `closing_at`), **after** the poll was saved; by `TagService.authorize_create_tag_names!` on a discussion / poll create carrying a tag name the user may not create (Loomio ≤ 3.12 only; 3.13 drops such tags silently); and by `authenticate_api_key!` (`Api::B3::BaseController` since 3.13.0, `Api::B3::UsersController` before) on every b3 path when the bearer does not `secure_compare` to the server's `ENV['SERVER_API_KEY']` (`B3_API_KEY` before 3.14, still read while the new name is unset) or that variable is unset / ≤ 16 chars. **Never** for visibility on `/b2/groups` (index), `/b2/threads…`, `/b2/search` or `/b2/reports` — those filter or 404 instead — so there the body means the key and nothing else. `MembershipsController#index` never raises it (a non-member gets `200 []`), `show` actions use `load_and_authorize` (the message-bearing body below). | `LoomioAuthError` kind `unauthenticated`; the message hedges towards visibility only on the two gated lists **and only on GET**, names the poll exception on `POST /b2/polls`, says "key, nothing else" on the filter-only paths, is definitive ("key rejected") when a **fresh** (< 60 s) health verdict says so, and on `/server0/` and `/b3/` paths names the b3 secret and ignores the health verdict |
 | 403 | `{"error":"Not authorized to <action> <Model>."}` | CanCan `authorize!` with a message (`unauthorized.manage.all`) — per-record permission. `Not authorized to show Group.` on `GET /b2/groups/:id` = the group exists and is hidden from the user | kind `not_authorized`, message verbatim; the group-show case is explained as *hidden group, remedy is membership* |
 | 403 | `{"error":"User is not an admin"}` | `memberships#create` `authorize_manage_group!` | kind `not_admin` |
 | 403 | `{"error":403}` | `respond_with_standard_error` for `Subscription::MaxMembersExceeded`; on the b3 membership routes (3.13.0+) also `Subscription::NotActive` (b3/base_controller.rb:6: the target group's subscription is inactive or expired) | kind `plan_limit`; the message names the inactive-subscription cause, and on `/b3/memberships` says the b3 secret was accepted |
@@ -1258,7 +1328,51 @@ otherwise.
   "default and maximum page size 50"). The connector's schema stops at
   50.
 
-## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0; reads, writes and the Markdown guard on 3.13.1 on 2026-10-24/25)
+## Loomio 3.13.1 → 3.15.0 changes that matter (written 2026-11-06)
+
+From Loomio's source at `v3.13.1`, `v3.14.0`, `v3.14.1` and master
+commit 5cde393b9 (what the reference instance runs: `v3.14.0-87`, with
+`Version.current` = `3.15.0`; **v3.15.0 was not a tag on 2026-11-06 —
+`v3.14.1` was the last**), its release notes
+(`docs/release_notes/2026-11-01_v3.14.0.md`), `deploy/UPGRADING.md`
+("User and Server API paths") and `docs/help/en/user_manual/
+integrations/api/user-api.md`. "Release" is the first tag containing
+the commit. Everything here is handled in **0.0.18** unless the last
+column says otherwise.
+
+| Release | Commit | Change | Effect on the connector |
+|---|---|---|---|
+| 3.14.0 | 81fbad246 | **Versioned API paths.** The User API is `/api/user0`, the Server API `/api/server0` ("the number increases when a release breaks one of these APIs", UPGRADING.md). `/api/b2` and `/api/b3` still answer — routes.rb:139-142 mounts the same controllers under both (`scope 'b2', module: 'user0'`, `scope 'b3', module: 'server0'`) — "but will be removed in a later release". Controllers moved to `app/controllers/api/user0/` and `api/server0/`. | `src/loomio/api-dialect.ts`: the generation follows the Loomio version the health probe reports — ≥ 3.14.0 `/user0` + `/server0`, else (and before any probe answered) `/b2` + `/b3`. The first probe of a process uses `/b2/groups`; later ones `/user0/groups` on 3.14+ (`healthProbePath`). The 403 catalogue and the log redactor recognise both generations. Tool names, `LOOMIO_B3_API_KEY` and `b3_enabled` are unchanged. |
+| 3.14.0 | 81fbad246 | **`/api/b2` is a compatibility shim, not an alias**: `Api::User0::LegacyB2Fields` (app/controllers/api/user0/legacy_b2_fields.rb) runs on requests whose path starts with `/api/b2/`: a `before_action` renames the five poll settings a client may send and the `notify_on_closing_soon` / `recipient_audience` values back to the new names, an `after_action` renames every `polls[]` row and its `results[]` in the response to the OLD names. It renames keys only — the serializers still decide what a caller may see. It does NOT translate the thread setting below. | On `/b2` (Loomio < 3.14, or 3.14+ before the version is known) every response passes through `modernizePollsIn` (`src/loomio/poll-fields.ts`, applied in the HTTP client's `handleResponse`) and poll writes through `legacyPollParams`; on `/user0` nothing is translated. A caller never sees a pre-3.14 poll name. |
+| 3.14.0 | af2dfa22a, 44bb45208, 81fbad246 | **Poll fields renamed** (columns, `PollSerializer`, `PermittedParams#poll_attributes`, CSV exports; migrations 20261027000001/3). Old → new: `voters_count` → `vote_count_eligible`, `decided_voters_count` → `vote_count_cast`, `undecided_voters_count` → `vote_count_uncast`, `cast_stances_pct` → `participation_pct`, `stance_counts` → `scores_by_option`, `quorum_count` → `quorum_threshold`, `quorum_votes_required` → `quorum_shortfall`, `min_score` → `score_min`, `max_score` → `score_max`, `minimum_stance_choices` → `choice_count_min`, `maximum_stance_choices` → `choice_count_max`, `dots_per_person` → `points_per_voter`; in `results[]` rows `voter_count` → `vote_count`, `voter_scores` → `scores_by_voter`. The `notify_on_closing_soon` value `undecided_voters` is `voters_uncast` (poll.rb:190); the audience ids `decided_voters` / `undecided_voters` are `voters_cast` / `voters_uncast` (migration 20261027000002 rewrites stored audiences). | The connector speaks the NEW names everywhere a caller sees them, on every Loomio version: tool inputs (`create_poll` / `update_poll` settings), outputs (`get_poll`, `list_polls`, `list_thread_items` polls, `get_discussion` side-loads, `search_content`) and docs. `POLL_FIELD_RENAMES` / `POLL_RESULT_FIELD_RENAMES` rename a legacy row; `POLL_PARAM_LEGACY_NAMES` translates the five write settings and the closing-soon value back on the legacy dialect. `HIDDEN_RESULT_FIELDS` strips by the new names. `recipient_audience` stays `'group'` only. |
+| 3.14.0 | e50f78c34, 00423ec5b | **`allow_concurrent_polls` → `polls_one_at_a_time`, OPPOSITE meaning** (`PermittedParams` discussion / template attributes; migration 20261031000002 renames and inverts the stored value). New threads and discussion templates default to allowing several polls at once. `LegacyB2Fields` does not translate it, so from 3.14 `PATCH /b2/discussions/{id}` with `allow_concurrent_polls` is a 400 (`PermittedParams` in `:raise` mode). | **BREAKING fix in 0.0.18.** 0.0.17's `update_discussion(allow_concurrent_polls)` answered 400 on 3.14+. `update_discussion` now takes `polls_one_at_a_time` (boolean) and `allow_concurrent_polls` is gone from the schema; on a pre-3.14 server the value is sent inverted under the old name. A write carrying it resolves the dialect first (`resolveApiDialect` probes when no version is known). `create_discussion` never had the setting. `create_poll`'s "thread must allow another poll" rule now reads `polls_one_at_a_time: false`, or none active. |
+| 3.14.0 | d1b51ef58 | **`attachments_admin_only`** on discussions and templates: only thread admins and group admins may add files and inline images (discussions, comments, votes, outcomes, email replies); existing attachments survive edits. Permitted on `PATCH …/discussions/{id}` (permitted_params.rb:57, 155, 188). | `update_discussion` takes `attachments_admin_only` (boolean, Loomio 3.14+); on a pre-3.14 server it is refused with a clear error before anything is written. |
+| 3.14.0 | 162f52820 | **Polls editable before voting opens**: an authorized editor may change `anonymous`, the voting method and `hide_results` until `opened_at`; once voting has opened anonymity and voting method are fixed and `until_closed` cannot be relaxed. | No code change (`update_poll` offers neither `anonymous` nor `poll_type`); the "cannot change" caveat now applies once voting has opened. |
+| 3.14.0 | 427412336 | **Voting times keep their minutes**: `closing_at` is no longer rounded down to the hour; scheduled opening and closing are checked every minute (`config/recurring.yml` schedules `OpenScheduledPollsWorker` and `ExpireLapsedPollsWorker` every minute; `hourly_task_job.rb` no longer runs them). | No code change. Docs: "next full hour" is no longer required on 3.14+ (any future minute closes within a minute); before 3.14 the hour rounding and hourly close still apply. `update_poll`'s `closing_at` text still suggests the next full hour, which works on every version. |
+| 3.14.0 | b345d8838, 2d61abc01 | **Search indexing is asynchronous**: `after_save_commit :enqueue_search_index_update` (`Searchable`) into the prioritised `search_index` queue, instead of inside the request. | No code change. New or edited content can take a short time to appear in `search_content`; documented. |
+| 3.13.2 | 133eb7f81 | `TopicItem` tag editing extended to context editors (ability/topic_item.rb). | None (the connector does not edit tags on items). |
+| 3.14.0 | — | The collaboration (Y.js) server moved into Rails (`deploy/UPGRADING.md` "Collaborative editing runs in the app"). | None: no API effect. |
+| 3.14.0 | 81fbad246 | Server API secret setting renamed `SERVER_API_KEY`; `B3_API_KEY` is read while the new one is unset; a configured key shorter than 17 characters stops Loomio from starting. | No code change: `LOOMIO_B3_API_KEY` must equal whichever the instance uses. Docs name both. |
+| present at 3.15.0 | — | `/api/v1/profile` and the rest of v1 remain the browser's session-cookie API. | Not wrapped; the public `GET /v1/boot/version` stays the connector's only v1 call. |
+
+The OpenAPI mismatches listed for 3.13.1 above were not re-checked
+against the 3.15.0 document except where a row says so.
+
+## Verified live (2026-09-20 on Loomio 3.8.1; reads re-verified 2026-10-02 on 3.9.0; reads, writes and the Markdown guard on 3.13.1 on 2026-10-24/25; reads, writes and the Markdown guard on 3.15.0 on 2026-11-06)
+
+**2026-11-06, Loomio 3.15.0 (master 5cde393b9), connector 0.0.18,
+non-admin key, the same sandbox group.** After the reference instance
+moved from 3.13.1 to the 3.15.0 master build, the read tools and the
+write round-trip below were re-run over `/user0` (the dialect the probe
+selects on 3.14+): poll rows arrive in the new vocabulary
+(`vote_count_eligible`, `scores_by_option`, …) and pass through
+`modernizePollsIn` untouched, `update_discussion({polls_one_at_a_time})`
+— the write 0.0.17 could no longer make, Loomio answering 400 on `/b2`
+— succeeds, `create_poll` / `update_poll` send `score_min` /
+`choice_count_max` under their new names, and the Markdown guard
+refuses an open `until_vote` poll's thread exactly as on 3.13.1. The
+same reads over `/b2` return the old names and are normalised to
+identical output. Everything created was deleted.
 
 **2026-10-25, Loomio 3.13.1, connector 0.0.16, non-admin key, sandbox group
 (`private_only`, `group_privacy: parent_members`).** Write round-trip

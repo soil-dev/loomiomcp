@@ -18,6 +18,12 @@ for 0.0.16 / Loomio 3.13.1: where Loomio ≥ 3.11.1 pages a collection
 (the groups index, thread items — at most 500 rows per request), the
 connector requests 500 at a time and follows only the pages the call
 needs, within a per-call page cap, flagging a walk the cap stopped.
+0.0.18 / Loomio 3.15.0 changed no request count: the API path
+generation (`/user0` on Loomio ≥ 3.14, `/b2` before — paths below are
+quoted in the pre-3.14 form) and the poll field renaming cost nothing
+extra; the one addition is a health probe before an `update_discussion`
+that carries `polls_one_at_a_time` / `attachments_admin_only` when no
+probe has reported the Loomio version yet.
 
 | Tool | Loomio requests | Read profile sent | Bytes controls |
 |---|---|---|---|
@@ -26,7 +32,7 @@ needs, within a per-call page cap, flagging a walk the cap stopped.
 | `get_group` | 1 | `exclude_types=tag translation` | attachments / cover urls dropped |
 | `list_discussions` | 1 | `exclude_types=group parent membership reaction translation` (keeps `topics` — with their `tags` field, which excluding `tag` would strip) | `description_max_chars` (default 1500; an HTML body over the cap loses its tag attributes first — `rel` / `target` / heading `id` — so the cap carries content), slim users |
 | `get_discussion` | 1 (2 with `include_items`, +1 per further 500 embedded items, ≤ 3; the items requests exclude `discussion`, so the opening post is not sent twice) | `exclude_types=parent membership reaction translation` (keeps `topics`, `groups`) | full text |
-| `list_polls` | 1 | list profile | `description_max_chars` (caps `details`), results gated; rows drop `results[]` / `stv_results` (per-voter ids and scores, 30–40 % of a visible poll) and null type knobs — `stance_counts` + `total_score` stay |
+| `list_polls` | 1 | list profile | `description_max_chars` (caps `details`), results gated; rows drop `results[]` / `stv_results` (per-voter ids and scores, 30–40 % of a visible poll) and null type knobs — `scores_by_option` + `total_score` stay |
 | `get_poll` | 1 | show profile | full text, results gated, full `results[]` |
 | `list_threads` | 1 (`GET /b2/threads`); under `LOOMIO_MCP_GROUP_IDS` 1–10 (it walks the index in pages of 100 so nothing it returns counts a withheld thread) | `exclude_types=topic group parent membership reaction translation` (compact minus `tag`) | `limit` ≤ 100; no bodies |
 | `list_thread_items` | 1 per 500 items of the window by `topic_id` (≤ 2), +1 with `discussion_id` / `poll_id`; with `kinds` 1 per 500 items of the whole thread (≤ 10); always 1 (+1) before 3.11.1 | `compact=1` for a bare `topic_id`; compact plus `discussion` when the thread's record is already known; compact minus `reaction` with `include_reactions` | Loomio ≥ 3.11.1 serves exactly the `offset` / `limit` window (a second page only when the first was used up without a budget cut); older Loomio returns the whole thread, sliced here (`server_paged: false`); a `max_total_chars` reply budget (default 120000 shaped characters — `limit` × `body_max_chars` alone would allow ~900 KB; `truncated_by_budget` + `next_offset` continue); `body_max_chars` (default 4000); side-loads narrowed to the returned items; polls carry `poll_options[]` so `option_scores` are readable without a `get_poll` |
@@ -164,7 +170,8 @@ the unstructured error message.
   `/b2/discussions/:id`, `/b2/groups/my-handle` → `/b2/groups/:id`,
   `/b2/threads/77/items` → `/b2/threads/:id/items`,
   `/b3/users/identity/saml/someone@example.org` →
-  `/b3/users/identity/:type/:uid`. Query strings are dropped entirely —
+  `/b3/users/identity/:type/:uid`, and the `/user0/…` / `/server0/…`
+  paths Loomio ≥ 3.14 takes the same way. Query strings are dropped entirely —
   `/b2/search?query=budget` logs as `/b2/search`, `/b2/reports?group_ids=…`
   as `/b2/reports`. The API key travels in the `Authorization` header
   (never in a URL since 0.0.9) and headers are never logged.

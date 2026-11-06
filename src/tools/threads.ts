@@ -66,12 +66,13 @@ import {
   positiveId,
   TEXT_MAX,
 } from "./_common.js";
+import { userApiPath } from "../loomio/api-dialect.js";
 
 // ── Loomio 3.8's thread routes ──────────────────────────────────────────────
 //
 // Loomio 3.4 replaced the Event model (and the v1 `events` endpoint the
 // 0.0.11 `list_events` read) with TopicItem, and 3.1+ exposes threads to
-// API keys under `/b2/threads` (Api::B2::ThreadsController, 3.8.1):
+// API keys under userApiPath(`/threads`) (Api::B2::ThreadsController, 3.8.1):
 //
 //   GET /b2/threads                  TopicQuery.visible_to(user), ordered
 //                                    last_activity_at desc, `limit` (default
@@ -162,7 +163,7 @@ import {
 // StanceService for a changed vote (no subclass, same shape).
 //
 // Poll results inside a thread go through src/loomio/visibility.ts:
-// Loomio's serializers emit `results` / `stance_counts` / voters'
+// Loomio's serializers emit `results` / `scores_by_option` / voters'
 // `option_scores` whenever `results_available?` (the `until_closed`
 // gate) and leave `until_vote` to the client — which for an API user
 // that never votes would mean every voter's choice on a poll whose
@@ -302,7 +303,7 @@ function headerUrl(h: Omit<ThreadHeader, "url">): { url?: string } {
 
 /**
  * A 404 from `GET /b2/discussions/{id}` or `GET /b2/polls/{id}`. Unlike
- * the `/b2/threads/*` routes (see `THREAD_NOT_VISIBLE`), these go
+ * the userApiPath(`/threads/*`) routes (see `THREAD_NOT_VISIBLE`), these go
  * through `load_and_authorize`: ModelLocator finds the record first
  * (unknown id or key → 404) and only THEN checks `can?(:show)` (a record
  * the user may not see → 403 "Not authorized to show …", which the
@@ -312,7 +313,7 @@ function headerUrl(h: Omit<ThreadHeader, "url">): { url?: string } {
 function notFound(what: "discussion" | "poll", id: string | number): LoomioApiError {
   return new LoomioApiError(
     404,
-    `Loomio has no ${what} with id or key "${id}" (HTTP 404 from GET /b2/${what}s/{id}). A ${what} that ` +
+    `Loomio has no ${what} with id or key "${id}" (HTTP 404 from GET ${userApiPath("/")}${what}s/{id}). A ${what} that ` +
       `exists but is hidden from the connector's user answers 403 'Not authorized to show …' instead, ` +
       `so this identifier is wrong, not restricted — check that it is a ${what} id or key, not a ` +
       "topic_id (thread id): the two id sequences are independent.",
@@ -380,7 +381,7 @@ export async function resolveThread(
     let body: DiscussionsResponse;
     try {
       body = await loomioGet<DiscussionsResponse>(
-        `/b2/discussions/${encodePathSegment(ref.discussion_id)}`,
+        userApiPath(`/discussions/${encodePathSegment(ref.discussion_id)}`),
         readParams("compact"),
       );
     } catch (err) {
@@ -390,7 +391,7 @@ export async function resolveThread(
     if (!d || d.topic_id == null) {
       throw new LoomioApiError(
         502,
-        `Loomio answered GET /b2/discussions/${ref.discussion_id} without a discussion carrying a ` +
+        `Loomio answered GET ${userApiPath("/discussions/")}${ref.discussion_id} without a discussion carrying a ` +
           "topic_id; the response shape is not the one Loomio 3.8.1 produces.",
       );
     }
@@ -436,7 +437,7 @@ async function showPollThread(pollRef: string | number): Promise<{
   let body: PollsResponse;
   try {
     body = await loomioGet<PollsResponse>(
-      `/b2/polls/${encodePathSegment(pollRef)}`,
+      userApiPath(`/polls/${encodePathSegment(pollRef)}`),
       readParams("thread_guard"),
     );
   } catch (err) {
@@ -446,7 +447,7 @@ async function showPollThread(pollRef: string | number): Promise<{
   if (!p || p.topic_id == null) {
     throw new LoomioApiError(
       502,
-      `Loomio answered GET /b2/polls/${pollRef} without a poll carrying a topic_id; the response ` +
+      `Loomio answered GET ${userApiPath("/polls/")}${pollRef} without a poll carrying a topic_id; the response ` +
         "shape is not the one Loomio 3.8.1 produces.",
     );
   }
@@ -467,7 +468,7 @@ async function showPollThread(pollRef: string | number): Promise<{
 }
 
 const THREAD_NOT_VISIBLE =
-  "thread not found or not visible to the connector's user (HTTP 404 from GET /b2/threads/{topic_id}). " +
+  `thread not found or not visible to the connector's user (HTTP 404 from GET ${userApiPath("/threads/")}{topic_id}). ` +
   "Loomio resolves a thread through TopicQuery.visible_to(user).find, so an unknown topic_id and a " +
   "private thread in a group the user has not joined look the same. Check the topic_id (it is the " +
   "thread id, not the discussion or poll id) and the user's membership.";
@@ -593,7 +594,7 @@ export function shapeComment(
  * A poll as a thread item shows it: identity, type, schedule, the
  * visibility settings, participation counts, its options and — when the
  * results are visible to the connector's user — the per-option tallies
- * (`stance_counts`, aligned with `poll_options[]`, which Loomio orders
+ * (`scores_by_option`, aligned with `poll_options[]`, which Loomio orders
  * by priority on both). The full `results[]` (per-option voter ids and
  * scores) is left to get_poll: the thread already carries every stance,
  * so repeating the breakdown here would double the bytes for nothing a
@@ -628,12 +629,12 @@ const ITEM_POLL_FIELDS = [
   "anonymous",
   "weighted_voting",
   "specified_voters_only",
-  "voters_count",
-  "decided_voters_count",
-  "undecided_voters_count",
-  "cast_stances_pct",
+  "vote_count_eligible",
+  "vote_count_cast",
+  "vote_count_uncast",
+  "participation_pct",
   "current_outcome_id",
-  "stance_counts",
+  "scores_by_option",
   "total_score",
   "details",
   "details_format",
@@ -648,7 +649,7 @@ export interface ItemPollOption {
 
 export type ShapedItemPoll = Pick<GatedPoll<LoomioPoll>, (typeof ITEM_POLL_FIELDS)[number]> &
   Record<string, unknown> & {
-    /** In display (priority) order; `stance_counts[i]` is the tally of `poll_options[i]`. */
+    /** In display (priority) order; `scores_by_option[i]` is the tally of `poll_options[i]`. */
     poll_options: ItemPollOption[];
     results_visible: boolean;
     results_hidden_reason?: ResultsVisibility["reason"];
@@ -966,7 +967,7 @@ const ITEMS_SCOPE_NOTE =
   "results and other voters' choices are hidden where the poll's hide_results setting hides them " +
   "from a member who has not voted (results_visible / results_hidden_reason on each poll). A " +
   "stance's option_scores is keyed by poll_option ID — resolve the keys through the poll's " +
-  "poll_options[] {id, name}; stance_counts[i] is the tally of poll_options[i]. Anonymous polls " +
+  "poll_options[] {id, name}; scores_by_option[i] is the tally of poll_options[i]. Anonymous polls " +
   "have no stances here at all (Loomio's b2 API does not serialize their ballots) — do not try to " +
   "infer voters.";
 
@@ -1030,7 +1031,7 @@ export async function listThreadItems(
     : headerKnown
       ? "items_known_thread"
       : "compact";
-  const path = `/b2/threads/${resolved.topic_id}/items`;
+  const path = userApiPath(`/threads/${resolved.topic_id}/items`);
   const kinds = input.kinds?.length ? input.kinds : undefined;
   const fail = (err: unknown): never => rethrowThreadNotFound(err, resolved.topic_id);
 
@@ -1529,7 +1530,10 @@ function headerFromTopic(
 async function showThread(topicId: number): Promise<{ body: ThreadsResponse; topic: LoomioTopic }> {
   let body: ThreadsResponse;
   try {
-    body = await loomioGet<ThreadsResponse>(`/b2/threads/${topicId}`, readParams("compact"));
+    body = await loomioGet<ThreadsResponse>(
+      userApiPath(`/threads/${topicId}`),
+      readParams("compact"),
+    );
   } catch (err) {
     rethrowThreadNotFound(err, topicId);
   }
@@ -1537,7 +1541,7 @@ async function showThread(topicId: number): Promise<{ body: ThreadsResponse; top
   if (!topic) {
     throw new LoomioApiError(
       502,
-      `Loomio answered GET /b2/threads/${topicId} without a thread row; the response shape is ` +
+      `Loomio answered GET ${userApiPath("/threads/")}${topicId} without a thread row; the response shape is ` +
         "not the one Loomio 3.8.1 produces.",
     );
   }
@@ -1568,7 +1572,7 @@ async function loadThreadForGuard(ref: ThreadRef): Promise<GuardRead> {
     let body: DiscussionsResponse;
     try {
       body = await loomioGet<DiscussionsResponse>(
-        `/b2/discussions/${encodePathSegment(ref.discussion_id)}`,
+        userApiPath(`/discussions/${encodePathSegment(ref.discussion_id)}`),
         readParams("thread_guard"),
       );
     } catch (err) {
@@ -1578,7 +1582,7 @@ async function loadThreadForGuard(ref: ThreadRef): Promise<GuardRead> {
     if (!d || d.topic_id == null) {
       throw new LoomioApiError(
         502,
-        `Loomio answered GET /b2/discussions/${ref.discussion_id} without a discussion carrying a ` +
+        `Loomio answered GET ${userApiPath("/discussions/")}${ref.discussion_id} without a discussion carrying a ` +
           "topic_id; the response shape is not the one Loomio 3.8.1 produces.",
       );
     }
@@ -1671,7 +1675,7 @@ async function guardThreadMarkdown(read: GuardRead): Promise<{ calls: number; ch
   // cached identity the read did not.
   const cleared = new Set(read.polls.map((p) => p.id));
   const pager = loomioPager<ThreadItemsResponse>(
-    `/b2/threads/${topicId}/items`,
+    userApiPath(`/threads/${topicId}/items`),
     readParams("items_known_thread"),
     { root: "items", maxPages: MAX_ITEM_SCAN_PAGES },
   );
@@ -1773,14 +1777,16 @@ export async function getThreadMarkdown(
   const guard = legacy.honours ? { calls: 0, checked: 0 } : await guardThreadMarkdown(read);
   let body: { markdown?: unknown };
   try {
-    body = await loomioGet<{ markdown?: unknown }>(`/b2/threads/${header.topic_id}/markdown`);
+    body = await loomioGet<{ markdown?: unknown }>(
+      userApiPath(`/threads/${header.topic_id}/markdown`),
+    );
   } catch (err) {
     rethrowThreadNotFound(err, header.topic_id);
   }
   if (typeof body.markdown !== "string") {
     throw new LoomioApiError(
       502,
-      `Loomio answered GET /b2/threads/${header.topic_id}/markdown without a markdown string; the ` +
+      `Loomio answered GET ${userApiPath("/threads/")}${header.topic_id}/markdown without a markdown string; the ` +
         "response shape is not the one Loomio 3.8.1 produces.",
     );
   }
@@ -1992,7 +1998,7 @@ async function listThreadsPage(
   exhausted: boolean | null;
   nextOffset: number | null;
 }> {
-  const body = await loomioGet<ThreadsResponse>("/b2/threads", {
+  const body = await loomioGet<ThreadsResponse>(userApiPath("/threads"), {
     limit,
     offset,
     // `compact` minus `tag`: compact would strip the `tags` FIELD from
@@ -2066,7 +2072,7 @@ async function listThreadsWalk(
   let upstreamOffset = 0;
   let reachedEnd = false;
   for (let n = 0; n < THREADS_WALK_MAX_PAGES && !reachedEnd; n += 1) {
-    const body = await loomioGet<ThreadsResponse>("/b2/threads", {
+    const body = await loomioGet<ThreadsResponse>(userApiPath("/threads"), {
       limit: THREADS_WALK_PAGE,
       offset: upstreamOffset,
       ...readParams("threads"),

@@ -5,9 +5,11 @@
 loomiomcp is a thin shim. It holds one upstream credential
 (`LOOMIO_API_KEY`) — over HTTP also the OAuth signing key — and exposes
 a small tool surface — 14 reads, 10 writes, 9 opt-in instance-admin tools
-— that calls Loomio's b2 API on behalf of authenticated MCP clients,
-plus the optional b3 admin endpoints (gated by a separate,
-server-instance secret) when explicitly enabled.
+— that calls Loomio's User API (`/api/user0`; `/api/b2` before Loomio
+3.14) on behalf of authenticated MCP clients, plus the optional b3
+admin endpoints (Loomio's Server API, `/api/server0`; `/api/b3` before
+3.14; gated by a separate, server-instance secret) when explicitly
+enabled.
 
 This file was revised for v0.0.17 after a security review of v0.0.16
 (23 findings, 22 smaller items); where v0.0.16 behaved differently from what is written
@@ -18,8 +20,12 @@ it), and **everything Loomio returns is untrusted text** (see "Loomio
 content is untrusted input"). What remains open after this release is
 listed at the end, under "Accepted risks".
 
-Everything below is stated against Loomio 3.13.1 (`TESTED_LOOMIO_VERSION`
-in `src/version.ts`). 3.9 → 3.13.1 changed what this file depends on in
+Everything below is stated against Loomio 3.15.0 (`TESTED_LOOMIO_VERSION`
+in `src/version.ts`): written against 3.13.1 and re-read for 3.14 /
+3.15, whose changes — versioned API paths, renamed poll fields, the
+inverted `polls_one_at_a_time` thread setting, `SERVER_API_KEY` —
+change no rule in this file beyond the names noted where they occur.
+3.9 → 3.13.1 changed what this file depends on in
 three places, each covered below: the Markdown export stopped applying
 "hide results until vote" (3.10), the groups index and thread items
 became paged (3.11.1, which changes the upstream cost bounds), and the
@@ -215,7 +221,8 @@ blast radius. Understand this before exposing the connector publicly:
   says whether the subscription is active, which is all a caller needs.
   `list_groups` never carried it (it picks fields). Since v0.0.17 the
   group, discussion and poll shows are ALLOW-lists of the fields their
-  3.13.1 serializers send (minus the drops above): an attribute a later
+  3.15.0 serializers send (under Loomio 3.14's poll field names, minus
+  the drops above): an attribute a later
   Loomio adds stays out until it is reviewed and listed, instead of
   reaching every caller by default.
 - **Hidden and missing look the same in open-DCR mode.** Loomio answers
@@ -339,12 +346,14 @@ the tools exist to read. What bounds the damage:
 Two distinct secrets:
 
 - **`LOOMIO_API_KEY`** — per-user, sent as `Authorization: Bearer …` on
-  every b2 request. Copy it from the user's API access page in Loomio
+  every User API request. Copy it from the user's API access page in Loomio
   (`/profile/api_access`).
 - **`LOOMIO_B3_API_KEY`** (optional) — server-instance admin secret,
-  sent as `Authorization: Bearer …` on b3 requests. Equal to
-  `ENV['B3_API_KEY']` on the Loomio server. Only set this if you run the
-  Loomio instance.
+  sent as `Authorization: Bearer …` on Server API (b3) requests. Equal
+  to `ENV['SERVER_API_KEY']` on the Loomio server (`B3_API_KEY` before
+  Loomio 3.14, still read while the new name is unset; Loomio 3.14+
+  refuses to start with a key shorter than 17 characters). Only set
+  this if you run the Loomio instance.
 
 Both travel in the `Authorization` header, never in the URL. Loomio
 rejects keys passed in the query string (removed July 2026) precisely
@@ -456,7 +465,8 @@ The same holds, instance-wide, for the b3 secret (below), and the OAuth
 signing key mints any token or client registration for this connector:
 rotating `MCP_OAUTH_SIGNING_KEY` invalidates all of them (DEPLOY.md).
 
-**Scope of the b3 secret.** The b3 Server API covers far more than the
+**Scope of the b3 secret.** Loomio's Server API (`/server0`; `/b3`
+before 3.14) covers far more than the
 operations this connector wraps: user update (including `is_admin`),
 hard destroy and redact, in addition to deactivate / reactivate / show /
 index and lookup by external identity. Since Loomio 3.13 the same
@@ -592,7 +602,8 @@ work on every supported Loomio; the five provisioning tools need
 Loomio 3.13+ and were verified only against Loomio's source, tests and
 documentation.
 
-The user tools call the member routes
+The user tools call the member routes (quoted in their pre-3.14 form;
+on Loomio ≥ 3.14 the connector sends them under `/api/server0/`)
 `POST /api/b3/users/{id}/deactivate` and `…/{id}/reactivate` (the
 `?id=` collection routes are deprecated in Loomio's OpenAPI document),
 `GET /api/b3/users/{id}`, `GET /api/b3/users/identity/{type}/{uid}` and
@@ -773,7 +784,9 @@ abuse sizing:
 
 ## Key-health probe and `/health`
 
-`src/loomio/health.ts` issues an authenticated `GET /api/b2/groups` (200
+`src/loomio/health.ts` issues an authenticated `GET /api/user0/groups`
+(`/api/b2/groups` before Loomio 3.14 and for a process's first probe,
+before the version is known; 200
 → `valid`; 403 with Loomio's unauthenticated body → `rejected`; anything
 else → `unreachable`) and the public, credential-free
 `GET /api/v1/boot/version`. The result is cached 60 s and shared between

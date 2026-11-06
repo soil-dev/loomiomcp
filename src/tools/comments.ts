@@ -25,6 +25,7 @@ import {
   refuseHtmlWithoutFormat,
 } from "./_common.js";
 import { resolveThread, type ShapedComment, shapeComment } from "./threads.js";
+import { userApiPath } from "../loomio/api-dialect.js";
 
 // ── Comment writes: FLAT JSON, and why ──────────────────────────────────────
 //
@@ -196,7 +197,7 @@ export async function createComment(
     if (header.id == null) {
       throw new LoomioApiError(
         502,
-        `Loomio answered GET /b2/discussions/${input.discussion_id} without a discussion id; the ` +
+        `Loomio answered GET ${userApiPath("/discussions/")}${input.discussion_id} without a discussion id; the ` +
           "response shape is not the one Loomio 3.8.1 produces.",
       );
     }
@@ -216,11 +217,11 @@ export async function createComment(
   });
   let resp: CommentsResponse;
   try {
-    resp = await loomioPost<CommentsResponse>("/b2/comments", body);
+    resp = await loomioPost<CommentsResponse>(userApiPath("/comments"), body);
   } catch (err) {
     explainCreateRefusal(err, input.parent_type);
   }
-  return shapeCommentWrite(resp, "POST /b2/comments");
+  return shapeCommentWrite(resp, `POST ${userApiPath("/comments")}`);
 }
 
 /** The allow-list refusal for a comment write whose group cannot be read (module note). */
@@ -260,7 +261,7 @@ async function assertCommentTargetInScope(
   if (type === "Poll") {
     let body: PollsResponse;
     try {
-      body = await loomioGet<PollsResponse>(`/b2/polls/${ref}`, readParams("compact"));
+      body = await loomioGet<PollsResponse>(userApiPath(`/polls/${ref}`), readParams("compact"));
     } catch (err) {
       collapseNotVisible(err, "poll", ref);
     }
@@ -281,7 +282,7 @@ function explainCreateRefusal(err: unknown, parentType: string | undefined): nev
   if (err instanceof LoomioApiError && err.status === 404) {
     throw new LoomioApiError(
       404,
-      "Loomio answered 404 for POST /b2/comments: the target discussion, comment, poll, stance or " +
+      `Loomio answered 404 for POST ${userApiPath("/comments")}: the target discussion, comment, poll, stance or ` +
         "outcome does not exist or was soft-deleted (Loomio ≥ 3.11 refuses a reply to a deleted " +
         "item with 404 before checking permissions). Check the id and parent_type; nothing was " +
         "created.",
@@ -340,7 +341,7 @@ export async function updateComment(
 ): Promise<CommentWriteResult> {
   const { id, ...attrs } = input;
   if (hasGroupAllowlist()) throw unplaceable("A comment edit");
-  const path = `/b2/comments/${id}`;
+  const path = userApiPath(`/comments/${id}`);
   const resp = await loomioPatch<CommentsResponse>(path, flatBody(attrs));
   return shapeCommentWrite(resp, `PATCH ${path}`);
 }
@@ -372,7 +373,7 @@ export async function deleteComment(
   input: z.infer<typeof deleteCommentSchema>,
 ): Promise<DeleteCommentResult> {
   if (hasGroupAllowlist()) throw unplaceable("A comment deletion");
-  const path = `/b2/comments/${input.id}`;
+  const path = userApiPath(`/comments/${input.id}`);
   const resp = await loomioDelete<CommentsResponse>(path);
   const shaped = shapeCommentWrite(resp, `DELETE ${path}`);
   return {
