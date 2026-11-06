@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.19 — unreleased
+## 0.0.19 — 2026-11-06
 
 **Dependency release.** No tool, input or output changes; no Loomio
 API changes (the instance still runs 3.15.0, `TESTED_LOOMIO_VERSION`
