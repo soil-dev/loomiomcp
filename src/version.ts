@@ -31,6 +31,6 @@
  * integration tests and server-API docs only — the reference deployment
  * holds no server secret.
  */
-export const VERSION = "0.0.18";
+export const VERSION = "0.0.19";
 
 export const TESTED_LOOMIO_VERSION = "3.15.0";

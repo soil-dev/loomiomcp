@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.0.19 — unreleased
+
+**Dependency release.** No tool, input or output changes; no Loomio
+API changes (the instance still runs 3.15.0, `TESTED_LOOMIO_VERSION`
+unchanged).
+
+- Runtime: `undici` 8.12.4, `express-rate-limit` 8.7.3 (patch releases).
+- Build / test: `vitest` 5.1.0, `@types/node` 26.6.6, `@biomejs/biome`
+  2.6.5 (exact pin). `npm audit`: 0 advisories; no Dependabot alerts.
+- **Container base: `node:22-slim` → `node:24-slim`** (Node 24.22.2,
+  the active LTS line; pinned by digest). The 22-slim pin had fallen
+  behind its line; Dependabot's proposal of `node:25-slim` was declined
+  because Node 25 is a "current", non-LTS line. CI now also runs on
+  Node 26 (the newest LTS) beside 22 and 24; the image moves to 26 in a
+  later release once that has run for a while.
+- GitHub Actions (Dependabot, SHA-pinned): `actions/checkout` 7.0.1,
+  `actions/setup-node` 7.1.0, `actions/upload-artifact` 7.0.2,
+  `actions/download-artifact` 8.0.2.
+
+Tests: 1,059.
+
 ## 0.0.18 — 2026-11-06
 
 **Loomio 3.14 / 3.15 adoption.** Loomio 3.14.0 (2026-11-01) versioned its
