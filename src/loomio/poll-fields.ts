@@ -109,7 +109,10 @@ export function modernizePoll<T extends LoomioPoll>(poll: T): T {
   let out = renameKeys(row, POLL_FIELD_RENAMES);
   // From here on `out` is either `row` itself (untouched so far) or the
   // one private copy; `own()` makes sure a further change lands in a copy.
-  const own = (): Row => (out === row ? (out = { ...row }) : out);
+  const own = (): Row => {
+    if (out === row) out = { ...row };
+    return out;
+  };
   const results = out["results"];
   if (Array.isArray(results)) {
     let changed = false;
